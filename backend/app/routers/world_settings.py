@@ -1,6 +1,9 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
+from typing import List
+from pydantic import BaseModel
 from app.database import get_db
+from app.schemas.world_setting import WorldSettingCreate, WorldSettingUpdate, WorldSettingResponse
 from app.models.user import User
 from app.crud.world_setting import WorldSettingCRUD
 from app.crud.novel import NovelCRUD
@@ -8,19 +11,14 @@ from app.routers.auth import get_current_user
 
 router = APIRouter(prefix="/world-settings")
 
-@router.post("/")
+@router.post("/", response_model=WorldSettingResponse)
 async def create_world_setting(
-    name: str,
-    description: str = None,
-    rules: str = None,
-    history: str = None,
-    geography: str = None,
-    novel_id: str = None,
+    setting_data: WorldSettingCreate,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    if novel_id:
-        novel = NovelCRUD.get_novel_by_id(db, novel_id)
+    if setting_data.novel_id:
+        novel = NovelCRUD.get_novel_by_id(db, setting_data.novel_id)
         if not novel or novel.user_id != current_user.id:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -30,16 +28,16 @@ async def create_world_setting(
     setting = WorldSettingCRUD.create_world_setting(
         db,
         current_user.id,
-        name,
-        description=description,
-        rules=rules,
-        history=history,
-        geography=geography,
-        novel_id=novel_id
+        setting_data.name,
+        description=setting_data.description,
+        rules=setting_data.rules,
+        history=setting_data.history,
+        geography=setting_data.geography,
+        novel_id=setting_data.novel_id
     )
     return setting
 
-@router.get("/")
+@router.get("/", response_model=List[WorldSettingResponse])
 async def list_world_settings(
     novel_id: str = None,
     db: Session = Depends(get_db),
@@ -47,7 +45,7 @@ async def list_world_settings(
 ):
     return WorldSettingCRUD.get_user_world_settings(db, current_user.id, novel_id)
 
-@router.get("/{setting_id}")
+@router.get("/{setting_id}", response_model=WorldSettingResponse)
 async def get_world_setting(
     setting_id: str,
     db: Session = Depends(get_db),
@@ -61,14 +59,10 @@ async def get_world_setting(
         )
     return setting
 
-@router.put("/{setting_id}")
+@router.put("/{setting_id}", response_model=WorldSettingResponse)
 async def update_world_setting(
     setting_id: str,
-    name: str = None,
-    description: str = None,
-    rules: str = None,
-    history: str = None,
-    geography: str = None,
+    setting_update: WorldSettingUpdate,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -79,16 +73,7 @@ async def update_world_setting(
             detail="World setting not found"
         )
     
-    update_data = {
-        k: v for k, v in {
-            "name": name,
-            "description": description,
-            "rules": rules,
-            "history": history,
-            "geography": geography
-        }.items() if v is not None
-    }
-    
+    update_data = setting_update.model_dump(exclude_unset=True)
     return WorldSettingCRUD.update_world_setting(db, setting_id, **update_data)
 
 @router.delete("/{setting_id}")

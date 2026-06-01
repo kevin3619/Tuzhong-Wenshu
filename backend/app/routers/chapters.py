@@ -1,7 +1,9 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 from typing import List
+from pydantic import BaseModel
 from app.database import get_db
+from app.schemas.chapter import ChapterCreate, ChapterUpdate, ChapterResponse
 from app.models.user import User
 from app.models.novel import Chapter
 from app.crud.chapter import ChapterCRUD
@@ -10,22 +12,16 @@ from app.routers.auth import get_current_user
 
 router = APIRouter(prefix="/chapters")
 
-class ChapterCreate:
-    def __init__(self, chapter_number: int, title: str, outline: str = None, content: str = ""):
-        self.chapter_number = chapter_number
-        self.title = title
-        self.outline = outline
-        self.content = content
+class ChapterCreateRequest(BaseModel):
+    chapter_number: int
+    title: str
+    outline: str = None
+    content: str = ""
 
-class ChapterResponse:
-    pass
-
-@router.post("/novels/{novel_id}")
+@router.post("/novels/{novel_id}", response_model=ChapterResponse)
 async def create_chapter(
     novel_id: str,
-    chapter_number: int,
-    title: str,
-    outline: str = None,
+    chapter_data: ChapterCreateRequest,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -36,13 +32,17 @@ async def create_chapter(
             detail="Novel not found"
         )
     
-    chapter = ChapterCRUD.create_chapter(db, novel_id, chapter_number, title)
-    if outline:
-        chapter = ChapterCRUD.update_chapter(db, chapter.id, outline=outline)
+    chapter = ChapterCRUD.create_chapter(
+        db, novel_id, chapter_data.chapter_number, chapter_data.title
+    )
+    if chapter_data.outline:
+        chapter = ChapterCRUD.update_chapter(db, chapter.id, outline=chapter_data.outline)
+    if chapter_data.content:
+        chapter = ChapterCRUD.update_chapter(db, chapter.id, content=chapter_data.content)
     
     return chapter
 
-@router.get("/novels/{novel_id}")
+@router.get("/novels/{novel_id}", response_model=List[ChapterResponse])
 async def list_chapters(
     novel_id: str,
     db: Session = Depends(get_db),
@@ -57,7 +57,7 @@ async def list_chapters(
     
     return ChapterCRUD.get_novel_chapters(db, novel_id)
 
-@router.get("/{chapter_id}")
+@router.get("/{chapter_id}", response_model=ChapterResponse)
 async def get_chapter(
     chapter_id: str,
     db: Session = Depends(get_db),
@@ -79,13 +79,10 @@ async def get_chapter(
     
     return chapter
 
-@router.put("/{chapter_id}")
-async def update_chapter(
+@router.put("/{chapter_id}", response_model=ChapterResponse)
+async def update_chapter_endpoint(
     chapter_id: str,
-    title: str = None,
-    content: str = None,
-    outline: str = None,
-    status: str = None,
+    chapter_update: ChapterUpdate,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -103,15 +100,9 @@ async def update_chapter(
             detail="Chapter not found"
         )
     
-    update_data = {
-        k: v for k, v in {
-            "title": title,
-            "content": content,
-            "outline": outline,
-            "status": status,
-            "word_count": len(content.split()) if content else None
-        }.items() if v is not None
-    }
+    update_data = chapter_update.model_dump(exclude_unset=True)
+    if "content" in update_data and update_data["content"]:
+        update_data["word_count"] = len(update_data["content"].split())
     
     return ChapterCRUD.update_chapter(db, chapter_id, **update_data)
 
