@@ -1,87 +1,102 @@
-import { useState, useEffect } from 'react'
-import { useParams } from 'react-router-dom'
-import { Project } from '@/types'
-import TextEditor from '@/components/Editor/TextEditor'
-import SuggestionPanel from '@/components/Editor/SuggestionPanel'
-import ModelSwitcher from '@/components/ModelSelector/ModelSwitcher'
-import { useProjects } from '@/hooks/useProjects'
-import { useModels } from '@/hooks/useModels'
-import { Button } from '@/components/ui/button'
-import { Save } from 'lucide-react'
-import toast from 'react-hot-toast'
+import { useEffect, useState } from 'react';
+import { useParams } from 'react-router-dom';
+import { useNovels } from '@/hooks/useNovels';
+import { useGeneration } from '@/hooks/useGeneration';
+import { Button } from '@/components/ui/button';
+import MonacoEditor from '@monaco-editor/react';
 
-function EditorPage() {
-  const { id } = useParams<{ id: string }>()
-  const { projects, updateProject } = useProjects()
-  const { selectedModel } = useModels()
-  const [project, setProject] = useState<Project | null>(null)
-  const [content, setContent] = useState('')
-  const [isSaving, setIsSaving] = useState(false)
+export default function EditorPage() {
+  const { id } = useParams<{ id: string }>();
+  const { currentNovel, fetchNovel, updateNovel } = useNovels();
+  const { generating, suggestions, generateSuggestions } = useGeneration();
+  const [content, setContent] = useState('');
+  const [saving, setSaving] = useState(false);
 
   useEffect(() => {
     if (id) {
-      const found = projects.find(p => p.id === id)
-      if (found) {
-        setProject(found)
-        setContent(found.content)
-      }
+      fetchNovel(id).then((novel) => {
+        if (novel) setContent(novel.content);
+      });
     }
-  }, [id, projects])
+  }, [id, fetchNovel]);
 
   const handleSave = async () => {
-    if (!project) return
-    try {
-      setIsSaving(true)
-      await updateProject(project.id, {
-        ...project,
-        content,
-        wordCount: content.length,
-      })
-      toast.success('已保存')
-    } catch (error) {
-      console.error('Save failed:', error)
-    } finally {
-      setIsSaving(false)
-    }
-  }
+    if (!id) return;
+    setSaving(true);
+    await updateNovel(id, { content, word_count: content.split(' ').length });
+    setSaving(false);
+  };
 
-  if (!project) {
-    return <div className="p-4">项目加载中...</div>
-  }
+  const handleGenerateSuggestions = async () => {
+    if (!id) return;
+    await generateSuggestions(content, id);
+  };
+
+  const applySuggestion = (suggestion: string) => {
+    setContent(content + '\n\n' + suggestion);
+  };
 
   return (
-    <div className="h-full flex flex-col gap-4 p-4">
-      {/* Header */}
-      <div className="flex items-center justify-between">
-        <div>
-          <h2 className="text-2xl font-bold">{project.title}</h2>
-          <p className="text-sm text-muted-foreground">{content.length} 字</p>
-        </div>
-        <div className="flex items-center gap-4">
-          <ModelSwitcher />
-          <Button onClick={handleSave} disabled={isSaving} className="gap-2">
-            <Save className="h-4 w-4" />
-            {isSaving ? '保存中...' : '保存'}
-          </Button>
-        </div>
-      </div>
-
+    <div className="flex h-screen">
       {/* Editor */}
-      <div className="flex-1 flex gap-4 overflow-hidden">
-        <div className="flex-1 overflow-hidden">
-          <TextEditor value={content} onChange={setContent} />
+      <div className="flex-1 flex flex-col">
+        <div className="bg-white shadow p-4 flex justify-between items-center">
+          <h1 className="text-2xl font-bold">{currentNovel?.title}</h1>
+          <div className="flex gap-2">
+            <Button
+              onClick={handleGenerateSuggestions}
+              disabled={generating}
+              className="bg-green-500 hover:bg-green-600"
+            >
+              {generating ? '生成中...' : '生成续写'}
+            </Button>
+            <Button
+              onClick={handleSave}
+              disabled={saving}
+              className="bg-blue-500 hover:bg-blue-600"
+            >
+              {saving ? '保存中...' : '保存'}
+            </Button>
+          </div>
         </div>
-        <div className="hidden lg:flex w-80">
-          <SuggestionPanel
-            suggestions={[]}
-            onSelect={(s) => setContent(content + s)}
-            onRefresh={() => {}}
-            selectedModel={selectedModel || undefined}
+        <div className="flex-1 overflow-hidden">
+          <MonacoEditor
+            height="100%"
+            defaultLanguage="markdown"
+            value={content}
+            onChange={(value) => setContent(value || '')}
+            theme="vs-light"
+            options={{
+              minimap: { enabled: false },
+              fontSize: 14,
+              wordWrap: 'on',
+            }}
           />
         </div>
       </div>
-    </div>
-  )
-}
 
-export default EditorPage
+      {/* Suggestions Sidebar */}
+      <div className="w-64 bg-white shadow border-l border-gray-200 p-4 overflow-y-auto">
+        <h2 className="font-bold text-lg mb-4">续写建议</h2>
+        {suggestions.length === 0 ? (
+          <p className="text-gray-500 text-sm">点击"生成续写"获取建议</p>
+        ) : (
+          <div className="space-y-3">
+            {suggestions.map((suggestion, idx) => (
+              <div key={idx} className="bg-gray-50 p-3 rounded border border-gray-200">
+                <p className="text-sm text-gray-700 mb-2">{suggestion}</p>
+                <Button
+                  size="sm"
+                  onClick={() => applySuggestion(suggestion)}
+                  className="w-full bg-blue-500 hover:bg-blue-600 text-xs"
+                >
+                  应用
+                </Button>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
