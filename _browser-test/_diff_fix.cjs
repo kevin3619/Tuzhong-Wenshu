@@ -1,0 +1,11 @@
+const fs = require('fs')
+const dump = require(__dirname + '/_arcs_full_dump.json')
+const names = [...new Set(dump.list.map(x => x.name))]
+console.log('unique names from dump: ' + names.length)
+const birth = require(__dirname + '/_fix_birthplace.json')
+const bkeys = Object.keys(birth)
+const missingInBirth = names.filter(n => !bkeys.includes(n))
+const extraInBirth = bkeys.filter(n => !names.includes(n))
+console.log('names missing in birthplace file:', JSON.stringify(missingInBirth))
+console.log('birthplace keys not in dump:', JSON.stringify(extraInBirth))
+console.log('names list:', JSON.stringify(names))

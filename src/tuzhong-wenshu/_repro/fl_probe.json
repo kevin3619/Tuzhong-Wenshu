@@ -1,0 +1,18 @@
+{
+  "fl": [
+    "    | **核心技能** | 察言观色（★★★★☆）、烹饪女红（★★★★☆）、消息传递（★★★☆☆） |",
+    "    | **功能标签** | 忠心侍女、消息传递、情感慰藉 |"
+  ],
+  "fullLen": 30499,
+  "keys": [
+    "keywords",
+    "genre",
+    "detailedDesignInput",
+    "protagonistName",
+    "userBookTitle",
+    "protagonistGender",
+    "protagonistAge",
+    "protagonistIdentity",
+    "creationMode"
+  ]
+}

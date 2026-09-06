@@ -1,0 +1,52 @@
+# ===== 依赖与构建产物 =====
+node_modules/
+.next/
+out/
+dist/
+build/
+*.tsbuildinfo
+.next/cache/
+
+# ===== 环境变量与密钥（生产配置，严禁提交）=====
+.env
+.env.local
+.env.*.local
+.env*.production.local
+.env*.development.local
+*.pem
+*.key
+*.p12
+
+# ===== 数据文件 / 运行日志 =====
+*.db
+*.db-journal
+*.db-wal
+*.sqlite
+*.sqlite3
+*.log
+*.tmp
+*.cache
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ===== 部署临时产物 =====
+deploy/*.zip
+deploy/*.zip.old
+_up_payload.b64
+.tmp/
+
+# ===== 本地浏览器自动化数据（可能含登录态）=====
+_browser-profile/
+_browser-test/*.png
+_browser-test/node_modules/
+
+# ===== 操作系统 / 编辑器 =====
+.DS_Store
+Thumbs.db
+.idea/
+*.swp
+*.swo
+
+# ===== 覆盖 node_modules 深层兜底 =====
+**/node_modules/

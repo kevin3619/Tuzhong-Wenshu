@@ -1,0 +1,79 @@
+﻿node : FATAL browserType.launchPersistentContext: Target page, context or browser has been closed
+At line:15 char:2624
++ ... pgrep\bin'; node "D:\tuzhongwang\tuzhong\途中文枢 (Tuzhong Wenshu) - AI 小 ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (FATAL browserTy...has been closed:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+Browser logs:
+
+<launching> C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe --disable-field-trial-config --disable-backgro
+und-networking --disable-background-timer-throttling --disable-backgrounding-occluded-windows --disable-back-forward-ca
+che --disable-breakpad --disable-client-side-phishing-detection --disable-component-extensions-with-background-pages --
+disable-component-update --no-default-browser-check --disable-default-apps --disable-dev-shm-usage --disable-edgeupdate
+r --disable-extensions --disable-features=AvoidUnnecessaryBeforeUnloadCheckSync,DestroyProfileOnBrowserClose,DialMediaR
+outeProvider,GlobalMediaControls,HttpsUpgrades,LensOverlay,MediaRouter,PaintHolding,ThirdPartyStoragePartitioning,Block
+OriginHeaderModificationOnRedirect,Translate,AutoDeElevate,OptimizationHints,msForceBrowserSignIn,msEdgeUpdateLaunchSer
+vicesPreferredVersion --enable-features=CDPScreenshotNewSurface --allow-pre-commit-input --disable-hang-monitor --disab
+le-ipc-flooding-protection --disable-popup-blocking --disable-prompt-on-repost --disable-renderer-backgrounding --disab
+le-updater-scheduler --force-color-profile=srgb --metrics-recording-only --no-first-run --password-store=basic --use-mo
+ck-keychain --no-service-autorun --export-tagged-pdf --disable-search-engine-choice-screen --unsafely-disable-devtools-
+self-xss-warnings --edge-skip-compat-layer-relaunch --disable-infobars --disable-search-engine-choice-screen --disable-
+sync --enable-unsafe-swiftshader --headless --hide-scrollbars --mute-audio --blink-settings=primaryHoverType=2,availabl
+eHoverTypes=2,primaryPointerType=4,availablePointerTypes=4 --no-sandbox --no-sandbox --user-data-dir=D:\tuzhongwang\tuz
+hong\途中文枢 (Tuzhong Wenshu) - AI 小说写作助手\_browser-profile --remote-debugging-pipe about:blank
+<launched> pid=21024
+Call log:
+[2m  - <launching> C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe --disable-field-trial-config --disable
+-background-networking --disable-background-timer-throttling --disable-backgrounding-occluded-windows --disable-back-fo
+rward-cache --disable-breakpad --disable-client-side-phishing-detection --disable-component-extensions-with-background-
+pages --disable-component-update --no-default-browser-check --disable-default-apps --disable-dev-shm-usage --disable-ed
+geupdater --disable-extensions --disable-features=AvoidUnnecessaryBeforeUnloadCheckSync,DestroyProfileOnBrowserClose,Di
+alMediaRouteProvider,GlobalMediaControls,HttpsUpgrades,LensOverlay,MediaRouter,PaintHolding,ThirdPartyStoragePartitioni
+ng,BlockOriginHeaderModificationOnRedirect,Translate,AutoDeElevate,OptimizationHints,msForceBrowserSignIn,msEdgeUpdateL
+aunchServicesPreferredVersion --enable-features=CDPScreenshotNewSurface --allow-pre-commit-input --disable-hang-monitor
+ --disable-ipc-flooding-protection --disable-popup-blocking --disable-prompt-on-repost --disable-renderer-backgrounding
+ --disable-updater-scheduler --force-color-profile=srgb --metrics-recording-only --no-first-run --password-store=basic 
+--use-mock-keychain --no-service-autorun --export-tagged-pdf --disable-search-engine-choice-screen --unsafely-disable-d
+evtools-self-xss-warnings --edge-skip-compat-layer-relaunch --disable-infobars --disable-search-engine-choice-screen --
+disable-sync --enable-unsafe-swiftshader --headless --hide-scrollbars --mute-audio --blink-settings=primaryHoverType=2,
+availableHoverTypes=2,primaryPointerType=4,availablePointerTypes=4 --no-sandbox --no-sandbox --user-data-dir=D:\tuzhong
+wang\tuzhong\途中文枢 (Tuzhong Wenshu) - AI 小说写作助手\_browser-profile --remote-debugging-pipe about:blank[22m
+[2m  - <launched> pid=21024[22m
+[2m  - [pid=21024] <gracefully close start>[22m
+[2m  - [pid=21024] <kill>[22m
+[2m  - [pid=21024] <will force kill>[22m
+[2m  - [pid=21024] taskkill stderr: ����: û���ҵ����� "21024"��[22m
+[2m  - [pid=21024] <process did exit: exitCode=21, signal=null>[22m
+[2m  - [pid=21024] starting temporary directories cleanup[22m
+[2m  - [pid=21024] finished temporary directories cleanup[22m
+[2m  - [pid=21024] <gracefully close end>[22m
+
+    at async D:\tuzhongwang\tuzhong\途中文枢 (Tuzhong Wenshu) - AI 小说写作助手\_browser-test\diag_wizard_dom.js:8:15) {
+  log: [
+    '  - <launching> C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe --disable-field-trial-config --d
+isable-background-networking --disable-background-timer-throttling --disable-backgrounding-occluded-windows --disable-b
+ack-forward-cache --disable-breakpad --disable-client-side-phishing-detection --disable-component-extensions-with-backg
+round-pages --disable-component-update --no-default-browser-check --disable-default-apps --disable-dev-shm-usage --disa
+ble-edgeupdater --disable-extensions --disable-features=AvoidUnnecessaryBeforeUnloadCheckSync,DestroyProfileOnBrowserCl
+ose,DialMediaRouteProvider,GlobalMediaControls,HttpsUpgrades,LensOverlay,MediaRouter,PaintHolding,ThirdPartyStoragePart
+itioning,BlockOriginHeaderModificationOnRedirect,Translate,AutoDeElevate,OptimizationHints,msForceBrowserSignIn,msEdgeU
+pdateLaunchServicesPreferredVersion --enable-features=CDPScreenshotNewSurface --allow-pre-commit-input --disable-hang-m
+onitor --disable-ipc-flooding-protection --disable-popup-blocking --disable-prompt-on-repost --disable-renderer-backgro
+unding --disable-updater-scheduler --force-color-profile=srgb --metrics-recording-only --no-first-run --password-store=
+basic --use-mock-keychain --no-service-autorun --export-tagged-pdf --disable-search-engine-choice-screen --unsafely-dis
+able-devtools-self-xss-warnings --edge-skip-compat-layer-relaunch --disable-infobars --disable-search-engine-choice-scr
+een --disable-sync --enable-unsafe-swiftshader --headless --hide-scrollbars --mute-audio --blink-settings=primaryHoverT
+ype=2,availableHoverTypes=2,primaryPointerType=4,availablePointerTypes=4 --no-sandbox --no-sandbox --user-data-dir=D:\\
+tuzhongwang\\tuzhong\\途中文枢 (Tuzhong Wenshu) - AI 小说写作助手\\_browser-profile --remote-debugging-pipe about:blank',
+    '  - <launched> pid=21024',
+    '  - [pid=21024] <gracefully close start>',
+    '  - [pid=21024] <kill>',
+    '  - [pid=21024] <will force kill>',
+    '  - [pid=21024] taskkill stderr: ����: û���ҵ����� "21024"��',
+    '  - [pid=21024] <process did exit: exitCode=21, signal=null>',
+    '  - [pid=21024] starting temporary directories cleanup',
+    '  - [pid=21024] finished temporary directories cleanup',
+    '  - [pid=21024] <gracefully close end>'
+  ]
+}

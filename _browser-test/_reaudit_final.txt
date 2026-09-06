@@ -1,0 +1,44 @@
+﻿STATUS=200 topKeys= worldSettings,foreshadowings,timelineEvents,worldbuilding,powerSystem,characters,factions,keyPlots,cover,idea,synopsis,outline,relationships,chapters
+
+===== [idea] =====
+-- EMPTY fields --
+  (无模板占位)
+
+===== [synopsis] =====
+-- EMPTY fields --
+  (无模板占位)
+
+===== [worldbuilding] =====
+-- EMPTY fields --
+  (无模板占位)
+
+===== [powerSystem] =====
+-- EMPTY fields --
+  (无模板占位)
+
+===== [characters] =====
+-- EMPTY fields --
+  sec._harem ×1  sec._harem=[]
+  (无模板占位)
+
+===== [factions] =====
+-- EMPTY fields --
+  (无模板占位)
+
+===== [relationships] =====
+-- EMPTY fields --
+  (无模板占位)
+
+===== [outline] =====
+-- EMPTY fields --
+  (无模板占位)
+
+===== [keyPlots] =====
+-- EMPTY fields --
+  (无模板占位)
+
+===== [chapters] =====
+-- EMPTY fields --
+  (无模板占位)
+
+DONE

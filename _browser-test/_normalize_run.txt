@@ -1,0 +1,82 @@
+﻿{
+ "getStatus": 200,
+ "normStatus": 200,
+ "normSuccess": true,
+ "changed": [
+  {
+   "name": "张献忠",
+   "field": "徽章",
+   "from": "首领",
+   "to": "大西皇帝"
+  },
+  {
+   "name": "朱由崧",
+   "field": "徽章",
+   "from": "昏君",
+   "to": "弘光帝"
+  },
+  {
+   "name": "朱聿键",
+   "field": "徽章",
+   "from": "有志无权",
+   "to": "隆武帝"
+  },
+  {
+   "name": "朱聿鐭",
+   "field": "徽章",
+   "from": "短命",
+   "to": "绍武帝"
+  },
+  {
+   "name": "瞿式耜",
+   "field": "徽章",
+   "from": "支撑危局",
+   "to": "东阁大学士"
+  },
+  {
+   "name": "朱落",
+   "field": "角色定位",
+   "from": "忠臣文官",
+   "to": "亲随"
+  },
+  {
+   "name": "周德全",
+   "field": "角色定位",
+   "from": "忠臣文官",
+   "to": "亲随"
+  },
+  {
+   "name": "何腾蛟",
+   "field": "徽章",
+   "from": "湖广巡抚",
+   "to": "大学士"
+  },
+  {
+   "name": "阎应元",
+   "field": "徽章",
+   "from": "江阴",
+   "to": "典史"
+  },
+  {
+   "name": "黄淳耀",
+   "field": "徽章",
+   "from": "嘉定",
+   "to": "进士"
+  }
+ ],
+ "removedDupes": 1,
+ "titlesFilled": 0,
+ "total": 44,
+ "historicalApplied": 10,
+ "onlineApplied": 0,
+ "titleDebug": {
+  "pending": 0,
+  "llm": false,
+  "raw": "",
+  "parsedKeys": 0
+ },
+ "startCount": 45,
+ "normCount": 44,
+ "postStatus": 200,
+ "postSuccess": true
+}

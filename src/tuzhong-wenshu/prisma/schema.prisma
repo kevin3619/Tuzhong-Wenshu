@@ -1,0 +1,360 @@
+// Prisma Schema for 途中文枢 (Tuzhong Wenshu) - SQLite
+// 升级日期: 2026-06-05
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = "file:./tuzhong.db"
+}
+
+// ============ 用户表 ============
+model User {
+  id                    String    @id @default(cuid())
+  username              String    @unique // 用户名
+  password              String    // bcrypt加密
+  nickname              String    // 昵称
+  email                 String?   @unique
+  avatarUrl             String?
+  wechatOpenid          String?   @unique // 微信openid
+  wechatUnionid         String?          // 微信unionid
+  subscriptionTier      String    @default("free") // free, monthly, quarterly, yearly, lifetime, pro
+  subscriptionStartedAt String?   // 会员生效起始日期(ISO)，管理员可手工修改
+  subscriptionExpiresAt String?   // 会员到期日期(ISO)，管理员可手工修改
+  dailyQuotaUsed        Int       @default(0)
+  dailyQuotaLimit       Int       @default(3000)
+  isAdmin               Boolean   @default(false)
+  status                Int       @default(1) // 0:禁用 1:正常
+  createdAt             String    @default("1970-01-01T00:00:00.000Z")
+  updatedAt             String    @default("1970-01-01T00:00:00.000Z")
+
+  // Relations
+  novels       Novel[]
+  writingStyles WritingStyle[]
+  aiModelConfigs AIModelConfig[]
+  referenceWorks ReferenceWork[]
+  payments     Payment[]
+  feedbacks    Feedback[]
+
+  @@index([isAdmin])
+  @@map("users")
+}
+
+// ============ 作品表 ============
+model Novel {
+  id               String  @id @default(cuid())
+  userId           String
+  title            String
+  description      String?
+  coverUrl         String?
+  genre            String?
+  status           String  @default("writing") // writing, completed, paused
+  targetWordCount  Int?
+  currentWordCount Int     @default(0)
+  healthScore      Int?
+  createdAt        String  @default("1970-01-01T00:00:00.000Z")
+  updatedAt        String  @default("1970-01-01T00:00:00.000Z")
+
+  // Relations
+  user            User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  chapters        Chapter[]
+  characters      Character[]
+  worldSettings   WorldSetting[]
+  foreshadowings  Foreshadowing[]
+  tomatoReports   TomatoReport[]
+  volumes         Volume[]
+
+  @@index([userId])
+  @@index([status])
+  @@map("novels")
+}
+
+// ============ 分卷表 ============
+model Volume {
+  id           String  @id @default(cuid())
+  novelId      String
+  name         String  // 卷名
+  summary      String? // 卷大纲
+  coreObjective String? // 核心目标
+  orderIndex   Int     @default(0)
+  createdAt    String  @default("")
+  updatedAt    String  @default("")
+
+  // Relations
+  novel        Novel   @relation(fields: [novelId], references: [id], onDelete: Cascade)
+  chapters     Chapter[]
+
+  @@index([novelId])
+  @@index([novelId, orderIndex])
+  @@map("volumes")
+}
+
+// ============ 章节表 ============
+model Chapter {
+  id             String  @id @default(cuid())
+  novelId        String
+  volumeId       String?
+  title          String
+  content        String  @default("")
+  orderIndex     Int
+  wordCount      Int     @default(0)
+  status         String  @default("draft") // draft, completed, published
+  versionHistory String  @default("[]") // JSON
+  createdAt      String  @default("")
+  updatedAt      String  @default("")
+
+  // Relations
+  novel          Novel           @relation(fields: [novelId], references: [id], onDelete: Cascade)
+  volume         Volume?         @relation(fields: [volumeId], references: [id])
+  tomatoReports  TomatoReport[]
+  foreshadowingsPlanted  Foreshadowing[] @relation("PlantedIn")
+  foreshadowingsResolved Foreshadowing[] @relation("ResolvedIn")
+  foreshadowingsPlannedResolve Foreshadowing[] @relation("PlannedResolve")
+
+  @@index([novelId])
+  @@index([novelId, orderIndex])
+  @@index([volumeId])
+  @@map("chapters")
+}
+
+// ============ 人物表 ============
+model Character {
+  id          String  @id @default(cuid())
+  novelId     String
+  name        String
+  aliases     String  @default("[]") // JSON array
+  gender      String? // male, female, other
+  age         Int?
+  role        String? // protagonist, antagonist, supporting, minor
+  appearance  String? // JSON
+  personality String? // JSON
+  background  String? // JSON
+  abilities   String? // JSON
+  color       String  @default("#3B82F6")
+  positionX   Int?
+  positionY   Int?
+  createdAt   String  @default("")
+  updatedAt   String  @default("")
+
+  // Relations
+  novel       Novel                  @relation(fields: [novelId], references: [id], onDelete: Cascade)
+  relationshipsSource CharacterRelationship[] @relation("Source")
+  relationshipsTarget CharacterRelationship[] @relation("Target")
+
+  @@index([novelId])
+  @@index([novelId, role])
+  @@map("characters")
+}
+
+// ============ 人物关系表 ============
+model CharacterRelationship {
+  id          String  @id @default(cuid())
+  sourceId    String
+  targetId    String
+  type        String  // 敌对,友好,师徒,爱慕,亲人,利用,其他
+  description String?
+  strength    Int     @default(3) // 1-5
+  createdAt   String  @default("")
+
+  // Relations
+  source      Character @relation("Source", fields: [sourceId], references: [id], onDelete: Cascade)
+  target      Character @relation("Target", fields: [targetId], references: [id], onDelete: Cascade)
+
+  @@map("character_relationships")
+}
+
+// ============ 世界设定表 ============
+model WorldSetting {
+  id          String  @id @default(cuid())
+  novelId     String
+  category    String  // geography, history, power_system, organization, race, item, rule
+  name        String
+  description String
+  parentId    String?
+  metadata    String? // JSON
+  createdAt   String  @default("")
+  updatedAt   String  @default("")
+
+  // Relations
+  novel       Novel       @relation(fields: [novelId], references: [id], onDelete: Cascade)
+  parent      WorldSetting? @relation("SettingHierarchy", fields: [parentId], references: [id])
+  children    WorldSetting[] @relation("SettingHierarchy")
+
+  @@index([novelId])
+  @@index([novelId, category])
+  @@map("world_settings")
+}
+
+// ============ 伏笔表 ============
+model Foreshadowing {
+  id                        String  @id @default(cuid())
+  novelId                   String
+  content                   String
+  type                      String? // plot, character, item, world
+  plantedChapterId          String?
+  plantedText               String?
+  plannedResolveChapterId   String?
+  plannedResolveDescription String?
+  actualResolveChapterId    String?
+  actualResolveStatus       String? // resolved, abandoned, modified
+  status                    String  @default("active") // active, resolved, abandoned
+  importance                Int     @default(3) // 1-5
+  reminderEnabled           Boolean @default(true)
+  reminderChaptersBefore    Int     @default(3)
+  createdAt                 String  @default("")
+  resolvedAt                String?
+
+  // Relations
+  novel                   Novel     @relation(fields: [novelId], references: [id], onDelete: Cascade)
+  plantedChapter          Chapter?  @relation("PlantedIn", fields: [plantedChapterId], references: [id])
+  plannedResolveChapter   Chapter?  @relation("PlannedResolve", fields: [plannedResolveChapterId], references: [id])
+  actualResolveChapter    Chapter?  @relation("ResolvedIn", fields: [actualResolveChapterId], references: [id])
+
+  @@index([novelId])
+  @@index([novelId, status])
+  @@map("foreshadowings")
+}
+
+// ============ 番茄检测报告表 ============
+model TomatoReport {
+  id                String  @id @default(cuid())
+  chapterId         String
+  novelId           String
+  aiTrace           Int?
+  coherence         Int?
+  homogeneity       Int?
+  shadowBanRisk     Int?
+  excitementDensity Int?
+  immersion         Int?
+  coldStart         Int?
+  overallScore      Int?
+  issues            String? // JSON
+  suggestions       String? // JSON
+  createdAt         String  @default("")
+
+  // Relations
+  chapter           Chapter @relation(fields: [chapterId], references: [id], onDelete: Cascade)
+  novel             Novel   @relation(fields: [novelId], references: [id], onDelete: Cascade)
+
+  @@index([chapterId])
+  @@map("tomato_reports")
+}
+
+// ============ 写作风格表 ============
+model WritingStyle {
+  id             String  @id @default(cuid())
+  userId         String
+  name           String
+  description    String?
+  isPreset       Boolean @default(false)
+  presetCategory String?
+  parameters     String  @default("{}") // JSON
+  sampleText     String?
+  usageCount     Int     @default(0)
+  createdAt      String  @default("")
+  updatedAt      String  @default("")
+
+  // Relations
+  user           User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("writing_styles")
+}
+
+// ============ AI模型配置表 ============
+model AIModelConfig {
+  id              String  @id @default(cuid())
+  userId          String
+  name            String
+  provider        String  // openai, claude, baidu, alibaba, deepseek, local
+  apiKeyEncrypted String?
+  baseUrl         String?
+  modelName       String
+  isDefault       Boolean @default(false)
+  usageStats      String  @default("{}") // JSON
+  createdAt       String  @default("")
+  updatedAt       String  @default("")
+
+  // Relations
+  user            User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("ai_model_configs")
+}
+
+// ============ 对标作品表 ============
+model ReferenceWork {
+  id            String  @id @default(cuid())
+  userId        String
+  title         String
+  author        String?
+  genre         String?
+  content       String?
+  fileUrl       String?
+  styleAnalysis String? // JSON
+  createdAt     String  @default("")
+  updatedAt     String  @default("")
+
+  // Relations
+  user          User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("reference_works")
+}
+
+// ============ 支付记录表 ============
+model Payment {
+  id             String  @id @default(cuid())
+  userId         String
+  orderNo        String  @unique // 订单号
+  amount         Float   // 支付金额
+  planType       String  // month/quarter/year
+  channel        String  @default("wechat") // wechat / alipay
+  status         Int     @default(0) // 0:待支付/待审核 1:支付成功 2:已失效/已驳回
+  payScreenshot  String? // 支付截图路径
+  qrCodeUrl      String? // 微信支付动态二维码URL(code_url)
+  expireAt       String? // 订单过期时间(微信支付30分钟有效期)
+  auditTime      String? // 审核时间
+  createdAt      String  @default("")
+
+  // Relations
+  user           User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([status])
+  @@index([channel])
+  @@map("payments")
+}
+
+// ============ 系统配置表 ============
+model SystemConfig {
+  id          String  @id @default(cuid())
+  configKey   String  @unique
+  configValue String?
+  createdAt   String  @default("")
+  updatedAt   String  @default("")
+
+  @@map("system_config")
+}
+
+// ============ 用户意见反馈表 ============
+model Feedback {
+  id        String   @id @default(cuid())
+  userId    String
+  category  String   @default("other")
+  content   String
+  contact   String?
+  status    Int      @default(0)
+  reply     String?
+  createdAt String   @default("")
+  updatedAt String   @default("")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([status])
+  @@index([createdAt])
+  @@map("feedbacks")
+}

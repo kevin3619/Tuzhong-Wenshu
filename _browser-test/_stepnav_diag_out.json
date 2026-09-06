@@ -1,0 +1,74 @@
+﻿{
+ "found": true,
+ "navClass": "step-nav-scroll px-3 pb-2 pt-2 wenshu-step-nav",
+ "innerClass": "flex flex-wrap items-center w-full",
+ "innerStyle": "",
+ "flexWrapApplied": "wrap",
+ "displayApplied": "flex",
+ "breakDivExists": true,
+ "breakDivClass": "w-full basis-full h-0",
+ "rows": [
+  {
+   "top": 158,
+   "n": 14,
+   "items": [
+    {
+     "x": 196,
+     "txt": "输入主题"
+    },
+    {
+     "x": 196,
+     "txt": "灵感创作"
+    },
+    {
+     "x": 190,
+     "txt": "世界观设定"
+    },
+    {
+     "x": 190,
+     "txt": "金手指设定"
+    },
+    {
+     "x": 184,
+     "txt": "主要人物设定"
+    },
+    {
+     "x": 196,
+     "txt": "势力设定"
+    },
+    {
+     "x": 184,
+     "txt": "人物关系图谱"
+    },
+    {
+     "x": 1532,
+     "txt": "简介卖点"
+    },
+    {
+     "x": 1520,
+     "txt": "整体故事大纲"
+    },
+    {
+     "x": 1520,
+     "txt": "关键剧情节点"
+    },
+    {
+     "x": 1520,
+     "txt": "分卷章节划分"
+    },
+    {
+     "x": 1520,
+     "txt": "逐章生成正文"
+    },
+    {
+     "x": 1532,
+     "txt": "避坑检查"
+    },
+    {
+     "x": 1528,
+     "txt": "制作小说封面"
+    }
+   ]
+  }
+ ]
+}

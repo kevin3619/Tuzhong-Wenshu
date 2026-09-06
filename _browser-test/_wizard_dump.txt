@@ -1,0 +1,126 @@
+﻿IN_WIZARD=true URL=https://tuzhongwang.xyz/tuzhong-wenshu
+{
+ "head": "途中文枢作品书架设定中心风格工坊SKILL使用指南VIP会员个人设置管理后台收起菜单KKevin管理员← 返回书架分卷章节划分📋草稿箱1智能推荐：智能推荐模型（免费）▼输入主题灵感创作世界观设定金手指设定主要人物设定势力设定人物关系图谱简介卖点整体故事大纲关键剧情节点分卷章节划分逐章生成正文避坑检查制作小说封面上一步开始写正文(self.__next_f=self.__next_f||[]).push([0])self.__next_f.push([1,\"1:\\\"$Sreact.fragment\\\"\\n2:I[40859,[\\\"/tuzhong-wenshu/_next/static/chu",
+ "clicks": [
+  {
+   "t": "途中文枢",
+   "cls": "flex items-center h-14 px-4 border-b bor"
+  },
+  {
+   "t": "作品书架",
+   "cls": "flex items-center h-10 px-3 rounded-lg t"
+  },
+  {
+   "t": "设定中心",
+   "cls": "flex items-center h-10 px-3 rounded-lg t"
+  },
+  {
+   "t": "风格工坊",
+   "cls": "flex items-center h-10 px-3 rounded-lg t"
+  },
+  {
+   "t": "SKILL",
+   "cls": "flex items-center h-10 px-3 rounded-lg t"
+  },
+  {
+   "t": "使用指南",
+   "cls": "flex items-center h-10 px-3 rounded-lg t"
+  },
+  {
+   "t": "VIP会员",
+   "cls": "flex items-center h-10 px-3 rounded-lg t"
+  },
+  {
+   "t": "个人设置",
+   "cls": "flex items-center h-10 px-3 rounded-lg t"
+  },
+  {
+   "t": "管理后台",
+   "cls": "flex items-center h-10 px-3 rounded-lg t"
+  },
+  {
+   "t": "收起菜单",
+   "cls": "flex items-center w-full h-11 px-3 round"
+  },
+  {
+   "t": "KKevin管理员",
+   "cls": "flex items-center space-x-2 pl-3 border-"
+  },
+  {
+   "t": "← 返回书架",
+   "cls": "text-sm font-medium wenshu-model-btn px-"
+  },
+  {
+   "t": "📋草稿箱1",
+   "cls": "text-sm font-medium wenshu-model-btn px-"
+  },
+  {
+   "t": "智能推荐：智能推荐模型（免费）▼",
+   "cls": "text-sm text-white/90 bg-white/10 hover:"
+  },
+  {
+   "t": "输入主题",
+   "cls": "inline-flex flex-col items-center gap-1 "
+  },
+  {
+   "t": "灵感创作",
+   "cls": "inline-flex flex-col items-center gap-1 "
+  },
+  {
+   "t": "世界观设定",
+   "cls": "inline-flex flex-col items-center gap-1 "
+  },
+  {
+   "t": "金手指设定",
+   "cls": "inline-flex flex-col items-center gap-1 "
+  },
+  {
+   "t": "主要人物设定",
+   "cls": "inline-flex flex-col items-center gap-1 "
+  },
+  {
+   "t": "势力设定",
+   "cls": "inline-flex flex-col items-center gap-1 "
+  },
+  {
+   "t": "人物关系图谱",
+   "cls": "inline-flex flex-col items-center gap-1 "
+  },
+  {
+   "t": "简介卖点",
+   "cls": "inline-flex flex-col items-center gap-1 "
+  },
+  {
+   "t": "整体故事大纲",
+   "cls": "inline-flex flex-col items-center gap-1 "
+  },
+  {
+   "t": "关键剧情节点",
+   "cls": "inline-flex flex-col items-center gap-1 "
+  },
+  {
+   "t": "分卷章节划分",
+   "cls": "inline-flex flex-col items-center gap-1 "
+  },
+  {
+   "t": "逐章生成正文",
+   "cls": "inline-flex flex-col items-center gap-1 "
+  },
+  {
+   "t": "避坑检查",
+   "cls": "inline-flex flex-col items-center gap-1 "
+  },
+  {
+   "t": "制作小说封面",
+   "cls": "inline-flex flex-col items-center gap-1 "
+  },
+  {
+   "t": "上一步",
+   "cls": "flex items-center space-x-2 px-6 py-2 bo"
+  },
+  {
+   "t": "开始写正文",
+   "cls": "flex items-center space-x-2 px-6 py-2 ro"
+  }
+ ]
+}

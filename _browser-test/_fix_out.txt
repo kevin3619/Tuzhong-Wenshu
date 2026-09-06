@@ -1,0 +1,4 @@
+﻿GET_OK topKeys= worldSettings,foreshadowings,timelineEvents,worldbuilding,powerSystem,characters,factions,keyPlots,cover,idea,synopsis,outline,relationships,chapters
+FIX_AFTER_FILL= {"contradiction":23}
+POST_RESULT= {"status":200,"body":{"success":true,"data":{"chapters":{"volumes":[{"id":"vol-1","volumeNumber":1,"name":"第1卷·魂穿肇庆","summary":"核心主题：觉醒与立国。第1-5章：魂穿朱由榔，扬州十日前夕；第6-15章：摆脱懦弱形象，初展帝王心术；第16-30章：组建班底，联络瞿式耜、何腾蛟；第31-50章：肇庆登基，永历政权建立故事从1645年永历帝朱由榔魂穿肇庆监国，马士英以「清君侧」为由架空军权。朱由榔深夜召见陈邦彦推行「新军整编令」，当众撕毁东林党排兵布防图。","coreOb
+DONE

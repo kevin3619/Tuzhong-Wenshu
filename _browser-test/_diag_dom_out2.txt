@@ -1,0 +1,13 @@
+﻿{
+ "sidebarBtns": [],
+ "buttons": [
+  "收起菜单",
+  "KKevin管理员",
+  "草稿箱1",
+  "AI全自动生成",
+  "新建作品"
+ ],
+ "h1": "欢迎回来，创作者！",
+ "hasCharPage": false,
+ "hasFacPage": false
+}

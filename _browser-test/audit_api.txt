@@ -1,0 +1,151 @@
+===== 永历中兴 /api/settings 离线审计 =====
+TOP_KEYS=["worldSettings","foreshadowings","timelineEvents","worldbuilding","powerSystem","characters","factions","keyPlots","cover","idea","synopsis","outline","relationships"]
+
+EMPTY_TPL_BY_SECTION={
+ "idea": {
+  "empty": 1,
+  "tpl": 0,
+  "size": 26
+ },
+ "worldbuilding": {
+  "empty": 1,
+  "tpl": 0,
+  "size": 34
+ },
+ "powerSystem": {
+  "empty": 4,
+  "tpl": 0,
+  "size": 3
+ },
+ "characters": {
+  "empty": 279,
+  "tpl": 57,
+  "size": 7
+ },
+ "factions": {
+  "empty": 0,
+  "tpl": 0,
+  "size": 1
+ },
+ "relationships": {
+  "empty": 87,
+  "tpl": 0,
+  "size": 1
+ },
+ "synopsis": {
+  "empty": 7,
+  "tpl": 0,
+  "size": 18
+ },
+ "outline": {
+  "empty": 1,
+  "tpl": 0,
+  "size": 17
+ },
+ "keyPlots": {
+  "empty": 0,
+  "tpl": 0,
+  "size": 6
+ },
+ "chapters": "ABSENT"
+}
+
+TOTAL_EMPTY_NODES=380
+TOTAL_TPL_SAMPLES=57
+
+===== 关键字段空值条目计数 =====
+characterJobGoal: 42
+    characters|entry.characters.protagonist.job
+    characters|entry.characters.femaleLead.goal
+    characters|entry.characters.antagonists[2].job
+    characters|entry.characters.antagonists[2].goal
+    characters|entry.characters.antagonists[3].goal
+    characters|entry.characters.antagonists[4].goal
+    characters|entry.characters.antagonists[5].goal
+    characters|entry.characters.antagonists[6].goal
+    characters|entry.characters.antagonists[7].job
+    characters|entry.characters.antagonists[7].goal
+    characters|entry.characters.antagonists[8].goal
+    characters|entry.characters.antagonists[9].goal
+characterPower: 236
+    characters|entry.characters.protagonist.arcNodes[0].powerLevel
+    characters|entry.characters.protagonist.arcNodes[1].powerLevel
+    characters|entry.characters.protagonist.arcNodes[2].powerLevel
+    characters|entry.characters.protagonist.arcNodes[3].powerLevel
+    characters|entry.characters.protagonist.arcNodes[4].powerLevel
+    characters|entry.characters.femaleLead.arcNodes[0].powerLevel
+    characters|entry.characters.femaleLead.arcNodes[1].powerLevel
+    characters|entry.characters.femaleLead.arcNodes[2].powerLevel
+    characters|entry.characters.femaleLead.arcNodes[3].powerLevel
+    characters|entry.characters.femaleLead.arcNodes[4].powerLevel
+    characters|entry.characters.antagonist.arcNodes[0].powerLevel
+    characters|entry.characters.antagonist.arcNodes[1].powerLevel
+factionFields: 125
+    characters|entry.characters.femaleLead.goal
+    characters|entry.characters.antagonists[2].goal
+    characters|entry.characters.antagonists[3].goal
+    characters|entry.characters.antagonists[4].goal
+    characters|entry.characters.antagonists[5].goal
+    characters|entry.characters.antagonists[6].goal
+    characters|entry.characters.antagonists[7].goal
+    characters|entry.characters.antagonists[8].goal
+    characters|entry.characters.antagonists[9].goal
+    characters|entry.characters.antagonists[10].goal
+    characters|entry.characters.antagonists[11].goal
+    characters|entry.characters.antagonists[12].goal
+chapterVol: 0
+relationship: 87
+    relationships|entry.relationships.relationships[0].deepConflict
+    relationships|entry.relationships.relationships[1].deepConflict
+    relationships|entry.relationships.relationships[2].deepConflict
+    relationships|entry.relationships.relationships[3].deepConflict
+    relationships|entry.relationships.relationships[4].deepConflict
+    relationships|entry.relationships.relationships[5].deepConflict
+    relationships|entry.relationships.relationships[6].deepConflict
+    relationships|entry.relationships.relationships[7].deepConflict
+    relationships|entry.relationships.relationships[8].deepConflict
+    relationships|entry.relationships.relationships[9].deepConflict
+    relationships|entry.relationships.relationships[10].deepConflict
+    relationships|entry.relationships.relationships[11].deepConflict
+
+===== 模板占位样例 (first 40) =====
+  characters|entry.characters.supporting[0].personality:朱由崧性格鲜明，为人处世有其独特原则，在故事中展现出多面性的性格特征
+  characters|entry.characters.supporting[0].hiddenTraits:朱由崧以弘光帝（福王）；弘光朝昏君、历史悲剧人物、被清军俘虏示人，外表朱由崧性格鲜明，心底却藏着一段不愿对人言说的过往，
+  characters|entry.characters.supporting[1].personality:朱聿键性格鲜明，为人处世有其独特原则，在故事中展现出多面性的性格特征
+  characters|entry.characters.supporting[1].hiddenTraits:朱聿键以隆武帝（唐王）；有志无权的皇帝、历史悲剧人物、被清军俘虏后绝食而亡示人，外表朱聿键性格鲜明，心底却藏着一段不愿对
+  characters|entry.characters.supporting[2].personality:朱聿鐭性格鲜明，为人处世有其独特原则，在故事中展现出多面性的性格特征
+  characters|entry.characters.supporting[2].hiddenTraits:朱聿鐭以绍武帝（唐王之弟）；短命皇帝、内斗代表、被清军攻破后自缢示人，外表朱聿鐭性格鲜明，心底却藏着一段不愿对人言说的过
+  characters|entry.characters.supporting[5].personality:郑成功性格鲜明，为人处世有其独特原则，在故事中展现出多面性的性格特征
+  characters|entry.characters.supporting[5].hiddenTraits:郑成功以抗清名将（盟友）；重要盟友、水师力量、后期收复台湾示人，外表郑成功性格鲜明，心底却藏着一段不愿对人言说的过往，往
+  characters|entry.characters.supporting[6].personality:李定国性格鲜明，为人处世有其独特原则，在故事中展现出多面性的性格特征
+  characters|entry.characters.supporting[6].hiddenTraits:李定国以大西军将领（盟友）；猛将盟友、北伐主力、两蹶名王示人，外表李定国性格鲜明，心底却藏着一段不愿对人言说的过往，往往
+  characters|entry.characters.supporting[7].personality:赵虎性格鲜明，为人处世有其独特原则，在故事中展现出多面性的性格特征
+  characters|entry.characters.supporting[7].hiddenTraits:赵虎以亲卫队统领示人，外表赵虎性格鲜明，心底却藏着一段不愿对人言说的过往，往往在关键抉择时左右其判断
+  characters|entry.characters.supporting[7].contradiction:表面从容不迫，实则赵虎以亲卫队统领示人，外表赵虎性格鲜明。
+  characters|entry.characters.supporting[8].personality:王忠赐性格鲜明，为人处世有其独特原则，在故事中展现出多面性的性格特征
+  characters|entry.characters.supporting[8].hiddenTraits:王忠赐以联络官示人，外表王忠赐性格鲜明，心底却藏着一段不愿对人言说的过往，往往在关键抉择时左右其判断
+  characters|entry.characters.supporting[8].contradiction:表面从容不迫，实则王忠赐以联络官示人，外表王忠赐性格鲜明。
+  characters|entry.characters.supporting[9].personality:朱落性格鲜明，为人处世有其独特原则，在故事中展现出多面性的性格特征
+  characters|entry.characters.supporting[9].hiddenTraits:朱落以内务总管示人，外表朱落性格鲜明，心底却藏着一段不愿对人言说的过往，往往在关键抉择时左右其判断
+  characters|entry.characters.supporting[9].contradiction:表面从容不迫，实则朱落以内务总管示人，外表朱落性格鲜明。
+  characters|entry.characters.supporting[10].personality:白柏年性格鲜明，为人处世有其独特原则，在故事中展现出多面性的性格特征
+  characters|entry.characters.supporting[10].hiddenTraits:白柏年以斥候队长示人，外表白柏年性格鲜明，心底却藏着一段不愿对人言说的过往，往往在关键抉择时左右其判断
+  characters|entry.characters.supporting[10].contradiction:表面从容不迫，实则白柏年以斥候队长示人，外表白柏年性格鲜明。
+  characters|entry.characters.supporting[11].personality:孙思远性格鲜明，为人处世有其独特原则，在故事中展现出多面性的性格特征
+  characters|entry.characters.supporting[11].hiddenTraits:孙思远以情报主事示人，外表孙思远性格鲜明，心底却藏着一段不愿对人言说的过往，往往在关键抉择时左右其判断
+  characters|entry.characters.supporting[11].contradiction:表面从容不迫，实则孙思远以情报主事示人，外表孙思远性格鲜明。
+  characters|entry.characters.supporting[12].personality:周德全性格鲜明，为人处世有其独特原则，在故事中展现出多面性的性格特征
+  characters|entry.characters.supporting[12].hiddenTraits:周德全以军需官示人，外表周德全性格鲜明，心底却藏着一段不愿对人言说的过往，往往在关键抉择时左右其判断
+  characters|entry.characters.supporting[12].contradiction:表面从容不迫，实则周德全以军需官示人，外表周德全性格鲜明。
+  characters|entry.characters.supporting[13].personality:焦琏性格鲜明，为人处世有其独特原则，在故事中展现出多面性的性格特征
+  characters|entry.characters.supporting[13].hiddenTraits:焦琏以参将；忠诚将领、城防主力、曾救驾立功示人，外表焦琏性格鲜明，心底却藏着一段不愿对人言说的过往，往往在关键抉择时左右
+  characters|entry.characters.supporting[13].contradiction:表面从容不迫，实则焦琏以参将；忠诚将领、城防主力、曾救驾立功示人，外表焦琏性格鲜明。
+  characters|entry.characters.supporting[14].personality:庞天寿性格鲜明，为人处世有其独特原则，在故事中展现出多面性的性格特征
+  characters|entry.characters.supporting[14].hiddenTraits:庞天寿以心腹太监；情报枢纽、内廷总管、监视朝臣示人，外表庞天寿性格鲜明，心底却藏着一段不愿对人言说的过往，往往在关键抉择
+  characters|entry.characters.supporting[15].personality:张同敞性格鲜明，为人处世有其独特原则，在故事中展现出多面性的性格特征
+  characters|entry.characters.supporting[15].hiddenTraits:张同敞以锦衣卫指挥佥事；锦衣卫骨干、秘密行动担当、忠诚护主示人，外表张同敞性格鲜明，心底却藏着一段不愿对人言说的过往，往
+  characters|entry.characters.supporting[16].personality:堵胤锡性格鲜明，为人处世有其独特原则，在故事中展现出多面性的性格特征
+  characters|entry.characters.supporting[16].hiddenTraits:堵胤锡以湖广参政；军队建设者、战略家、地方大员示人，外表堵胤锡性格鲜明，心底却藏着一段不愿对人言说的过往，往往在关键抉择
+  characters|entry.characters.supporting[17].personality:何腾蛟性格鲜明，为人处世有其独特原则，在故事中展现出多面性的性格特征
+  characters|entry.characters.supporting[17].hiddenTraits:何腾蛟以湖广巡抚；湖广支柱、联合各路兵马、历史上壮烈殉国（小说中将被改写）示人，外表何腾蛟性格鲜明，心底却藏着一段不愿对
+  characters|entry.characters.supporting[18].personality:吴万雄性格鲜明，为人处世有其独特原则，在故事中展现出多面性的性格特征

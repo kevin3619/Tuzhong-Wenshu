@@ -1,0 +1,304 @@
+{
+  "meta": {
+    "version": "v7-platinum-prompts",
+    "generatedAt": "2026-07-25T04:28:35.140Z",
+    "startChapter": 1,
+    "endChapter": 25,
+    "totalCount": 25,
+    "note": "本摘要包含每章prompt产出信息，可用于抽查或批量投喂"
+  },
+  "spotCheckGuide": {
+    "recommendCheck": [
+      1,
+      12,
+      25
+    ],
+    "checkItems": [
+      "四段式结构完整性（冲突/博弈/高潮/收益四段比例是否正确）",
+      "爽点类型是否匹配剧情卡指定类型",
+      "字数区间2000-2500字是否达标",
+      "战力逻辑5层支撑是否暗合",
+      "下章钩子与下一章冲突是否衔接",
+      "登场角色是否严格按剧情卡限制",
+      "是否存在脚手架/元叙事句",
+      "是否存在AI高频词"
+    ]
+  },
+  "chapters": [
+    {
+      "chapter": 1,
+      "title": "残躯濒死，巫祖系统",
+      "volume": 1,
+      "arc": "部落篇",
+      "coolPoint": "血脉碾压",
+      "endHook": "新敌现身",
+      "characters": 3,
+      "promptFile": "ch_001_残躯濒死巫祖系统.txt",
+      "promptSizeKB": "24.3"
+    },
+    {
+      "chapter": 2,
+      "title": "扮猪吃虎，隐忍蛰伏",
+      "volume": 1,
+      "arc": "部落篇",
+      "coolPoint": "图腾镇杀",
+      "endHook": "签到提示",
+      "characters": 4,
+      "promptFile": "ch_002_扮猪吃虎隐忍蛰伏.txt",
+      "promptSizeKB": "24.4"
+    },
+    {
+      "chapter": 3,
+      "title": "晨起签到，肉身精进",
+      "volume": 1,
+      "arc": "部落篇",
+      "coolPoint": "扮猪吃虎",
+      "endHook": "秘境开启",
+      "characters": 2,
+      "promptFile": "ch_003_晨起签到肉身精进.txt",
+      "promptSizeKB": "24.3"
+    },
+    {
+      "chapter": 4,
+      "title": "族人嘲讽，暗流涌动",
+      "volume": 1,
+      "arc": "部落篇",
+      "coolPoint": "系统落地",
+      "endHook": "图腾异动",
+      "characters": 3,
+      "promptFile": "ch_004_族人嘲讽暗流涌动.txt",
+      "promptSizeKB": "24.4"
+    },
+    {
+      "chapter": 5,
+      "title": "林间偶遇，清冷巫女",
+      "volume": 1,
+      "arc": "部落篇",
+      "coolPoint": "护族打脸",
+      "endHook": "祖血沸腾",
+      "characters": 5,
+      "promptFile": "ch_005_林间偶遇清冷巫女.txt",
+      "promptSizeKB": "24.4"
+    },
+    {
+      "chapter": 6,
+      "title": "凶兽窥探，徒手退敌",
+      "volume": 1,
+      "arc": "部落篇",
+      "coolPoint": "废柴反杀",
+      "endHook": "封神异动",
+      "characters": 2,
+      "promptFile": "ch_006_凶兽窥探徒手退敌.txt",
+      "promptSizeKB": "24.4"
+    },
+    {
+      "chapter": 7,
+      "title": "秘密签到，血脉提纯",
+      "volume": 1,
+      "arc": "部落篇",
+      "coolPoint": "血脉碾压",
+      "endHook": "新敌现身",
+      "characters": 4,
+      "promptFile": "ch_007_秘密签到血脉提纯.txt",
+      "promptSizeKB": "24.4"
+    },
+    {
+      "chapter": 8,
+      "title": "同族刁难，借力打力",
+      "volume": 1,
+      "arc": "部落篇",
+      "coolPoint": "图腾镇杀",
+      "endHook": "签到提示",
+      "characters": 4,
+      "promptFile": "ch_008_同族刁难借力打力.txt",
+      "promptSizeKB": "24.4"
+    },
+    {
+      "chapter": 9,
+      "title": "试炼将至，暗流竞争",
+      "volume": 1,
+      "arc": "部落篇",
+      "coolPoint": "扮猪吃虎",
+      "endHook": "秘境开启",
+      "characters": 2,
+      "promptFile": "ch_009_试炼将至暗流竞争.txt",
+      "promptSizeKB": "24.3"
+    },
+    {
+      "chapter": 10,
+      "title": "夜半苦修，夯实根基",
+      "volume": 1,
+      "arc": "部落篇",
+      "coolPoint": "系统落地",
+      "endHook": "图腾异动",
+      "characters": 4,
+      "promptFile": "ch_010_夜半苦修夯实根基.txt",
+      "promptSizeKB": "24.4"
+    },
+    {
+      "chapter": 11,
+      "title": "试炼开幕，众人轻视",
+      "volume": 1,
+      "arc": "部落篇",
+      "coolPoint": "护族打脸",
+      "endHook": "新敌现身",
+      "characters": 4,
+      "promptFile": "ch_011_试炼开幕众人轻视.txt",
+      "promptSizeKB": "24.4"
+    },
+    {
+      "chapter": 12,
+      "title": "首轮对决，瞬败强敌",
+      "volume": 1,
+      "arc": "部落篇",
+      "coolPoint": "废柴反杀",
+      "endHook": "签到提示",
+      "characters": 2,
+      "promptFile": "ch_012_首轮对决瞬败强敌.txt",
+      "promptSizeKB": "24.3"
+    },
+    {
+      "chapter": 13,
+      "title": "祖血微动，图腾共鸣",
+      "volume": 1,
+      "arc": "部落篇",
+      "coolPoint": "血脉碾压",
+      "endHook": "秘境开启",
+      "characters": 4,
+      "promptFile": "ch_013_祖血微动图腾共鸣.txt",
+      "promptSizeKB": "24.3"
+    },
+    {
+      "chapter": 14,
+      "title": "接连取胜，逆势突围",
+      "volume": 1,
+      "arc": "部落篇",
+      "coolPoint": "图腾镇杀",
+      "endHook": "图腾异动",
+      "characters": 6,
+      "promptFile": "ch_014_接连取胜逆势突围.txt",
+      "promptSizeKB": "24.5"
+    },
+    {
+      "chapter": 15,
+      "title": "秘境签到，斩获宝药",
+      "volume": 1,
+      "arc": "部落篇",
+      "coolPoint": "扮猪吃虎",
+      "endHook": "祖血沸腾",
+      "characters": 3,
+      "promptFile": "ch_015_秘境签到斩获宝药.txt",
+      "promptSizeKB": "24.4"
+    },
+    {
+      "chapter": 16,
+      "title": "强敌针对，恶意围剿",
+      "volume": 1,
+      "arc": "部落篇",
+      "coolPoint": "系统落地",
+      "endHook": "封神异动",
+      "characters": 3,
+      "promptFile": "ch_016_强敌针对恶意围剿.txt",
+      "promptSizeKB": "24.4"
+    },
+    {
+      "chapter": 17,
+      "title": "以一敌三，碾压全场",
+      "volume": 1,
+      "arc": "部落篇",
+      "coolPoint": "护族打脸",
+      "endHook": "新敌现身",
+      "characters": 4,
+      "promptFile": "ch_017_以一敌三碾压全场.txt",
+      "promptSizeKB": "24.3"
+    },
+    {
+      "chapter": 18,
+      "title": "药巫相助，暗递机缘",
+      "volume": 1,
+      "arc": "部落篇",
+      "coolPoint": "废柴反杀",
+      "endHook": "签到提示",
+      "characters": 4,
+      "promptFile": "ch_018_药巫相助暗递机缘.txt",
+      "promptSizeKB": "24.4"
+    },
+    {
+      "chapter": 19,
+      "title": "试炼登顶，全场哗然",
+      "volume": 1,
+      "arc": "部落篇",
+      "coolPoint": "血脉碾压",
+      "endHook": "秘境开启",
+      "characters": 3,
+      "promptFile": "ch_019_试炼登顶全场哗然.txt",
+      "promptSizeKB": "24.4"
+    },
+    {
+      "chapter": 20,
+      "title": "初步觉醒，微末图腾",
+      "volume": 1,
+      "arc": "部落篇",
+      "coolPoint": "图腾镇杀",
+      "endHook": "图腾异动",
+      "characters": 4,
+      "promptFile": "ch_020_初步觉醒微末图腾.txt",
+      "promptSizeKB": "24.4"
+    },
+    {
+      "chapter": 21,
+      "title": "长老重视，破格培养",
+      "volume": 1,
+      "arc": "部落篇",
+      "coolPoint": "扮猪吃虎",
+      "endHook": "新敌现身",
+      "characters": 3,
+      "promptFile": "ch_021_长老重视破格培养.txt",
+      "promptSizeKB": "24.3"
+    },
+    {
+      "chapter": 22,
+      "title": "族人改观，心态反转",
+      "volume": 1,
+      "arc": "部落篇",
+      "coolPoint": "系统落地",
+      "endHook": "签到提示",
+      "characters": 3,
+      "promptFile": "ch_022_族人改观心态反转.txt",
+      "promptSizeKB": "24.4"
+    },
+    {
+      "chapter": 23,
+      "title": "后山签到，解锁巫技",
+      "volume": 1,
+      "arc": "部落篇",
+      "coolPoint": "护族打脸",
+      "endHook": "秘境开启",
+      "characters": 5,
+      "promptFile": "ch_023_后山签到解锁巫技.txt",
+      "promptSizeKB": "24.4"
+    },
+    {
+      "chapter": 24,
+      "title": "边境告急，凶兽围城",
+      "volume": 1,
+      "arc": "部落篇",
+      "coolPoint": "废柴反杀",
+      "endHook": "图腾异动",
+      "characters": 2,
+      "promptFile": "ch_024_边境告急凶兽围城.txt",
+      "promptSizeKB": "24.3"
+    },
+    {
+      "chapter": 25,
+      "title": "主动请缨，镇守边境",
+      "volume": 1,
+      "arc": "部落篇",
+      "coolPoint": "血脉碾压",
+      "endHook": "祖血沸腾",
+      "characters": 5,
+      "promptFile": "ch_025_主动请缨镇守边境.txt",
+      "promptSizeKB": "24.4"
+    }
+  ]
+}

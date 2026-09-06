@@ -1,0 +1,186 @@
+﻿{
+ "found": true,
+ "viewportW": 1600,
+ "chain": [
+  {
+   "i": 0,
+   "cls": "step-nav-scroll px-3 pb-2",
+   "tag": "DIV",
+   "w": 1360,
+   "overflowX": "visible",
+   "display": "block"
+  },
+  {
+   "i": 1,
+   "cls": "wenshu-top-bar select-none rounded-t-2xl",
+   "tag": "DIV",
+   "w": 1360,
+   "overflowX": "visible",
+   "display": "block"
+  },
+  {
+   "i": 2,
+   "cls": "rounded-2xl shadow-2xl w-full",
+   "tag": "DIV",
+   "w": 1360,
+   "overflowX": "visible",
+   "display": "flex"
+  },
+  {
+   "i": 3,
+   "cls": "rounded-2xl shadow-xl w-full",
+   "tag": "DIV",
+   "w": 1360,
+   "overflowX": "hidden",
+   "display": "flex"
+  },
+  {
+   "i": 4,
+   "cls": "py-4",
+   "tag": "DIV",
+   "w": 1360,
+   "overflowX": "visible",
+   "display": "block"
+  },
+  {
+   "i": 5,
+   "cls": "",
+   "tag": "DIV",
+   "w": 1360,
+   "overflowX": "visible",
+   "display": "block"
+  },
+  {
+   "i": 6,
+   "cls": "flex-1 min-h-0 overflow-y-auto",
+   "tag": "MAIN",
+   "w": 1392,
+   "overflowX": "hidden",
+   "display": "block"
+  },
+  {
+   "i": 7,
+   "cls": "flex flex-col flex-1",
+   "tag": "DIV",
+   "w": 1392,
+   "overflowX": "visible",
+   "display": "flex"
+  },
+  {
+   "i": 8,
+   "cls": "flex h-screen overflow-hidden",
+   "tag": "DIV",
+   "w": 1600,
+   "overflowX": "hidden",
+   "display": "flex"
+  },
+  {
+   "i": 9,
+   "cls": "h-full antialiased",
+   "tag": "BODY",
+   "w": 1600,
+   "overflowX": "visible",
+   "display": "block"
+  },
+  {
+   "i": 10,
+   "cls": "",
+   "tag": "HTML",
+   "w": 1600,
+   "overflowX": "visible",
+   "display": "block"
+  }
+ ],
+ "btns": [
+  {
+   "y": 158,
+   "x": 140,
+   "w": 176,
+   "txt": "输入主题OpenRo"
+  },
+  {
+   "y": 158,
+   "x": 140,
+   "w": 176,
+   "txt": "灵感创作OpenRo"
+  },
+  {
+   "y": 158,
+   "x": 140,
+   "w": 176,
+   "txt": "世界观设定OpenR"
+  },
+  {
+   "y": 158,
+   "x": 140,
+   "w": 176,
+   "txt": "金手指设定OpenR"
+  },
+  {
+   "y": 158,
+   "x": 178,
+   "w": 99,
+   "txt": "主要人物设定Deep"
+  },
+  {
+   "y": 158,
+   "x": 170,
+   "w": 116,
+   "txt": "势力设定综合全能：G"
+  },
+  {
+   "y": 158,
+   "x": 170,
+   "w": 116,
+   "txt": "人物关系图谱综合全能"
+  },
+  {
+   "y": 158,
+   "x": 1506,
+   "w": 116,
+   "txt": "简介卖点综合全能：G"
+  },
+  {
+   "y": 158,
+   "x": 1506,
+   "w": 116,
+   "txt": "整体故事大纲综合全能"
+  },
+  {
+   "y": 158,
+   "x": 1506,
+   "w": 116,
+   "txt": "关键剧情节点综合全能"
+  },
+  {
+   "y": 158,
+   "x": 1506,
+   "w": 116,
+   "txt": "分卷章节划分综合全能"
+  },
+  {
+   "y": 158,
+   "x": 1506,
+   "w": 116,
+   "txt": "逐章生成正文综合全能"
+  },
+  {
+   "y": 158,
+   "x": 1506,
+   "w": 116,
+   "txt": "避坑检查综合全能：G"
+  },
+  {
+   "y": 158,
+   "x": 1514,
+   "w": 116,
+   "txt": "制作小说封面综合全能"
+  }
+ ],
+ "bdRect": {
+  "x": 236,
+  "y": 191,
+  "w": 1336,
+  "h": 0
+ }
+}

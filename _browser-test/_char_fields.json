@@ -1,0 +1,313 @@
+﻿{
+ "count": 44,
+ "list": [
+  {
+   "role": "protagonist",
+   "name": "朱由榔",
+   "birthplace": "肇庆桂王府书房（魂穿附身处），原籍广西桂林",
+   "arcCount": 5,
+   "arcStages": "起步·初心 | 觉醒·转折 | 成长·磨砺 | 巅峰·高光 | 超脱·归宿"
+  },
+  {
+   "role": "femaleLead",
+   "name": "玉竹",
+   "birthplace": "生于前明都城，自幼长于斯地，当地风土人情塑成其早年性情",
+   "arcCount": 5,
+   "arcStages": "起步·初心 | 觉醒·转折 | 成长·磨砺 | 巅峰·高光 | 超脱·归宿"
+  },
+  {
+   "role": "antagonist",
+   "name": "丁魁楚",
+   "birthplace": "生于前明都城，自幼长于斯地，当地风土人情塑成其早年性情",
+   "arcCount": 5,
+   "arcStages": "起步·初心 | 觉醒·转折 | 成长·磨砺 | 巅峰·高光 | 超脱·归宿"
+  },
+  {
+   "role": "antagonists",
+   "name": "丁魁楚",
+   "birthplace": "生于前明都城，自幼长于斯地，当地风土人情塑成其早年性情",
+   "arcCount": 5,
+   "arcStages": "起步·初心 | 觉醒·转折 | 成长·磨砺 | 巅峰·高光 | 超脱·归宿"
+  },
+  {
+   "role": "antagonists",
+   "name": "多铎",
+   "birthplace": "生于前明都城，自幼长于斯地，当地风土人情塑成其早年性情",
+   "arcCount": 5,
+   "arcStages": "起步·初心 | 觉醒·转折 | 成长·磨砺 | 巅峰·高光 | 超脱·归宿"
+  },
+  {
+   "role": "antagonists",
+   "name": "马士英",
+   "birthplace": "生于前明都城，自幼长于斯地，当地风土人情塑成其早年性情",
+   "arcCount": 5,
+   "arcStages": "起步·初心 | 觉醒·转折 | 成长·磨砺 | 巅峰·高光 | 超脱·归宿"
+  },
+  {
+   "role": "antagonists",
+   "name": "阮大铖",
+   "birthplace": "生于前明都城，自幼长于斯地，当地风土人情塑成其早年性情",
+   "arcCount": 5,
+   "arcStages": "起步·初心 | 觉醒·转折 | 成长·磨砺 | 巅峰·高光 | 超脱·归宿"
+  },
+  {
+   "role": "antagonists",
+   "name": "吴三桂",
+   "birthplace": "生于前明都城，自幼长于斯地，当地风土人情塑成其早年性情",
+   "arcCount": 5,
+   "arcStages": "起步·初心 | 觉醒·转折 | 成长·磨砺 | 巅峰·高光 | 超脱·归宿"
+  },
+  {
+   "role": "antagonists",
+   "name": "多尔衮",
+   "birthplace": "生于前明都城，自幼长于斯地，当地风土人情塑成其早年性情",
+   "arcCount": 5,
+   "arcStages": "起步·初心 | 觉醒·转折 | 成长·磨砺 | 巅峰·高光 | 超脱·归宿"
+  },
+  {
+   "role": "antagonists",
+   "name": "孔有德",
+   "birthplace": "生于前明都城，自幼长于斯地，当地风土人情塑成其早年性情",
+   "arcCount": 5,
+   "arcStages": "起步·初心 | 觉醒·转折 | 成长·磨砺 | 巅峰·高光 | 超脱·归宿"
+  },
+  {
+   "role": "antagonists",
+   "name": "李成栋",
+   "birthplace": "生于前明都城，自幼长于斯地，当地风土人情塑成其早年性情",
+   "arcCount": 5,
+   "arcStages": "起步·初心 | 觉醒·转折 | 成长·磨砺 | 巅峰·高光 | 超脱·归宿"
+  },
+  {
+   "role": "antagonists",
+   "name": "耿仲明",
+   "birthplace": "生于前明都城，自幼长于斯地，当地风土人情塑成其早年性情",
+   "arcCount": 5,
+   "arcStages": "起步·初心 | 觉醒·转折 | 成长·磨砺 | 巅峰·高光 | 超脱·归宿"
+  },
+  {
+   "role": "antagonists",
+   "name": "尚可喜",
+   "birthplace": "生于前明都城，自幼长于斯地，当地风土人情塑成其早年性情",
+   "arcCount": 5,
+   "arcStages": "起步·初心 | 觉醒·转折 | 成长·磨砺 | 巅峰·高光 | 超脱·归宿"
+  },
+  {
+   "role": "antagonists",
+   "name": "张献忠",
+   "birthplace": "生于前明都城，自幼长于斯地，当地风土人情塑成其早年性情",
+   "arcCount": 5,
+   "arcStages": "起步·初心 | 觉醒·转折 | 成长·磨砺 | 巅峰·高光 | 超脱·归宿"
+  },
+  {
+   "role": "antagonists",
+   "name": "孙可望",
+   "birthplace": "生于前明都城，自幼长于斯地，当地风土人情塑成其早年性情",
+   "arcCount": 5,
+   "arcStages": "起步·初心 | 觉醒·转折 | 成长·磨砺 | 巅峰·高光 | 超脱·归宿"
+  },
+  {
+   "role": "antagonists",
+   "name": "金声桓",
+   "birthplace": "生于前明都城，自幼长于斯地，当地风土人情塑成其早年性情",
+   "arcCount": 5,
+   "arcStages": "起步·初心 | 觉醒·转折 | 成长·磨砺 | 巅峰·高光 | 超脱·归宿"
+  },
+  {
+   "role": "antagonists",
+   "name": "郑芝龙",
+   "birthplace": "生于前明都城，自幼长于斯地，当地风土人情塑成其早年性情",
+   "arcCount": 5,
+   "arcStages": "起步·初心 | 觉醒·转折 | 成长·磨砺 | 巅峰·高光 | 超脱·归宿"
+  },
+  {
+   "role": "supporting",
+   "name": "朱由崧",
+   "birthplace": "生于前明都城，自幼长于斯地，当地风土人情塑成其早年性情",
+   "arcCount": 5,
+   "arcStages": "起步·初心 | 觉醒·转折 | 成长·磨砺 | 巅峰·高光 | 超脱·归宿"
+  },
+  {
+   "role": "supporting",
+   "name": "朱聿键",
+   "birthplace": "生于前明都城，自幼长于斯地，当地风土人情塑成其早年性情",
+   "arcCount": 5,
+   "arcStages": "起步·初心 | 觉醒·转折 | 成长·磨砺 | 巅峰·高光 | 超脱·归宿"
+  },
+  {
+   "role": "supporting",
+   "name": "朱聿鐭",
+   "birthplace": "生于前明都城，自幼长于斯地，当地风土人情塑成其早年性情",
+   "arcCount": 5,
+   "arcStages": "起步·初心 | 觉醒·转折 | 成长·磨砺 | 巅峰·高光 | 超脱·归宿"
+  },
+  {
+   "role": "supporting",
+   "name": "瞿式耜",
+   "birthplace": "生于前明都城，自幼长于斯地，当地风土人情塑成其早年性情",
+   "arcCount": 5,
+   "arcStages": "起步·初心 | 觉醒·转折 | 成长·磨砺 | 巅峰·高光 | 超脱·归宿"
+  },
+  {
+   "role": "supporting",
+   "name": "史可法",
+   "birthplace": "生于前明都城，自幼长于斯地，当地风土人情塑成其早年性情",
+   "arcCount": 5,
+   "arcStages": "起步·初心 | 觉醒·转折 | 成长·磨砺 | 巅峰·高光 | 超脱·归宿"
+  },
+  {
+   "role": "supporting",
+   "name": "郑成功",
+   "birthplace": "生于前明都城，自幼长于斯地，当地风土人情塑成其早年性情",
+   "arcCount": 5,
+   "arcStages": "起步·初心 | 觉醒·转折 | 成长·磨砺 | 巅峰·高光 | 超脱·归宿"
+  },
+  {
+   "role": "supporting",
+   "name": "李定国",
+   "birthplace": "生于前明都城，自幼长于斯地，当地风土人情塑成其早年性情",
+   "arcCount": 5,
+   "arcStages": "起步·初心 | 觉醒·转折 | 成长·磨砺 | 巅峰·高光 | 超脱·归宿"
+  },
+  {
+   "role": "supporting",
+   "name": "赵虎",
+   "birthplace": "生于前明都城，自幼长于斯地，当地风土人情塑成其早年性情",
+   "arcCount": 5,
+   "arcStages": "起步·初心 | 觉醒·转折 | 成长·磨砺 | 巅峰·高光 | 超脱·归宿"
+  },
+  {
+   "role": "supporting",
+   "name": "王忠赐",
+   "birthplace": "生于前明都城，自幼长于斯地，当地风土人情塑成其早年性情",
+   "arcCount": 5,
+   "arcStages": "起步·初心 | 觉醒·转折 | 成长·磨砺 | 巅峰·高光 | 超脱·归宿"
+  },
+  {
+   "role": "supporting",
+   "name": "朱落",
+   "birthplace": "生于前明都城，自幼长于斯地，当地风土人情塑成其早年性情",
+   "arcCount": 5,
+   "arcStages": "起步·初心 | 觉醒·转折 | 成长·磨砺 | 巅峰·高光 | 超脱·归宿"
+  },
+  {
+   "role": "supporting",
+   "name": "白柏年",
+   "birthplace": "生于前明都城，自幼长于斯地，当地风土人情塑成其早年性情",
+   "arcCount": 5,
+   "arcStages": "起步·初心 | 觉醒·转折 | 成长·磨砺 | 巅峰·高光 | 超脱·归宿"
+  },
+  {
+   "role": "supporting",
+   "name": "孙思远",
+   "birthplace": "生于前明都城，自幼长于斯地，当地风土人情塑成其早年性情",
+   "arcCount": 5,
+   "arcStages": "起步·初心 | 觉醒·转折 | 成长·磨砺 | 巅峰·高光 | 超脱·归宿"
+  },
+  {
+   "role": "supporting",
+   "name": "周德全",
+   "birthplace": "生于前明都城，自幼长于斯地，当地风土人情塑成其早年性情",
+   "arcCount": 5,
+   "arcStages": "起步·初心 | 觉醒·转折 | 成长·磨砺 | 巅峰·高光 | 超脱·归宿"
+  },
+  {
+   "role": "supporting",
+   "name": "焦琏",
+   "birthplace": "生于前明都城，自幼长于斯地，当地风土人情塑成其早年性情",
+   "arcCount": 5,
+   "arcStages": "起步·初心 | 觉醒·转折 | 成长·磨砺 | 巅峰·高光 | 超脱·归宿"
+  },
+  {
+   "role": "supporting",
+   "name": "庞天寿",
+   "birthplace": "生于前明都城，自幼长于斯地，当地风土人情塑成其早年性情",
+   "arcCount": 5,
+   "arcStages": "起步·初心 | 觉醒·转折 | 成长·磨砺 | 巅峰·高光 | 超脱·归宿"
+  },
+  {
+   "role": "supporting",
+   "name": "张同敞",
+   "birthplace": "生于前明都城，自幼长于斯地，当地风土人情塑成其早年性情",
+   "arcCount": 5,
+   "arcStages": "起步·初心 | 觉醒·转折 | 成长·磨砺 | 巅峰·高光 | 超脱·归宿"
+  },
+  {
+   "role": "supporting",
+   "name": "堵胤锡",
+   "birthplace": "生于前明都城，自幼长于斯地，当地风土人情塑成其早年性情",
+   "arcCount": 5,
+   "arcStages": "起步·初心 | 觉醒·转折 | 成长·磨砺 | 巅峰·高光 | 超脱·归宿"
+  },
+  {
+   "role": "supporting",
+   "name": "何腾蛟",
+   "birthplace": "生于前明都城，自幼长于斯地，当地风土人情塑成其早年性情",
+   "arcCount": 5,
+   "arcStages": "起步·初心 | 觉醒·转折 | 成长·磨砺 | 巅峰·高光 | 超脱·归宿"
+  },
+  {
+   "role": "supporting",
+   "name": "吴万雄",
+   "birthplace": "生于前明都城，自幼长于斯地，当地风土人情塑成其早年性情",
+   "arcCount": 5,
+   "arcStages": "起步·初心 | 觉醒·转折 | 成长·磨砺 | 巅峰·高光 | 超脱·归宿"
+  },
+  {
+   "role": "supporting",
+   "name": "刘文秀",
+   "birthplace": "生于前明都城，自幼长于斯地，当地风土人情塑成其早年性情",
+   "arcCount": 5,
+   "arcStages": "起步·初心 | 觉醒·转折 | 成长·磨砺 | 巅峰·高光 | 超脱·归宿"
+  },
+  {
+   "role": "supporting",
+   "name": "艾能奇",
+   "birthplace": "生于前明都城，自幼长于斯地，当地风土人情塑成其早年性情",
+   "arcCount": 5,
+   "arcStages": "起步·初心 | 觉醒·转折 | 成长·磨砺 | 巅峰·高光 | 超脱·归宿"
+  },
+  {
+   "role": "supporting",
+   "name": "阎应元",
+   "birthplace": "生于前明都城，自幼长于斯地，当地风土人情塑成其早年性情",
+   "arcCount": 5,
+   "arcStages": "起步·初心 | 觉醒·转折 | 成长·磨砺 | 巅峰·高光 | 超脱·归宿"
+  },
+  {
+   "role": "supporting",
+   "name": "黄淳耀",
+   "birthplace": "生于前明都城，自幼长于斯地，当地风土人情塑成其早年性情",
+   "arcCount": 5,
+   "arcStages": "起步·初心 | 觉醒·转折 | 成长·磨砺 | 巅峰·高光 | 超脱·归宿"
+  },
+  {
+   "role": "supporting",
+   "name": "王得仁",
+   "birthplace": "生于前明都城，自幼长于斯地，当地风土人情塑成其早年性情",
+   "arcCount": 5,
+   "arcStages": "起步·初心 | 觉醒·转折 | 成长·磨砺 | 巅峰·高光 | 超脱·归宿"
+  },
+  {
+   "role": "supporting",
+   "name": "郑鸿逵",
+   "birthplace": "生于前明都城，自幼长于斯地，当地风土人情塑成其早年性情",
+   "arcCount": 5,
+   "arcStages": "起步·初心 | 觉醒·转折 | 成长·磨砺 | 巅峰·高光 | 超脱·归宿"
+  },
+  {
+   "role": "supporting",
+   "name": "黄道周",
+   "birthplace": "生于前明都城，自幼长于斯地，当地风土人情塑成其早年性情",
+   "arcCount": 5,
+   "arcStages": "起步·初心 | 觉醒·转折 | 成长·磨砺 | 巅峰·高光 | 超脱·归宿"
+  },
+  {
+   "role": "supporting",
+   "name": "张煌言",
+   "birthplace": "生于前明都城，自幼长于斯地，当地风土人情塑成其早年性情",
+   "arcCount": 5,
+   "arcStages": "起步·初心 | 觉醒·转折 | 成长·磨砺 | 巅峰·高光 | 超脱·归宿"
+  }
+ ]
+}

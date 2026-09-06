@@ -1,0 +1,9 @@
+{
+  "vipStatus": "vip",
+  "vipExpireDate": "2099-12-31",
+  "firstGeneratedNovelId": "temp",
+  "totalGeneratedCount": 1,
+  "createdNovelIds": [
+    "temp"
+  ]
+}

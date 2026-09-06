@@ -1,0 +1,153 @@
+﻿STATUS=200 topKeys= worldSettings,foreshadowings,timelineEvents,worldbuilding,powerSystem,characters,factions,keyPlots,cover,idea,synopsis,outline,relationships,chapters
+
+===== [idea] =====
+-- EMPTY fields --
+  sec.keywords ×1  sec.keywords=[]
+  (无模板占位)
+
+===== [synopsis] =====
+-- EMPTY fields --
+  sec.coreGoldenQuote ×1  sec.coreGoldenQuote=空串
+  sec.fanqieVersion ×1  sec.fanqieVersion=空串
+  sec.goldenQuote ×1  sec.goldenQuote=空串
+  sec.openingHook ×1  sec.openingHook=空串
+  sec.qidianVersion ×1  sec.qidianVersion=空串
+  sec.suspenseSetup ×1  sec.suspenseSetup=[]
+  sec.targetReaderProfile ×1  sec.targetReaderProfile=空串
+  (无模板占位)
+
+===== [worldbuilding] =====
+-- EMPTY fields --
+  sec.historicalEpochs ×1  sec.historicalEpochs=[]
+  (无模板占位)
+
+===== [powerSystem] =====
+-- EMPTY fields --
+  protagonistAbilities.evolutionNodes ×1  sec.protagonistAbilities[0].evolutionNodes=[]
+  protagonistAbility.evolutionNodes ×1  sec.protagonistAbility.evolutionNodes=[]
+  worldPowerSystem.elements ×1  sec.worldPowerSystem.elements=[]
+  worldPowerSystem.rules ×1  sec.worldPowerSystem.rules=空串
+  (无模板占位)
+
+===== [characters] =====
+-- EMPTY fields --
+  _haremsec._harem ×1  sec._harem=(null)
+  antagonist.aliases ×1  sec.antagonist.aliases=空串
+  antagonist.appearance ×1  sec.antagonist.appearance=空串
+  antagonist.background ×1  sec.antagonist.background=空串
+  antagonist.contradiction ×1  sec.antagonist.contradiction=空串
+  antagonist.coreSkills ×1  sec.antagonist.coreSkills=[]
+  antagonist.decisionPattern ×1  sec.antagonist.decisionPattern=空串
+  antagonist.experience ×1  sec.antagonist.experience=空串
+  antagonist.faction ×1  sec.antagonist.faction=空串
+  antagonist.growthArc ×1  sec.antagonist.growthArc=空串
+  antagonist.growthBackground ×1  sec.antagonist.growthBackground=空串
+  antagonist.hiddenTraits ×1  sec.antagonist.hiddenTraits=空串
+  antagonist.mentor ×1  sec.antagonist.mentor=空串
+  antagonist.moralBottomLine ×1  sec.antagonist.moralBottomLine=空串
+  antagonist.name ×1  sec.antagonist.name=空串
+  antagonist.personality ×1  sec.antagonist.personality=空串
+  antagonist.personalityOrigin ×1  sec.antagonist.personalityOrigin=空串
+  antagonist.psychologicalTrauma ×1  sec.antagonist.psychologicalTrauma=空串
+  antagonist.quirks ×1  sec.antagonist.quirks=空串
+  antagonist.relationToProtagonist ×1  sec.antagonist.relationToProtagonist=空串
+  antagonist.signatureItem ×1  sec.antagonist.signatureItem=空串
+  antagonist.skills ×1  sec.antagonist.skills=[]
+  antagonist.socialNetwork ×1  sec.antagonist.socialNetwork=空串
+  antagonist.speechHabit ×1  sec.antagonist.speechHabit=空串
+  antagonist.techniques ×1  sec.antagonist.techniques=空串
+  antagonist.themeColor ×1  sec.antagonist.themeColor=空串
+  antagonist.title ×1  sec.antagonist.title=空串
+  antagonist.values ×1  sec.antagonist.values=空串
+  antagonist.weaknesses ×1  sec.antagonist.weaknesses=空串
+  antagonist.weapons ×1  sec.antagonist.weapons=空串
+  antagonists.aliases ×1  sec.antagonists[0].aliases=空串
+  antagonists.appearance ×1  sec.antagonists[0].appearance=空串
+  antagonists.background ×1  sec.antagonists[0].background=空串
+  antagonists.contradiction ×1  sec.antagonists[0].contradiction=空串
+  antagonists.coreSkills ×1  sec.antagonists[0].coreSkills=[]
+  antagonists.decisionPattern ×1  sec.antagonists[0].decisionPattern=空串
+  antagonists.experience ×1  sec.antagonists[0].experience=空串
+  antagonists.faction ×1  sec.antagonists[0].faction=空串
+  antagonists.growthArc ×1  sec.antagonists[0].growthArc=空串
+  antagonists.growthBackground ×1  sec.antagonists[0].growthBackground=空串
+  antagonists.hiddenTraits ×1  sec.antagonists[0].hiddenTraits=空串
+  antagonists.mentor ×1  sec.antagonists[0].mentor=空串
+  antagonists.moralBottomLine ×1  sec.antagonists[0].moralBottomLine=空串
+  antagonists.name ×1  sec.antagonists[0].name=空串
+  antagonists.personality ×1  sec.antagonists[0].personality=空串
+  antagonists.personalityOrigin ×1  sec.antagonists[0].personalityOrigin=空串
+  antagonists.psychologicalTrauma ×1  sec.antagonists[0].psychologicalTrauma=空串
+  antagonists.quirks ×1  sec.antagonists[0].quirks=空串
+  antagonists.relationToProtagonist ×1  sec.antagonists[0].relationToProtagonist=空串
+  antagonists.signatureItem ×1  sec.antagonists[0].signatureItem=空串
+  antagonists.skills ×1  sec.antagonists[0].skills=[]
+  antagonists.socialNetwork ×1  sec.antagonists[0].socialNetwork=空串
+  antagonists.speechHabit ×1  sec.antagonists[0].speechHabit=空串
+  antagonists.techniques ×1  sec.antagonists[0].techniques=空串
+  antagonists.themeColor ×1  sec.antagonists[0].themeColor=空串
+  antagonists.title ×1  sec.antagonists[0].title=空串
+  antagonists.values ×1  sec.antagonists[0].values=空串
+  antagonists.weaknesses ×1  sec.antagonists[0].weaknesses=空串
+  antagonists.weapons ×1  sec.antagonists[0].weapons=空串
+  arcNodes.change ×15  sec.protagonist.arcNodes[0].change=空串
+  arcNodes.event ×15  sec.protagonist.arcNodes[0].event=空串
+  protagonist.aliases ×1  sec.protagonist.aliases=空串
+  protagonist.appearance ×1  sec.protagonist.appearance=空串
+  protagonist.background ×1  sec.protagonist.background=空串
+  protagonist.contradiction ×1  sec.protagonist.contradiction=空串
+  protagonist.coreSkills ×1  sec.protagonist.coreSkills=[]
+  protagonist.decisionPattern ×1  sec.protagonist.decisionPattern=空串
+  protagonist.experience ×1  sec.protagonist.experience=空串
+  protagonist.faction ×1  sec.protagonist.faction=空串
+  protagonist.growthArc ×1  sec.protagonist.growthArc=空串
+  protagonist.growthBackground ×1  sec.protagonist.growthBackground=空串
+  protagonist.hiddenTraits ×1  sec.protagonist.hiddenTraits=空串
+  protagonist.mentor ×1  sec.protagonist.mentor=空串
+  protagonist.moralBottomLine ×1  sec.protagonist.moralBottomLine=空串
+  protagonist.name ×1  sec.protagonist.name=空串
+  protagonist.personality ×1  sec.protagonist.personality=空串
+  protagonist.personalityOrigin ×1  sec.protagonist.personalityOrigin=空串
+  protagonist.psychologicalTrauma ×1  sec.protagonist.psychologicalTrauma=空串
+  protagonist.quirks ×1  sec.protagonist.quirks=空串
+  protagonist.relationToProtagonist ×1  sec.protagonist.relationToProtagonist=空串
+  protagonist.signatureItem ×1  sec.protagonist.signatureItem=空串
+  protagonist.skills ×1  sec.protagonist.skills=[]
+  protagonist.socialNetwork ×1  sec.protagonist.socialNetwork=空串
+  protagonist.speechHabit ×1  sec.protagonist.speechHabit=空串
+  protagonist.techniques ×1  sec.protagonist.techniques=空串
+  protagonist.themeColor ×1  sec.protagonist.themeColor=空串
+  protagonist.title ×1  sec.protagonist.title=空串
+  protagonist.values ×1  sec.protagonist.values=空串
+  protagonist.weaknesses ×1  sec.protagonist.weaknesses=空串
+  protagonist.weapons ×1  sec.protagonist.weapons=空串
+  sec.femaleLeads ×1  sec.femaleLeads=[]
+  sec.supporting ×1  sec.supporting=[]
+  (无模板占位)
+
+===== [factions] =====
+-- EMPTY fields --
+  (无模板占位)
+
+===== [relationships] =====
+-- EMPTY fields --
+  relationships.deepConflict ×87  sec.relationships[0].deepConflict=空串
+-- TPL fields --
+  relationships.impactOnPlot ×22  sec.relationships[23].impactOnPlot=多铎作为重要角色在剧情中发挥关键作用，与主角的关系推动故事发
+  relationships.plotInfluence ×22  sec.relationships[23].plotInfluence=多铎作为重要角色在剧情中发挥关键作用，与主角的关系推动故事发
+
+===== [outline] =====
+-- EMPTY fields --
+  sec.triRacePowerLevels ×1  sec.triRacePowerLevels=[]
+  (无模板占位)
+
+===== [keyPlots] =====
+-- EMPTY fields --
+  volumes.shuangPoints ×16  sec.volumes[0].shuangPoints[5]=空串
+  (无模板占位)
+
+===== [chapters] =====
+-- EMPTY fields --
+  (无模板占位)
+
+DONE

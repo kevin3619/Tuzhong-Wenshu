@@ -1,0 +1,559 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ============================================================
+   文枢墨韵设计系统 (Literary Ink Schema)
+   东方文人书房 × 现代AI科技
+   ============================================================ */
+
+:root {
+  /* 主色调：温润米白纸张 */
+  --background: #faf7f2;
+  --foreground: #1a1a1a;
+
+  /* 文枢色板 */
+  --ink-paper: #faf7f2;        /* 纸张底色 */
+  --ink-paper-deep: #f3ede3;   /* 深一阶纸张 */
+  --ink-black: #1a1a1a;        /* 墨黑 */
+  --ink-soft: #3d3d3d;         /* 软墨 */
+  --ink-muted: #6b6b6b;        /* 灰墨 */
+  --ink-faint: #a8a29e;        /* 淡墨 */
+
+  /* 强调色：朱砂红（文学仪式感） */
+  --vermilion: #c8364d;        /* 朱砂 */
+  --vermilion-deep: #a82841;   /* 深朱砂 */
+  --vermilion-soft: #e8b4bc;   /* 淡朱砂 */
+
+  /* 辅助色：古铜金（点缀） */
+  --bronze: #b8860b;           /* 古铜金 */
+  --bronze-soft: #d4a84b;      /* 淡古铜 */
+
+  /* 状态色 */
+  --jade: #6b8e7b;             /* 青瓷绿 - 完成 */
+  --dai-blue: #4a5568;         /* 黛蓝 - 信息 */
+  --indigo-ink: #2c3e50;       /* 靛墨 - 标题 */
+
+  /* 边框与分割 */
+  --border-ink: #e7e1d8;       /* 墨边 */
+  --border-soft: #f0ebe2;      /* 软边 */
+}
+
+html, body {
+  height: 100%;
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: 'PingFang SC', 'Microsoft YaHei', 'Helvetica Neue', sans-serif;
+  /* 纸张纹理：极淡的网格 + 噪点 */
+  background-image:
+    radial-gradient(circle at 20% 30%, rgba(200, 54, 77, 0.015) 0%, transparent 50%),
+    radial-gradient(circle at 80% 70%, rgba(184, 134, 11, 0.015) 0%, transparent 50%),
+    repeating-linear-gradient(0deg, transparent, transparent 2px, rgba(26, 26, 26, 0.008) 2px, rgba(26, 26, 26, 0.008) 3px);
+  background-attachment: fixed;
+}
+
+/* 衬线字体类：用于标题与环节名 */
+.font-serif-wenshu {
+  font-family: 'Noto Serif SC', 'Source Han Serif SC', 'Songti SC', 'STSong', serif;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+/* 等宽字体类：用于日志、代码 */
+.font-mono-wenshu {
+  font-family: 'JetBrains Mono', 'Cascadia Code', 'Consolas', monospace;
+}
+
+/* 自定义滚动条：墨色细条 */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #d6cfc3;
+  border-radius: 4px;
+  border: 1px solid #e7e1d8;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--ink-faint);
+}
+
+/* 隐藏Next.js开发错误指示器 */
+nextjs-portal,
+[data-nextjs-toast],
+[data-nextjs-error-overlay] {
+  display: none !important;
+}
+
+/* ============================================================
+   动画关键帧
+   ============================================================ */
+
+/* 墨迹晕染淡入 */
+@keyframes ink-fade-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* 进度条流光 */
+@keyframes shimmer-flow {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+/* 朱砂落印（按钮按下） */
+@keyframes vermilion-stamp {
+  0% { transform: scale(1); }
+  50% { transform: scale(0.97); }
+  100% { transform: scale(1); }
+}
+
+/* 卷轴展开（步骤切换） */
+@keyframes scroll-unfold {
+  from { opacity: 0; transform: translateX(-4px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+
+/* 星光闪烁（loading） */
+@keyframes star-glimmer {
+  0%, 100% { opacity: 0.4; }
+  50% { opacity: 1; }
+}
+
+/* 应用动画类 */
+.animate-ink-fade {
+  animation: ink-fade-in 0.4s ease-out;
+}
+.animate-scroll-unfold {
+  animation: scroll-unfold 0.3s ease-out;
+}
+.animate-star-glimmer {
+  animation: star-glimmer 1.5s ease-in-out infinite;
+}
+
+/* ============================================================
+   通用组件样式
+   ============================================================ */
+
+/* 文枢卡片：米白底 + 墨边 + 顶部朱砂色条 */
+.wenshu-card {
+  background: #ffffff;
+  border: 1px solid var(--border-ink);
+  border-radius: 14px;
+  box-shadow: 0 1px 3px rgba(26, 26, 26, 0.04), 0 4px 12px rgba(26, 26, 26, 0.03);
+  transition: box-shadow 0.25s ease, transform 0.25s ease;
+}
+.wenshu-card:hover {
+  box-shadow: 0 2px 6px rgba(26, 26, 26, 0.06), 0 8px 20px rgba(26, 26, 26, 0.05);
+}
+
+/* 文枢色条：朱砂→古铜金渐变 */
+.wenshu-stripe {
+  background: linear-gradient(90deg, var(--vermilion) 0%, var(--bronze) 100%);
+}
+
+/* 文枢标题区：米白底 + 衬线字 */
+.wenshu-title-band {
+  background: linear-gradient(90deg, var(--ink-paper-deep) 0%, #ffffff 100%);
+  border-bottom: 1px solid var(--border-ink);
+}
+
+/* 文枢主按钮：墨黑底 + 朱砂hover */
+.wenshu-btn-primary {
+  background: var(--ink-black);
+  color: #faf7f2;
+  border: 1px solid var(--ink-black);
+  transition: all 0.2s ease;
+}
+.wenshu-btn-primary:hover {
+  background: var(--vermilion-deep);
+  border-color: var(--vermilion-deep);
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(168, 40, 65, 0.25);
+}
+.wenshu-btn-primary:active {
+  animation: vermilion-stamp 0.3s ease;
+}
+.wenshu-btn-primary:disabled {
+  background: var(--ink-faint);
+  border-color: var(--ink-faint);
+  cursor: not-allowed;
+  transform: none;
+  box-shadow: none;
+}
+
+/* 文枢次按钮：透明底 + 墨边 */
+.wenshu-btn-secondary {
+  background: transparent;
+  color: var(--ink-black);
+  border: 1px solid var(--border-ink);
+  transition: all 0.2s ease;
+}
+.wenshu-btn-secondary:hover {
+  border-color: var(--ink-black);
+  background: var(--ink-paper-deep);
+}
+
+/* 文枢输入框：聚焦朱砂红ring */
+.wenshu-input {
+  background: #ffffff;
+  border: 1px solid var(--border-ink);
+  border-radius: 8px;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+.wenshu-input:focus {
+  outline: none;
+  border-color: var(--vermilion);
+  box-shadow: 0 0 0 3px rgba(200, 54, 77, 0.12);
+}
+
+/* 文枢标签 */
+.wenshu-label {
+  color: var(--ink-soft);
+  font-size: 0.875rem;
+  font-weight: 500;
+  letter-spacing: 0.01em;
+}
+
+/* 文枢进度条：流光 */
+.wenshu-progress-bar {
+  background: linear-gradient(90deg, var(--vermilion) 0%, var(--bronze) 50%, var(--vermilion) 100%);
+  background-size: 200% 100%;
+  animation: shimmer-flow 2s linear infinite;
+}
+
+/* 风格实验室滑块样式 */
+input[type="range"].style-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 8px;
+  border-radius: 4px;
+  background: var(--border-ink);
+  outline: none;
+  cursor: pointer;
+}
+
+input[type="range"].style-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: var(--vermilion);
+  cursor: pointer;
+  border: 3px solid #ffffff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2), 0 0 0 1px rgba(200, 54, 77, 0.2);
+  transition: transform 0.15s ease, box-shadow 0.15s ease;
+}
+
+input[type="range"].style-slider::-webkit-slider-thumb:hover {
+  transform: scale(1.15);
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.25), 0 0 0 2px rgba(200, 54, 77, 0.3);
+}
+
+input[type="range"].style-slider::-webkit-slider-thumb:active {
+  transform: scale(1.2);
+  background: var(--vermilion-deep);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3), 0 0 0 3px rgba(200, 54, 77, 0.3);
+}
+
+input[type="range"].style-slider::-moz-range-thumb {
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: var(--vermilion);
+  cursor: pointer;
+  border: 3px solid #ffffff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2), 0 0 0 1px rgba(200, 54, 77, 0.2);
+  transition: transform 0.15s ease, box-shadow 0.15s ease;
+}
+
+input[type="range"].style-slider::-moz-range-thumb:hover {
+  transform: scale(1.15);
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.25), 0 0 0 2px rgba(200, 54, 77, 0.3);
+}
+
+input[type="range"].style-slider::-moz-range-thumb:active {
+  transform: scale(1.2);
+  background: var(--vermilion-deep);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3), 0 0 0 3px rgba(200, 54, 77, 0.3);
+}
+
+input[type="range"].style-slider::-moz-range-track {
+  height: 8px;
+  border-radius: 4px;
+  background: var(--border-ink);
+}
+
+/* 文本框自动高度适配：确保所有textarea能显示完整内容 */
+textarea {
+  field-sizing: content;
+  min-height: 60px;
+  overflow-y: hidden;
+  resize: vertical;
+  line-height: 1.7;
+  font-family: inherit;
+}
+
+/* 长文本区域保底最小高度 */
+textarea.min-h-100 {
+  min-height: 100px;
+}
+
+textarea.min-h-120 {
+  min-height: 120px;
+}
+
+textarea.min-h-150 {
+  min-height: 150px;
+}
+
+textarea.min-h-200 {
+  min-height: 200px;
+}
+
+/* AI创作向导步骤导航美化滚动条 - 隐藏滚动条但保留滚动功能 */
+.step-nav-scroll {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+.step-nav-scroll::-webkit-scrollbar {
+  display: none;
+  width: 0;
+  height: 0;
+}
+
+/* ============================================================
+   步骤指示器专用样式
+   ============================================================ */
+
+/* 步骤导航容器：米白底 + 墨色下边框 */
+.wenshu-step-nav {
+  background: var(--ink-paper);
+  border-bottom: 1px solid var(--border-ink);
+}
+
+/* 步骤按钮：默认灰墨 */
+.wenshu-step-btn {
+  color: var(--ink-muted);
+  transition: all 0.2s ease;
+}
+.wenshu-step-btn:hover:not(:disabled) {
+  color: var(--ink-black);
+  background: var(--ink-paper-deep);
+}
+
+/* 当前步骤：朱砂红 + 微光 */
+.wenshu-step-current {
+  color: var(--vermilion);
+  background: rgba(200, 54, 77, 0.08);
+  position: relative;
+}
+.wenshu-step-current::after {
+  content: '';
+  position: absolute;
+  bottom: -1px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 24px;
+  height: 2px;
+  background: var(--vermilion);
+  border-radius: 1px;
+}
+
+/* 已完成步骤：青瓷绿 */
+.wenshu-step-done {
+  color: var(--jade);
+}
+
+/* 步骤连接箭头 */
+.wenshu-step-arrow {
+  color: var(--ink-faint);
+}
+
+/* ============================================================
+   顶部导航栏样式
+   ============================================================ */
+
+/* 顶部栏：墨黑底 + 朱砂下边框 */
+.wenshu-top-bar {
+  background: var(--ink-black);
+  border-bottom: 2px solid var(--vermilion);
+  color: #faf7f2;
+}
+
+/* 模型选择器按钮 */
+.wenshu-model-btn {
+  background: rgba(250, 247, 242, 0.08);
+  color: rgba(250, 247, 242, 0.9);
+  border: 1px solid rgba(250, 247, 242, 0.15);
+  transition: all 0.2s ease;
+}
+.wenshu-model-btn:hover {
+  background: rgba(250, 247, 242, 0.15);
+  border-color: rgba(250, 247, 242, 0.3);
+}
+
+/* ============================================================
+   自动生成进度面板
+   ============================================================ */
+
+.wenshu-autogen-panel {
+  background: linear-gradient(135deg, rgba(200, 54, 77, 0.04) 0%, rgba(184, 134, 11, 0.04) 100%);
+  border: 1px solid var(--border-ink);
+  border-left: 3px solid var(--vermilion);
+  border-radius: 12px;
+}
+
+.wenshu-autogen-progress-track {
+  background: var(--border-ink);
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.wenshu-autogen-log {
+  background: var(--ink-paper-deep);
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  font-family: 'JetBrains Mono', 'Cascadia Code', 'Consolas', monospace;
+}
+
+/* ============================================================
+   创作方式选择器（三种模式）
+   ============================================================ */
+
+/* 仿写模式：墨黑主题 */
+.wenshu-mode-imitate-active {
+  border-color: var(--ink-black);
+  background: linear-gradient(135deg, rgba(26, 26, 26, 0.04) 0%, rgba(26, 26, 26, 0.01) 100%);
+  box-shadow: 0 2px 8px rgba(26, 26, 26, 0.08);
+}
+
+/* 同人文：朱砂红主题 */
+.wenshu-mode-fanfiction-active {
+  border-color: var(--vermilion);
+  background: linear-gradient(135deg, rgba(200, 54, 77, 0.05) 0%, rgba(200, 54, 77, 0.01) 100%);
+  box-shadow: 0 2px 8px rgba(200, 54, 77, 0.1);
+}
+
+/* 自己设计：古铜金主题 */
+.wenshu-mode-custom-active {
+  border-color: var(--bronze);
+  background: linear-gradient(135deg, rgba(184, 134, 11, 0.05) 0%, rgba(184, 134, 11, 0.01) 100%);
+  box-shadow: 0 2px 8px rgba(184, 134, 11, 0.1);
+}
+
+/* ============================================================
+   工具类
+   ============================================================ */
+
+/* 文字渐变：朱砂→古铜 */
+.text-gradient-wenshu {
+  background: linear-gradient(90deg, var(--vermilion) 0%, var(--bronze) 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  color: transparent;
+}
+
+/* 墨色分割线 */
+.divider-ink {
+  height: 1px;
+  background: linear-gradient(90deg, transparent 0%, var(--border-ink) 20%, var(--border-ink) 80%, transparent 100%);
+}
+
+/* 印章式标签 */
+.wenshu-stamp {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  background: var(--vermilion);
+  color: #faf7f2;
+  font-size: 0.7rem;
+  font-weight: 600;
+  border-radius: 3px;
+  letter-spacing: 0.05em;
+}
+
+/* 完成态徽章 */
+.wenshu-badge-done {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  background: rgba(107, 142, 123, 0.12);
+  color: var(--jade);
+  font-size: 0.7rem;
+  font-weight: 600;
+  border-radius: 3px;
+  border: 1px solid rgba(107, 142, 123, 0.25);
+}
+
+/* ============================================================
+   L4 微交互增强（CSS-only，不修改组件代码）
+   ============================================================ */
+
+/* 通用按钮：平滑过渡 + 按下回弹 */
+button:not(:disabled) {
+  transition: all 0.18s cubic-bezier(0.4, 0, 0.2, 1);
+}
+button:not(:disabled):active {
+  transform: scale(0.97);
+}
+
+/* 输入框聚焦：墨迹晕染效果 */
+input[type="text"]:focus,
+input[type="email"]:focus,
+input[type="password"]:focus,
+input[type="number"]:focus,
+input[type="search"]:focus,
+textarea:focus,
+select:focus {
+  outline: none;
+  border-color: var(--vermilion) !important;
+  box-shadow: 0 0 0 3px rgba(200, 54, 77, 0.10), 0 0 12px rgba(200, 54, 77, 0.06) !important;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+/* 卡片悬浮微抬 */
+.wenshu-card,
+[class*="rounded-xl"][class*="border-stone"]:not(button),
+[class*="rounded-2xl"][class*="border-stone"]:not(button) {
+  transition: box-shadow 0.25s ease, transform 0.25s ease;
+}
+
+/* 标签悬停 */
+label {
+  transition: color 0.15s ease;
+}
+
+/* 链接和可点击文本 */
+a, [class*="hover:text-"], [class*="hover:bg-"] {
+  transition: color 0.15s ease, background-color 0.15s ease;
+}
+
+/* 加载旋转器：朱砂色 */
+.animate-spin {
+  border-color: var(--ink-faint);
+  border-top-color: var(--vermilion) !important;
+}
+
+/* 禁用态：降低饱和度 */
+button:disabled,
+input:disabled,
+textarea:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* 选中文本：朱砂底 */
+::selection {
+  background: rgba(200, 54, 77, 0.15);
+  color: var(--ink-black);
+}

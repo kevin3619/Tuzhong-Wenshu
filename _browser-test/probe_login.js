@@ -1,0 +1,23 @@
+// 探针：用系统 Edge 打开线上，转储 DOM 文本
+const { chromium } = require('playwright-core')
+;(async () => {
+  const browser = await chromium.launch({ channel: 'msedge', headless: true, args: ['--no-sandbox'] })
+  const page = await browser.newPage({ viewport: { width: 1400, height: 900 } })
+  const logs = []
+  page.on('console', m => logs.push(m.text()))
+  await page.goto('https://tuzhongwang.xyz/tuzhong-wenshu', { waitUntil: 'networkidle', timeout: 60000 }).catch(e=>console.log('GOTO_ERR', e.message))
+  await page.waitForTimeout(2500)
+  const url = page.url()
+  const title = await page.title().catch(()=>'')
+  const text = await page.evaluate(() => document.body ? document.body.innerText.slice(0, 4000) : 'NOBODY').catch(e=>'EVAL_ERR:'+e.message)
+  const inputs = await page.evaluate(() => Array.from(document.querySelectorAll('input,button,textarea,a')).map(e => `${e.tagName.toLowerCase()}[${(e.type||'')}]${e.name?' '+e.name:''}: ${(e.getAttribute&&e.getAttribute('placeholder'))||''} "${(e.textContent||'').trim().slice(0,30)}"`).slice(0,60)).catch(e=>'ERR:'+e.message)
+  console.log('URL=', url)
+  console.log('TITLE=', title)
+  console.log('========== BODY TEXT ==========')
+  console.log(text)
+  console.log('========== INPUTS/BUTTONS ==========')
+  console.log(JSON.stringify(inputs, null, 1))
+  console.log('========== CONSOLE (last 10) ==========')
+  console.log(logs.slice(-10).join('\n'))
+  await browser.close()
+})().catch(e => { console.error('FATAL', e); process.exit(1) })

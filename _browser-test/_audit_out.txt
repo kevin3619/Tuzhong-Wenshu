@@ -1,0 +1,84 @@
+﻿STATUS=200 topKeys= worldSettings,foreshadowings,timelineEvents,worldbuilding,powerSystem,characters,factions,keyPlots,cover,idea,synopsis,outline,relationships,chapters
+
+===== [idea] =====
+-- EMPTY fields --
+  sec.keywords ×1  sec.keywords=[]
+  (无模板占位)
+
+===== [synopsis] =====
+-- EMPTY fields --
+  sec.coreGoldenQuote ×1  sec.coreGoldenQuote=空串
+  sec.fanqieVersion ×1  sec.fanqieVersion=空串
+  sec.goldenQuote ×1  sec.goldenQuote=空串
+  sec.openingHook ×1  sec.openingHook=空串
+  sec.qidianVersion ×1  sec.qidianVersion=空串
+  sec.suspenseSetup ×1  sec.suspenseSetup=[]
+  sec.targetReaderProfile ×1  sec.targetReaderProfile=空串
+  (无模板占位)
+
+===== [worldbuilding] =====
+-- EMPTY fields --
+  sec.historicalEpochs ×1  sec.historicalEpochs=[]
+  (无模板占位)
+
+===== [powerSystem] =====
+-- EMPTY fields --
+  protagonistAbilities.evolutionNodes ×1  sec.protagonistAbilities[0].evolutionNodes=[]
+  protagonistAbility.evolutionNodes ×1  sec.protagonistAbility.evolutionNodes=[]
+  worldPowerSystem.elements ×1  sec.worldPowerSystem.elements=[]
+  worldPowerSystem.rules ×1  sec.worldPowerSystem.rules=空串
+  (无模板占位)
+
+===== [characters] =====
+-- EMPTY fields --
+  _haremsec._harem ×1  sec._harem=(null)
+  antagonists.goal ×12  sec.antagonists[2].goal=空串
+  antagonists.job ×2  sec.antagonists[2].job=空串
+  arcNodes.powerLevel ×495  sec.protagonist.arcNodes[0].powerLevel=空串
+  femaleLead.goal ×1  sec.femaleLead.goal=空串
+  protagonist.job ×1  sec.protagonist.job=空串
+  sec.femaleLeads ×1  sec.femaleLeads=[]
+  supporting.goal ×73  sec.supporting[1].goal=空串
+  supporting.job ×9  sec.supporting[1].job=空串
+-- TPL fields --
+  supporting.contradiction ×7  sec.supporting[59].contradiction=表面从容不迫，实则赵虎以亲卫队统领示人，外表赵虎性格鲜明。
+  supporting.hiddenTraits ×23  sec.supporting[52].hiddenTraits=朱由崧以弘光帝（福王）；弘光朝昏君、历史悲剧人物、被清军俘虏
+  supporting.personality ×25  sec.supporting[52].personality=朱由崧性格鲜明，为人处世有其独特原则，在故事中展现出多面性的
+
+===== [factions] =====
+-- EMPTY fields --
+  factions.allies ×14  sec.factions[0].allies=[]
+  factions.coreResources ×14  sec.factions[0].coreResources=[]
+  factions.enemies ×14  sec.factions[0].enemies=[]
+  factions.flagshipFigures ×14  sec.factions[0].flagshipFigures=[]
+  factions.historyGrudges ×14  sec.factions[0].historyGrudges=空串
+  factions.internalFactions ×14  sec.factions[0].internalFactions=[]
+  factions.members ×14  sec.factions[0].members=[]
+  factions.philosophy ×14  sec.factions[0].philosophy=空串
+  factions.relationToProtagonist ×14  sec.factions[0].relationToProtagonist=空串
+  factions.strengthTier ×14  sec.factions[0].strengthTier=空串
+  factions.territory ×14  sec.factions[0].territory=空串
+  (无模板占位)
+
+===== [relationships] =====
+-- EMPTY fields --
+  relationships.deepConflict ×87  sec.relationships[0].deepConflict=空串
+-- TPL fields --
+  relationships.impactOnPlot ×22  sec.relationships[23].impactOnPlot=多铎作为重要角色在剧情中发挥关键作用，与主角的关系推动故事发
+  relationships.plotInfluence ×22  sec.relationships[23].plotInfluence=多铎作为重要角色在剧情中发挥关键作用，与主角的关系推动故事发
+
+===== [outline] =====
+-- EMPTY fields --
+  sec.triRacePowerLevels ×1  sec.triRacePowerLevels=[]
+  (无模板占位)
+
+===== [keyPlots] =====
+-- EMPTY fields --
+  volumes.shuangPoints ×16  sec.volumes[0].shuangPoints[5]=空串
+  (无模板占位)
+
+===== [chapters] =====
+-- EMPTY fields --
+  (无模板占位)
+
+DONE

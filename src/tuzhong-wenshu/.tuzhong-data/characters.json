@@ -1,0 +1,117 @@
+{
+  "1781107995395": [
+    {
+      "id": "char-luzhao",
+      "name": "陆昭",
+      "role": "主角",
+      "age": "十八岁",
+      "gender": "男",
+      "identity": "巫族遗孤/流浪剑客",
+      "appearance": "右臂缠绕黑色咒纹，左眼瞳孔呈漩涡状转动",
+      "personality": "看似玩世不恭实则洞察敏锐，背负着解开血脉封印的使命",
+      "background": "自幼流落市井，偶然触发体内沉睡的巫祖之力",
+      "skills": [
+        "混沌剑意",
+        "时空裂隙",
+        "巫祭共鸣"
+      ],
+      "growthArc": "从懵懂少年成长为撕裂天道枷锁的存在，最终揭开身世之谜",
+      "color": "#3B82F6",
+      "desc": "自幼流落市井，偶然触发体内沉睡的巫祖之力"
+    },
+    {
+      "id": "char-xuanming",
+      "name": "玄冥",
+      "role": "反派",
+      "age": "三千岁",
+      "gender": "男",
+      "identity": "幽冥殿主",
+      "appearance": "黑袍覆面，双目如血瞳，手持九幽骨杖",
+      "personality": "阴鸷暴戾，痴迷炼魂术",
+      "background": "曾屠戮三界，被封印于幽冥渊",
+      "skills": [
+        "血煞领域",
+        "噬魂咒",
+        "万鬼幡"
+      ],
+      "conflict": "与主角争夺巫神血脉控制权",
+      "color": "#EF4444",
+      "desc": "曾屠戮三界，被封印于幽冥渊"
+    },
+    {
+      "name": "赤魇",
+      "role": "反派",
+      "age": "八百岁",
+      "gender": "女",
+      "identity": "南疆巫蛊王",
+      "appearance": "红衣似火，额生妖纹",
+      "personality": "疯癫偏执，爱豢养毒虫",
+      "background": "幼年被献祭给邪神，获不死之力",
+      "skills": [
+        "万毒蚀心诀",
+        "御虫术",
+        "血祭大阵"
+      ],
+      "conflict": "试图复活旧日支配者",
+      "color": "#F97316",
+      "desc": "幼年被献祭给邪神，获不死之力",
+      "id": "char-chiyan"
+    },
+    {
+      "id": "char-cangque",
+      "name": "苍阙",
+      "role": "反派",
+      "age": "五千岁",
+      "gender": "男",
+      "identity": "天机阁叛徒/天命观测者",
+      "appearance": "白衣胜雪，左眼盲，右眼嵌星盘",
+      "personality": "冷漠理性，视众生为棋子",
+      "background": "窥见天道漏洞后叛出仙盟",
+      "skills": [
+        "推演天机",
+        "时空裂隙",
+        "因果律武器"
+      ],
+      "conflict": "阻止主角篡改命轨引发世界崩坏",
+      "color": "#8B5CF6",
+      "desc": "窥见天道漏洞后叛出仙盟"
+    },
+    {
+      "id": "char-baili",
+      "name": "白璃",
+      "role": "反派/女主",
+      "age": "不详",
+      "gender": "女",
+      "identity": "堕仙/月宫遗孤",
+      "appearance": "银发及腰，半身玉骨，足踏冰轮",
+      "personality": "清冷疏离，背负罪孽",
+      "background": "因私放混沌兽被剔仙骨贬凡尘",
+      "skills": [
+        "太阴真经",
+        "冰封万里",
+        "月魄剑阵"
+      ],
+      "conflict": "与男主共同对抗天道惩罚机制",
+      "color": "#EC4899",
+      "desc": "因私放混沌兽被剔仙骨贬凡尘"
+    },
+    {
+      "id": "char-zhuyin",
+      "name": "烛阴",
+      "role": "反派",
+      "age": "万岁+",
+      "gender": "中性",
+      "identity": "混沌意志化身/万物终焉",
+      "appearance": "无固定形态，时而巨蟒缠地，时而人形虚影",
+      "personality": "漠然无情，追求宇宙热寂",
+      "background": "创世之初便存在的原始黑暗",
+      "skills": [
+        "混沌吞噬",
+        "万法归虚"
+      ],
+      "conflict": "要吞噬一切存在回归虚无",
+      "color": "#10B981",
+      "desc": "创世之初便存在的原始黑暗"
+    }
+  ]
+}

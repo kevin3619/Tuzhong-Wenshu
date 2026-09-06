@@ -1,0 +1,19 @@
+{
+ "buckets": [
+  "protagonist",
+  "femaleLead",
+  "femaleLeads",
+  "antagonist",
+  "antagonists",
+  "supporting",
+  "_harem"
+ ],
+ "found": {
+  ".antagonist": [
+   ".antagonist"
+  ],
+  ".antagonists": [
+   ".antagonists[0]"
+  ]
+ }
+}

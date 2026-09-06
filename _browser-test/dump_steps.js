@@ -1,0 +1,55 @@
+// 进入向导后，逐步骤点击并转储该步 DOM（重点：主要人物设定、势力设定）
+const { chromium } = require('playwright-core')
+const path = require('path')
+const BASE = 'https://tuzhongwang.xyz/tuzhong-wenshu'
+const USER_DATA_DIR = path.join(__dirname, '..', '_browser-profile')
+
+;(async () => {
+  const ctx = await chromium.launchPersistentContext(USER_DATA_DIR, {
+    channel: 'msedge', headless: true, args: ['--no-sandbox'], viewport: { width: 1500, height: 960 },
+  })
+  let page = null
+  for (const p of ctx.pages()) { const t = await p.evaluate(() => (document.body.textContent || '').slice(0, 60)).catch(() => ''); if (t.trim()) { page = p; break } }
+  if (!page) { page = ctx.pages()[0] || await ctx.newPage() }
+  page.setDefaultTimeout(12000)
+  await page.goto(BASE, { waitUntil: 'domcontentloaded', timeout: 60000 })
+  await page.waitForTimeout(3000)
+  let inWizard = await page.evaluate(() => (document.body.textContent || '').includes('分卷章节划分')).catch(() => false)
+  if (!inWizard) {
+    const dbtn = page.locator('button:has-text("草稿箱")').first()
+    if (await dbtn.count()) { await dbtn.click(); await page.waitForTimeout(2500) }
+    const dcard = page.locator('text=永历中兴').first()
+    if (await dcard.count()) {
+      const card = dcard.locator('xpath=ancestor::div[contains(@class,"card") or contains(@class,"item") or contains(@class,"rounded")][1]')
+      const gen = card.locator('button:has-text("继续生成")').first()
+      if (await gen.count()) { await gen.click({ timeout: 9000 }).catch(() => {}) } else { await dcard.click({ timeout: 9000 }).catch(() => {}) }
+      for (let i = 0; i < 40; i++) { await page.waitForTimeout(1000); inWizard = await page.evaluate(() => (document.body.textContent || '').includes('分卷章节划分')).catch(() => false); if (inWizard) break }
+    }
+  }
+  console.log('IN_WIZARD=' + inWizard)
+
+  // 顶部步骤按钮（精确匹配）
+  const stepBtn = async (label) => {
+    const b = page.locator('button').filter({ hasText: label }).first()
+    return (await b.count()) ? b : null
+  }
+  const dumpStep = async (label) => {
+    const b = await stepBtn(label)
+    if (!b) { console.log(label + ' 步骤按钮未找到'); return }
+    await b.click({ timeout: 8000 }).catch(() => {})
+    await page.waitForTimeout(3500)
+    const d = await page.evaluate(() => {
+      const body = document.body.textContent || ''
+      const btns = []
+      document.querySelectorAll('button').forEach(el => { const t = (el.textContent || '').trim().replace(/\s+/g, ' '); if (t && t.length < 25) btns.push(t) })
+      return { head: body.replace(/\s+/g, ' ').slice(0, 200), btns: btns.slice(0, 80) }
+    }).catch(e => 'ERR:' + e.message)
+    console.log('\n===== ' + label + ' =====')
+    console.log(JSON.stringify(d, null, 1))
+    await page.screenshot({ path: path.join(__dirname, 'step_' + label + '.png') }).catch(() => {})
+  }
+
+  await dumpStep('主要人物设定')
+  await dumpStep('势力设定')
+  await ctx.close()
+})().catch(e => { console.error('FATAL', e); process.exit(1) })

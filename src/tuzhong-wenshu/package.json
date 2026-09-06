@@ -1,0 +1,54 @@
+{
+  "name": "tuzhong-wenshu",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev -p 3001",
+    "build": "next build",
+    "start": "next start -p 3001",
+    "lint": "eslint"
+  },
+  "dependencies": {
+    "@supabase/auth-helpers-nextjs": "^0.14.0",
+    "@supabase/supabase-js": "^2.106.2",
+    "@types/cytoscape": "^3.21.9",
+    "adm-zip": "^0.5.17",
+    "bcryptjs": "^3.0.3",
+    "cytoscape": "^3.33.4",
+    "cytoscape-react": "^5.0.3",
+    "firecrawl": "^4.29.2",
+    "iconv-lite": "^0.7.2",
+    "jose": "^6.2.3",
+    "lucide-react": "^1.16.0",
+    "next": "16.2.6",
+    "playwright-extra": "^4.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
+    "qrcode": "^1.5.4",
+    "qrcode.react": "^4.2.0",
+    "react": "19.2.4",
+    "react-dom": "19.2.4",
+    "recharts": "^3.8.1"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.60.0",
+    "@prisma/client": "^6.12.0",
+    "@types/adm-zip": "^0.5.8",
+    "@types/node": "^20",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "autoprefixer": "^10.4.0",
+    "eslint": "^9",
+    "eslint-config-next": "16.2.6",
+    "prisma": "^6.12.0",
+    "tailwindcss": "^3.4.0",
+    "typescript": "^5"
+  },
+  "allowScripts": {
+    "@prisma/client@6.19.3": true,
+    "@prisma/engines@6.19.3": true,
+    "prisma@6.19.3": true,
+    "sharp@0.34.5": true,
+    "unrs-resolver@1.12.2": true
+  },
+  "packageManager": "yarn@1.22.22+sha512.a6b2f7906b721bba3d67d4aff083df04dad64c399707841b7acf00f6b133b7ac24255f2652fa22ae3534329dc6180534e98d17432037ff6fd140556e2bb3137e"
+}
