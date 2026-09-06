@@ -29273,9 +29273,16 @@ ${charConfigStr}
         }
         // 🔥 阶段4 P2：删除洪荒题材硬编码模板污染
         // 仿写盘龙不应出现巫颂内容！所有字段必须基于LLM生成结果，不再硬编码补全
-        // 仅当LLM未生成关键字段时，使用background衍生personalityOrigin（无题材污染）
-        if (!charObj.personalityOrigin && charObj.background) {
-          charObj.personalityOrigin = _cutSent(charObj.background, 60)
+        // 🔥🔥🔥 2026-09-06 修复来源重复（用户实锤"深度设定-性格成因/成长背景细节重复"）：
+        //   原逻辑把 background 前60字直接充当 personalityOrigin，而 growthBackground 又取 background 前50字，
+        //   两个字段几乎完全重复。现改为：性格成因 = 从性格特质提炼"性格如何形成"的独立成句，不复用 background 文本。
+        if (!charObj.personalityOrigin && charObj.personality) {
+          var _poKwList = ['坚韧', '沉稳', '果决', '刚烈', '机敏', '豪迈', '沉静', '狠辣', '阴鸷', '谨慎', '重情', '温婉', '聪慧', '勇敢', '狡诈', '执拗', '豁达', '内敛', '张扬', '隐忍', '善良', '精明']
+          var _poTrait = ''
+          var _persStr0 = String(charObj.personality || '').replace(/\s+/g, '')
+          for (var _pi0 = 0; _pi0 < _poKwList.length; _pi0++) { if (_persStr0.indexOf(_poKwList[_pi0]) >= 0) { _poTrait = _poKwList[_pi0]; break } }
+          if (!_poTrait) _poTrait = _cutSent(_persStr0, 14) || '坚韧'
+          charObj.personalityOrigin = '这份' + _poTrait + '并非与生俱来，而是在过往一次次顺逆际遇与关键抉择中反复磨砺、自我确证后，沉淀为骨子里不可撼动的底色'
         }
         // 🔥🔥🔥 角色字段清洗：1)清除background中重复世界观 2)非洪荒题材清除洪荒词汇 3)重新填充空值
         var _bg = String(charObj.background || '')
@@ -29432,13 +29439,13 @@ ${charConfigStr}
         var _isProto = _charRole.indexOf('主角') >= 0
         var _isFL = _charRole.indexOf('女主') >= 0
         var _isAnta = _charRole.indexOf('反派') >= 0
-        // 性格成因
+        // 性格成因（不复用 background，避免与 growthBackground 重复）
         if (_isEmptyF(charObj.personalityOrigin)) {
-          var _poBg = _quoteSafe(_charBg, 40)
-          var _poPers = _ownSlice(_charPers, 8) || '坚韧'
-          charObj.personalityOrigin = _poBg
-            ? ('其' + _poPers + '的性格，源于' + _poBg + '的长期塑造')
-            : ('成长于动荡时局，历经数次起伏，锤炼出' + _poPers + '的性情')
+          var _poKw2 = ['坚韧', '沉稳', '果决', '刚烈', '机敏', '豪迈', '沉静', '狠辣', '阴鸷', '谨慎', '重情', '温婉', '聪慧', '勇敢', '狡诈', '执拗', '豁达', '内敛', '张扬', '隐忍', '善良', '精明']
+          var _poTrait2 = ''
+          for (var _pi2 = 0; _pi2 < _poKw2.length; _pi2++) { if (_charPers.indexOf(_poKw2[_pi2]) >= 0) { _poTrait2 = _poKw2[_pi2]; break } }
+          if (!_poTrait2) _poTrait2 = _ownSlice(_charPers, 8) || (_isAnta ? '城府深沉' : _isProto ? '坚韧果敢' : '外柔内刚')
+          charObj.personalityOrigin = '这份' + _poTrait2 + '并非与生俱来，而是在过往浮沉与一次次抉择中反复磨砺、渐次沉淀而成，最终化作其行事处世的鲜明底色'
         }
         // 成长背景细节
         if (_isEmptyF(charObj.growthBackground)) {
@@ -29462,10 +29469,12 @@ ${charConfigStr}
         if (_isEmptyF(charObj.mentor)) {
           charObj.mentor = _isProto ? ('未拜固定名师，以' + (_ownSlice(charObj.faction, 8) || '乱世实战') + '为师，靠自身悟性与奇遇步步成长') : _pick(['早年受一位隐世长者指点，得其衣钵与处世之道', '出身师门，由一位严厉却护短的恩师一手带大', '无正式师承，全凭观摩与自悟练就一身本领'])
         }
-        // 心理创伤/执念
+        // 心理创伤/执念（不复用 background 开篇——开篇已用于成长背景，改从背景后段截取，避免字段重复）
         if (_isEmptyF(charObj.psychologicalTrauma)) {
-          var _traumaQ = _quoteSafe(_charBg, 26)
-          charObj.psychologicalTrauma = _traumaQ ? ('过往「' + _traumaQ + '」在其心底留下难以释怀的伤痕，成为其行为深处的执念') : _pick(['一段无法挽回的失去，成为其始终回避却时时作痛的旧伤', '年少时的一次无力守护，化作其此后绝不重蹈覆辙的执念', '亲眼目睹至亲罹难却无力相救，自此再不肯轻易信人'])
+          var _traumaRaw = String(_charBg || '').replace(/\s+/g, '')
+          var _traumaPart = _traumaRaw.length > 34 ? _traumaRaw.substring(Math.floor(_traumaRaw.length * 0.45)) : _traumaRaw
+          var _traumaQ = _quoteSafe(_traumaPart, 26)
+          charObj.psychologicalTrauma = _traumaQ ? ('过往「' + _traumaQ + '」在其心底留下难以释怀的伤痕，成为其行为深处驱之不散的执念') : _pick(['一段无法挽回的失去，成为其始终回避却时时作痛的旧伤', '年少时的一次无力守护，化作其此后绝不重蹈覆辙的执念', '亲眼目睹至亲罹难却无力相救，自此再不肯轻易信人'])
         }
         // 道德底线
         if (_isEmptyF(charObj.moralBottomLine)) {
@@ -29557,9 +29566,16 @@ ${charConfigStr}
           var _skArr = Array.isArray(charObj.skills) ? charObj.skills.filter(function (s: any) { return s && String(s).trim() }).slice(0, 2).join('、') : ''
           charObj.techniques = _skArr || '家学渊源与实战磨砺所得的一身技艺'
         }
-        // 经历/履历
+        // 经历/履历（优先 growthArc；background 兜底用后段，不复用已用于成长背景的开篇，避免字段重复）
         if (_isEmptyF(charObj.experience)) {
-          charObj.experience = _quoteSafe(charObj.growthArc, 44) || _quoteSafe(_charBg, 44) || '半生颠沛，历经数场关键变故，练就今日心性本事'
+          var _expArc = _quoteSafe(charObj.growthArc, 44)
+          if (_expArc) {
+            charObj.experience = _expArc
+          } else {
+            var _expBg = String(_charBg || '').replace(/\s+/g, '')
+            var _expPart = _expBg.length > 30 ? _expBg.substring(Math.floor(_expBg.length * 0.3)) : _expBg
+            charObj.experience = _quoteSafe(_expPart, 44) || '半生颠沛，历经数场关键变故，练就今日心性本事'
+          }
         }
         // 核心动机（与 motivation 对齐，UI 字段名为 coreMotivation）
         if (_isEmptyF(charObj.coreMotivation)) {
