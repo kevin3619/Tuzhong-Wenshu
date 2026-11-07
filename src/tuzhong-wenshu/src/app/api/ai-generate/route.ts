@@ -3,12 +3,18 @@
  
 import { NextResponse } from 'next/server'
 import { callLLM, callLLMWithFallback, extractJSONFromText, cleanAIResponse, setImitateGuard, setExtraFallbackPool, isLLMModelHealthy, type LLMConfig, type LLMMessage } from '@/lib/ai/llm'
+import { runWithLLMRequestContext } from '@/lib/ai/llm-request-ctx'
 import { HARD_RULES, getGenericFallback } from '@/lib/ai/safe-pipeline'
 import { buildSystemPrompt, buildBookAnalysisMapping, BOOK_ANALYSIS_PROMPT, POLISH_8D_PROMPT } from '@/lib/ai/promptLibrary'
 import { deAiCleanup } from '@/lib/ai/deAiCleanup'
+// 🔥 2026-10-25 T2 反修复：chapter-quality 统一确定性门禁 + 未落地项说明见 docs/v1-platinum/flow-fix-report.md
+import { runChapterQualityGate, cleanChapterText, summarizeQGate, resolveWordBand, DEFAULT_WORD_BAND, wordBandLine, countWordUnits, WORD_UNIT_LABEL } from '@/lib/ai/oh-story/quality-gate'
+// 🔥 2026-10-26 T6：连载连续性台账（去白名单化伏笔抽取 + threadStatus + 注入窗口扩展）
+import { loadThreadLedger, openThreadsFor, threadStats, extractThreads, countResolvedBy } from '@/lib/ai/oh-story/threads'
+import { evaluateChapterStd } from '@/lib/ai/platinum-gate'
 import { projContentCheckFilter } from '@/lib/ai/proj-content-check'
 import { extractText } from '@/lib/text-utils'
-import { readFileSync, writeFileSync, existsSync, mkdirSync, statSync } from 'fs'
+import { readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync, statSync } from 'fs'
 import { join } from 'path'
 import { prisma } from '@/lib/prisma'
 import bookSourceManager from '@/lib/book-sources/manager'
@@ -22,6 +28,16 @@ import { normalizeCharactersTitlesAndRoles, dedupeCharactersByName } from '@/lib
 import { applyHistoricalTitles } from '@/lib/historical-titles'
 import { normalizeFactions, summarizeFactionReport } from '@/lib/faction-normalize'
 import { checkRateLimit, getClientIpFromRequest } from '@/lib/rate-limit'
+import { runChapterEngineWithReport, getLastEngineReport, isChapterEngineEnabled } from '@/lib/ai/chapter-engine'
+import { evaluatePlanningGate } from '@/lib/ai/oh-story/signing-gates'
+import { resolveRoute, type RouteResult } from '@/lib/ai/model-router'
+// 🔥 2026-11-01 新增：设定契约层（canon-contract）——解决「11 个环节各写各的、设定一致性只靠提示词」的结构性缺口。
+//   构建 = 把 idea/worldbuilding/powerSystem/characters/factions 固化成正向契约，注入所有环节 prompt 首段；
+//   校验 = 出口确定性核对（人物表外角色 / 金手指实体化 / 敌方代称 / 时序越界）。
+//   实测：《永历中兴》正文出现人物表外的「赵全」42 次、金手指被写成"脑中一册书"，原链路零校验全放过。
+import { buildCanonContract, renderCanonContract, verifyCanonContract } from '@/lib/ai/canon-contract'
+// 🔥 2026-10-25 T2（G-20）：免费优先 + 探活否决（探活结果由 docs/v1-platinum/evidence/probe-free-models.cjs 实测写入 models.json.lastProbe）
+import { loadModels as loadRouterModels, readProbe as readModelProbe, FREE_FIRST, FALLBACK_MODEL } from '@/lib/ai/model-router'
 
 const LOCAL_DATA_DIR = join(process.cwd(), '.tuzhong-data')
 const USER_METADATA_FILE = join(LOCAL_DATA_DIR, 'user-metadata.json')
@@ -186,61 +202,44 @@ function getRestraintRelationFromCenter(sysTypeName: string): string {
   return found?.restraintRelation || ''
 }
 
-async function checkVipPermission(novelId?: string): Promise<{ allowed: boolean; message: string }> {
-  const metadata = loadUserMetadata()
-  
-  // 优先从 Prisma 数据库检查 VIP 状态（微信支付回调写入的权威数据源）
-  try {
-    const vipUsers = await prisma.user.findMany({
-      where: { subscriptionTier: 'pro' },
-      select: { id: true, subscriptionExpiresAt: true }
-    })
-    const now = new Date()
-    const activeVip = vipUsers.find(u => {
-      if (!u.subscriptionExpiresAt) return true
-      return new Date(u.subscriptionExpiresAt) > now
-    })
-    if (activeVip) {
-      return { allowed: true, message: 'VIP会员' }
-    }
-  } catch (e) {
-    // 数据库查询失败时回退到本地文件检查
-    console.warn('[ai-generate] Prisma VIP检查失败，回退到本地文件:', e instanceof Error ? e.message : String(e))
+// 🔥 安全修复（Bug#VIP）：此前 findMany 任意 pro 用户存在即返回 allowed —— 任何免费用户永久绕过付费墙。
+//   现按当前请求用户精确校验：管理员放行 → 有效付费层放行 → 免费用户仅限第1本作品（以其名下已有作品数为准）。
+async function checkVipPermission(actor: { userId: string | null; isAdmin: boolean } | null, novelId?: string): Promise<{ allowed: boolean; message: string }> {
+  if (actor && actor.isAdmin) {
+    return { allowed: true, message: '管理员权限' }
   }
-  
-  // 回退：本地 JSON 文件检查（兼容旧数据）
-  if (metadata.vipStatus === 'vip') {
-    return { allowed: true, message: 'VIP会员' }
-  }
-  
-  if (metadata.totalGeneratedCount === 0) {
-    if (novelId) {
-      metadata.firstGeneratedNovelId = novelId
-      metadata.totalGeneratedCount = 1
-      if (!metadata.createdNovelIds.includes(novelId)) {
-        metadata.createdNovelIds.push(novelId)
+  if (actor && actor.userId) {
+    try {
+      const u = await prisma.user.findUnique({
+        where: { id: actor.userId },
+        select: { id: true, status: true, subscriptionTier: true, subscriptionExpiresAt: true },
+      })
+      if (u && u.status !== 0 && u.subscriptionTier && u.subscriptionTier !== 'free') {
+        if (!u.subscriptionExpiresAt || new Date(u.subscriptionExpiresAt) > new Date()) {
+          return { allowed: true, message: 'VIP会员' }
+        }
       }
-      saveUserMetadata(metadata)
-    }
-    return { allowed: true, message: '免费用户第1本作品' }
-  }
-  
-  if (metadata.totalGeneratedCount === 1) {
-    if (novelId && novelId === metadata.firstGeneratedNovelId) {
-      return { allowed: true, message: '免费用户第1本作品（续生成）' }
-    }
-    
-    if (!metadata.firstGeneratedNovelId && novelId) {
-      metadata.firstGeneratedNovelId = novelId
-      if (!metadata.createdNovelIds.includes(novelId)) {
-        metadata.createdNovelIds.push(novelId)
+      if (u && u.status !== 0) {
+        if (novelId) {
+          const _own = await prisma.novel.findFirst({ where: { id: novelId, userId: actor.userId }, select: { id: true } })
+          if (_own) {
+            return { allowed: true, message: '免费用户第1本作品（续生成）' }
+          }
+        }
+        const _cnt = await prisma.novel.count({ where: { userId: actor.userId } })
+        if (_cnt === 0) {
+          return { allowed: true, message: '免费用户第1本作品' }
+        }
+        return { allowed: false, message: '需要开通VIP会员才能生成第2本及以上作品' }
       }
-      saveUserMetadata(metadata)
-      return { allowed: true, message: '免费用户第1本作品' }
+    } catch (e) {
+      // 数据库查询失败：保守放行，不阻断正常创作（middleware 已保证登录态）
+      console.warn('[ai-generate] Prisma 每用户VIP校验失败，保守放行:', e instanceof Error ? e.message : String(e))
+      return { allowed: true, message: '校验暂不可用，放行' }
     }
   }
-  
-  return { allowed: false, message: '需要开通VIP会员才能生成第2本及以上作品' }
+  // 无用户身份（异常路径）：保守放行（匿名请求由 middleware 拦截，常态到不了这里）
+  return { allowed: true, message: '校验暂不可用，放行' }
 }
 
 const promptCache: Record<string, string> = {}
@@ -563,10 +562,16 @@ interface GenerateRequest {
   }
   manualModel?: boolean
   field?: string
+  // 字段级重新生成时携带的当前步骤全量快照，用于冻结其余字段（逐字保留）
+  frozen?: any
   enabledSkills?: Array<string | { id: string; prompt?: string }>
   nocache?: boolean
   activeStyle?: any
   bestsellerPrefs?: any
+  // 🔥 逐章生成正文·右上角控制面板（字数 / 风格 / 新角色）：由前端向导随 step:'content' 请求传入
+  targetWordCount?: number
+  style?: string
+  newCharacters?: string
 }
 
 // Imitation constraint prompt (common function for all steps)
@@ -948,13 +953,20 @@ const XIANXIA_REPLACE_MAP: [string, string][] = [
   ['真气', '精神念力'], ['剑气', '念力刃'], ['灵气', '星力'], ['内力', '念力'],
   ['御剑', '御使念兵'], ['宗门', '势力'], ['门派', '势力'], ['掌门', '首领'],
   ['师门', '师承'], ['金丹', '能量核心'], ['元婴', '精神体'], ['丹田', '能量中枢'],
-  ['经脉', '神经脉络'], ['法宝', '战兵'], ['仙术', '秘术'], ['古籍', '残卷'],
-  ['藏经阁', '资料库'], ['蜡烛', '灯'], ['马蹄', '车轮'], ['武林', '武者圈'],
+  ['经脉', '神经脉络'], ['法宝', '战兵'], ['仙术', '秘术'],
+  ['藏经阁', '资料库'],
   ['江湖', '地下世界'], ['渡劫', '突破瓶颈'], ['灵根', '基因'], ['筑基', '奠基'],
   ['修真', '修炼'], ['修仙', '修炼'], ['仙缘', '机缘'],
   // 🔥 强化（Bug#2）：补充高频仙侠错位词（科幻/都市题材严禁），彻底清洗缓存设定与正文中的残留
   ['仙界', '星界'], ['妖兽', '星兽'], ['修为', '能级'], ['证道', '明悟'],
-  ['鸿蒙', '原初'], ['混沌', '原初'],
+  // 🔥 2026-11-01 修复（P0-3）：删除 5 条把【正常中文/史实器物】当串味词的条目。
+  //   原条目 → 后果（历史题材实测）：
+  //     ['蜡烛','灯']      → 明代烛台、守夜蜡烛被改成"灯"，器物失真
+  //     ['马蹄','车轮']    → 骑兵的"马蹄"被改成"车轮"（骑兵变车兵）
+  //     ['古籍','残卷']    → "古籍"是正确用词，被强行改成"残卷"
+  //     ['鸿蒙','原初']    → 正常汉语词，且神话/历史题材会用
+  //     ['混沌','原初']    → "混沌初开"是成语，被改成"原初初开"
+  //   这些不是"仙侠专属词"，而是通用中文；误删比串味危害更大。
 ]
 
 // 🔥 仙侠式专有名词（人名/称号）替换表：9B 模型在非仙侠题材会生成 幽冥子/凌霄子/血煞天君/玄机老人 等带修真称号后缀的角色名，
@@ -1652,7 +1664,7 @@ async function _deAiPolishPass(text: string, llmConfig: any): Promise<string> {
     var polished = resp && resp.content ? String(resp.content) : ''
     if (!polished || polished.trim().length < 100) { console.log('[content] #8 去AI润色输出异常，保留原稿'); return text }
     var out = deAiCleanup(polished)
-    out = cleanNovelContent(out, null)
+    out = cleanNovelContent(out, null, _genre)
     var after = scanContentViolations(out).length
     if (after <= before && out.length >= text.length * 0.7) {
       console.log('[content] #8 去AI润色闭环生效: 特征库残留 ' + before + '→' + after + ', 长度 ' + text.length + '→' + out.length + ', 模型: ' + (resp.usedModel || ''))
@@ -1781,6 +1793,98 @@ function enforceStageConsistency(step: string, result: any, previousData: any): 
   return { fixed: fixed }
 }
 
+// 🔥 #200 生成端括号闭合兜底（确定性·零 LLM 调用）：LLM 产出的 aliases/birthplace/realmLevel 等字段
+//   常见「蜀王（追封」「陕西延安府（张献忠养子」式尾括号缺失（2026-09-09 QA 实锤）。按「；」分段逐段补「）」。
+// 🔥 #200b 模板句确定性剥离：实测 glm-4-flash 等弱模型会无视 prompt 禁令继续产出「血缘关联…」「永生之门」
+//   等万金油句（2026-09-09 真实生成实锤）。生成出口按句切分，剔除含违禁短语的句子（保留字段其余内容）。
+const _GEN_TPL_BAN = [
+  '一件与其身份经历紧密相连', '吾辈死生以之', '生于瘴气', '世人多直呼其名', '永生之门', '境界突破桎梏',
+  '外表温文尔雅', '血缘关联', '过度保护，敌人一旦以此要挟', '盾，为其惯用兵刃', '盾的操使',
+  '命运交织、恩怨纠缠', '初露锋芒，实力仍在', '数易其主、几经沉浮', '权倾一方到盛极而衰',
+  '绝不平庸的一生', '在故事中成长蜕变', '废柴到巅峰', '星域海盗', '星域秩序', '宁家大小姐',
+]
+const _genIsTpl = function (t: string): boolean {
+  if (!t) return false
+  for (let i = 0; i < _GEN_TPL_BAN.length; i++) { if (t.indexOf(_GEN_TPL_BAN[i]) !== -1) return true }
+  if (/阵营（[^）]{0,6}，/.test(t)) return true
+  return false
+}
+const _genStripTplSentences = function (t: string): string {
+  if (typeof t !== 'string' || !t) return t
+  if (!_genIsTpl(t)) return t
+  // 按「；」「。」切分（保留分隔符），剔除含违禁短语的句子
+  const parts = t.split(/(；|。)/)
+  const kept: string[] = []
+  for (let i = 0; i < parts.length; i += 2) {
+    const seg = parts[i]
+    const sep = parts[i + 1] || ''
+    if (!seg) continue
+    if (_genIsTpl(seg)) continue
+    kept.push(seg + sep)
+  }
+  let out = kept.join('')
+  // 整句全被剔光 → 返回空串（宁空勿假）
+  if (!_genIsTpl(out)) return out
+  // 兜底：句级切分后仍有残留（如违禁词横跨切分点），整字段清空
+  return ''
+}
+function _sanitizeCharsBrackets(result: any, issues: string[]): any {
+  try {
+    if (!result || typeof result !== 'object') return result
+    var _buckets: any[] = []
+    for (var _bi = 0; _bi < ['protagonist', 'antagonist', 'femaleLead'].length; _bi++) {
+      var _bk = (['protagonist', 'antagonist', 'femaleLead'] as any[])[_bi]
+      if (result[_bk] && typeof result[_bk] === 'object') _buckets.push(result[_bk])
+    }
+    for (var _ai = 0; _ai < ['antagonists', 'supporting', 'femaleLeads', 'masters', 'villains', 'allies'].length; _ai++) {
+      var _ak = (['antagonists', 'supporting', 'femaleLeads', 'masters', 'villains', 'allies'] as any[])[_ai]
+      if (Array.isArray(result[_ak])) {
+        for (var _aj = 0; _aj < result[_ak].length; _aj++) {
+          if (result[_ak][_aj] && typeof result[_ak][_aj] === 'object') _buckets.push(result[_ak][_aj])
+        }
+      }
+    }
+    var _fixCount = 0
+    var _tplCount = 0
+    var _fixOne = function (t: string): string {
+      if (typeof t !== 'string' || t.indexOf('（') === -1) return t
+      var _open = (t.match(/（/g) || []).length
+      var _close = (t.match(/）/g) || []).length
+      if (_open <= _close) return t
+      return t.split(/(；|;|\n)/).map(function (part: string) {
+        if (part === '；' || part === ';' || part === '\n') return part
+        var o = (part.match(/（/g) || []).length
+        var cl = (part.match(/）/g) || []).length
+        var out = part
+        while (o > cl) { out += '）'; cl++ }
+        return out
+      }).join('')
+    }
+    for (var _ci = 0; _ci < _buckets.length; _ci++) {
+      var _c = _buckets[_ci]
+      var _keys = Object.keys(_c)
+      for (var _ki = 0; _ki < _keys.length; _ki++) {
+        var _k = _keys[_ki]
+        if (_k === 'name') continue // 专名不参与模板剥离
+        var _v = _c[_k]
+        if (typeof _v === 'string') {
+          var _nv = _fixOne(_v)
+          // 🔥 #200b 模板句剥离（剔除含违禁短语的句子，宁空勿假）
+          var _tv = _genStripTplSentences(_nv)
+          if (_tv !== _nv) { _nv = _tv; _tplCount++ }
+          if (_nv !== _v) { _c[_k] = _nv; _fixCount++ }
+        } else if (Array.isArray(_v)) {
+          var _nva = _v.map(function (x: any) { return typeof x === 'string' ? _genStripTplSentences(_fixOne(x)) : x })
+          if (JSON.stringify(_nva) !== JSON.stringify(_v)) { _c[_k] = _nva; _fixCount++; _tplCount++ }
+        }
+      }
+    }
+    if (_fixCount > 0) issues.push('FIX characters 括号闭合补全 ' + _fixCount + ' 处（#200 生成端兜底）')
+    if (_tplCount > 0) issues.push('FIX characters 模板句剥离 ' + _tplCount + ' 处（#200b 生成端兜底）')
+  } catch (_e) { /* never throw */ }
+  return result
+}
+
 // 🔥 规划步质检（确定性·零额外 LLM 调用）：本步"自身质量达标"校验
 // 与 enforceStageConsistency（跨步一致性锁定）互补：本函数负责 ① 必需元素/schema 可观测 ② 残留跨题材危险词兜底再剥
 // （覆盖全局清洗刻意跳过的 name/title 等专名字段——这些字段若不剥，仙侠/洪荒词会直接漏进正文造成题材串味）
@@ -1801,6 +1905,8 @@ function validateStage(step: string, result: any, genre: string, previousData: a
       if (!result.protagonist || !result.protagonist.name) issues.push('WARN characters.protagonist.name 缺失')
       if (!Array.isArray(result.antagonists) || result.antagonists.length < 2) issues.push('WARN characters 反派<2')
       if (!Array.isArray(result.supporting) || result.supporting.length < 3) issues.push('WARN characters 配角<3')
+      // 🔥 #200 生成端括号闭合兜底（确定性修复，零风险）
+      _sanitizeCharsBrackets(result, issues)
     } else if (step === 'outline') {
       if (!Array.isArray(result.stages)) issues.push('WARN outline.stages 缺失(卷纲缺失)')
     } else if (step === 'worldbuilding') {
@@ -1816,6 +1922,19 @@ function validateStage(step: string, result: any, genre: string, previousData: a
     } else if (step === 'chapters') {
       if (!Array.isArray(result.chapters) && !Array.isArray(result.volumes)) issues.push('WARN chapters 缺 chapters/volumes')
     }
+    // 🔥 2026-10-22：oh-story 签约级规划门禁（结构完整性 + 占位词残留）
+    // S1 视为硬伤并进入既有规划重试循环；S2 仅告警，避免规划阶段无限重试。
+    try {
+      const _gate = evaluatePlanningGate(step, result, _canonGenre)
+      for (const _f of _gate.findings) {
+        if (_f.severity === 'S1') {
+          // 带「缺失」标记 → 命中规划重试循环的硬伤判定
+          issues.push('WARN 规划门禁[S1] 缺失/硬伤：' + _f.issue)
+        } else if (_f.severity === 'S2') {
+          issues.push('WARN 规划门禁[S2] 提示：' + _f.issue)
+        }
+      }
+    } catch (_gateErr) { /* never throw */ }
     // ② 残留跨题材危险词兜底再剥（仅非修炼/玄幻/洪荒/西幻题材；覆盖全局清洗跳过的 name/title 等专名字段）
     _isCultivation = /修仙|修真|玄幻|仙侠|洪荒|西幻|奇幻|魔法|斗气/.test(_canonGenre)
     _contamination = 0
@@ -1862,7 +1981,8 @@ function buildContentQaReport(result: any, previousData: any): any {
     var _dup = (_text.match(/(地|的|了|是|不|就|得)\1+/g) || []).length
     var _stateWordRe = /(脑海中|脑中|心中|心里|心底|脸上|眼里|耳边|耳畔|嘴边|手中|手里|脚下|身上|背上|头上|渐渐|慢慢|突然|立刻|久久|微微|猛地|暗自)/
     var _redundantShi = (_text.match(new RegExp('[一-龥]{2,4}是(?=' + _stateWordRe.source + ')', 'g')) || []).length
-    var _shuangRe = /(打脸|反转|逆袭|震惊|碾压|装逼|突破|晋级|获宝|打脸成功|强势|震惊全场|一战成名|吊打|横扫|爽)/g
+    // 不含「震惊/震惊全场」：与 platinum-gate.SHUANG_PATTERNS、SHUANG_MARKERS、CONTENT_PROMPT 禁词同口径
+    var _shuangRe = /(打脸|反转|逆袭|碾压|装逼|突破|晋级|获宝|打脸成功|强势|一战成名|吊打|横扫|爽)/g
     var _shuang = (_text.match(_shuangRe) || []).length
     var _canonName = (((previousData && previousData.idea && previousData.idea.protagonistName) || '')).toString()
     var _namePresent = _canonName ? (_text.indexOf(_canonName) >= 0) : true
@@ -1882,7 +2002,26 @@ function buildContentQaReport(result: any, previousData: any): any {
   }
 }
 
-function cleanNovelContent(text: string, previousData?: any): string {
+function cleanNovelContent(text: string, previousData?: any, genre?: string): string {
+  // 🔥 2026-10-28 修复（正文内容标准#8·合规闸门误伤）：异族→外邦 仅对写实类题材生效；幻想类（玄幻/仙侠/修真/洪荒/科幻/西幻 等）保留「异族」合法种族词，避免污染正文。
+  var _isFantasyGenre = !!genre && /玄幻|仙侠|修真|洪荒|修仙|科幻|西幻|奇幻|星际|末世|异世|无限|系统|机甲|赛博|网游|游戏|灵异|诡秘|盗墓|无限流|高武|武道|都市异能|都市修真|变种/.test(genre)
+  // 2026-10-16 生成出口合规红线闸门（通用红线词）：step content 原始产出曾泄漏「鞑虏」（生产实章探针实测）。
+  // content 生成接口此前无合规闸门（仅 settings 落库路径 _guardComplianceWords 有），此处对落库前正文做词级替换，覆盖首次生成/续写/重写/兜底全部出口。
+  // 仅收全题材通用红线词，不含国名类（印度/西班牙等）以免现代题材假阳性。
+  if (text) {
+    text = text
+      .split('鞑虏').join('清军')
+      .split('满清').join('清廷')
+      .split('屠杀').join('屠戮')
+      .split('屠城').join('城破')
+      .split('灭族').join('覆亡')
+      .split('异族').join(_isFantasyGenre ? '异族' : '外邦')
+      .split('满汉存亡').join('天下存亡')
+      .split('民族存亡').join('社稷存亡')
+      .split('民族尊严').join('国体尊严')
+    text = text.split('清廷清廷').join('清廷')
+  }
+
   if (!text) return ''
   var cleaned = text
     .replace(/^\uFEFF/, '')
@@ -1897,6 +2036,13 @@ function cleanNovelContent(text: string, previousData?: any): string {
   // 🔥 Bug修复：移除正文开头的"《第X章 标题》"书名号格式（AI模型常模仿user prompt中的格式）
   cleaned = cleaned.replace(/^\s*《\s*第[一二三四五六七八九十百千\d]+章[^》]*》[\s\r\n]*/m, '')
   cleaned = cleaned.replace(/^\s*《[^》]*》[\s\r\n]*/m, '') // 任何开头书名号包裹的标题
+  // 🔥 2026-10-25 新增：清除泄漏进正文的「《书名》第N章《标题》」组合形态
+  //   （线上实测 ch63 正文首行泄漏《永历中兴》第63章《瘿岭弃辎》，旧规则只删了书名号书名，残留"第N章《标题》"）
+  cleaned = cleaned.replace(/^\s*《[^》]{0,24}》\s*第[一二三四五六七八九十百千\d]+章\s*《[^》]{0,24}》[。！？、\s\r\n]*/gm, '')
+  cleaned = cleaned.replace(/[\r\n]\s*《[^》]{0,24}》\s*第[一二三四五六七八九十百千\d]+章\s*《[^》]{0,24}》[^\n]*/g, '\n\n')
+  cleaned = cleaned.replace(/^\s*第[一二三四五六七八九十百千\d]+章\s*《[^》]{0,24}》[。！？、\s\r\n]*/gm, '')
+  cleaned = cleaned.replace(/[\r\n]\s*第[一二三四五六七八九十百千\d]+章\s*《[^》]{0,24}》[^\n]*/g, '\n\n')
+  cleaned = cleaned.replace(/[\r\n]\s*《永历中兴》[^\n]*/g, '\n\n')
   cleaned = cleaned.replace(/[\r\n]\s*《\s*第[一二三四五六七八九十百千\d]+章[^》]*》[\s\r\n]*/g, '\n\n')
 
   // 移除正文开头的章节标题（如"第X章 XXX"单独成行）
@@ -2056,12 +2202,25 @@ function cleanNovelContent(text: string, previousData?: any): string {
   if (previousData && previousData.idea && previousData.idea.genre) _genreStr = String(previousData.idea.genre)
   else if (previousData && previousData.genre) _genreStr = String(previousData.genre)
   var _isXianxiaGenre = /玄幻|仙侠|修真|武侠|西幻|异世/.test(_genreStr)
+  // 🔥 2026-11-01 修复（P0-3）：历史/现实题材单独走「硬核修仙术语」白名单子集。
+  //   原实现对**所有非仙侠题材**（含历史/权谋/明末）套用整张替换表，把历史文本的正确用词改错：
+  //     "江湖"→"地下世界"（历史文"江湖"是正确用法）、"门派"→"势力"、
+  //     以及真实道教神祇"太上老君"→"太上元老"、"真武天君"→"真武主帅"（史实/民俗词被改写）。
+  //   现改为：历史题材只清洗真正的修炼术语（真气/金丹/元婴/灵气…），不碰历史常用词与真实神祇名。
+  var _isHistGenreForX = /历史|权谋|朝堂|明末|南明|民国|架空历史|古代|两宋元明/.test(_genreStr)
   if (!_isXianxiaGenre) {
-    for (var _xi = 0; _xi < XIANXIA_REPLACE_MAP.length; _xi++) {
-      cleaned = cleaned.split(XIANXIA_REPLACE_MAP[_xi][0]).join(XIANXIA_REPLACE_MAP[_xi][1])
+    var _xHardCore = new Set(['真气', '剑气', '灵气', '内力', '御剑', '金丹', '元婴', '丹田', '法宝', '仙术', '渡劫', '灵根', '筑基', '修真', '修仙', '仙缘', '仙界', '妖兽', '修为', '证道', '宗门', '掌门', '师门', '藏经阁'])
+    var _xMap = _isHistGenreForX
+      ? XIANXIA_REPLACE_MAP.filter(function (p) { return _xHardCore.has(p[0]) })
+      : XIANXIA_REPLACE_MAP
+    for (var _xi = 0; _xi < _xMap.length; _xi++) {
+      cleaned = cleaned.split(_xMap[_xi][0]).join(_xMap[_xi][1])
     }
     // 🔥 仙侠式专有名词（人名/称号）清洗：替换 幽冥子/凌霄子/血煞天君/玄机老人 等修真全名
+    //   历史题材下跳过真实道教神祇/封号（太上老君/真武天君/玉清真人…），它们是史实与民俗词，不是串味词。
+    var _xRealDeity = /^(太上老君|真武天君|玄阴天君|玉清真人|太虚真人|玄阴真人)$/
     for (var _xn = 0; _xn < XIANXIA_NAME_MAP.length; _xn++) {
+      if (_isHistGenreForX && _xRealDeity.test(XIANXIA_NAME_MAP[_xn][0])) continue
       cleaned = cleaned.split(XIANXIA_NAME_MAP[_xn][0]).join(XIANXIA_NAME_MAP[_xn][1])
     }
     // 🔥 修真称号后缀通用清洗：彻底拦截 天君/真君/道君/仙尊/妖皇/妖王/魔尊/老祖/剑仙/散仙 等修真风人名泄漏（解决"打地鼠"）
@@ -2069,6 +2228,27 @@ function cleanNovelContent(text: string, previousData?: any): string {
       cleaned = cleaned.split(XIANXIA_SUFFIX_MAP[_xs][0]).join(XIANXIA_SUFFIX_MAP[_xs][1])
     }
   }
+
+  // 🔥 2026-10-28 修复（正文内容标准#9·Latin/纯中文铁律）：确定性剥离泄漏进中文正文的英文单词片段。
+  //   CONTENT_PROMPT 已禁中英混杂、36281 行有「硬性废稿」检测闸门（仅触发重试、不剥离），此处补齐确定性清洗层：
+  //   移除连续 4+ 个英文字母的单词（纯中文叙事不应出现），避免 GLM-4-9B 夹英德文污染词漏网。
+  //   允许名单（安全白名单，仅保留不减伤）：都市/现实题材通行缩写与常见技术词（APP/VIP/GPS/NBA/WiFi/WeChat/iPhone...）。
+  var _latinKeep = new Set(['APP','VIP','GPS','NBA','KTV','WX','QQ','SMS','USB','PC','TV','OK','NO','AI','ML','IT','ID','VS','EX','RM','OO','XI','WE','HI','OH','GO','UP','MY','WIFI','WECHAT','IPHONE','IPAD','ANDROID','IOS','EXCEL','PPT','PDF','URL','HTTP','HTTPS','API','JSON','CSS','HTML','VR','AR','XR','3D','2D','4K','HD','LED','LCD','CPU','GPU','GPT','USB','UI','UX','PS','MC','HP','IP'])
+  cleaned = cleaned.replace(/[A-Za-z]{4,}/g, function (_m) { return _latinKeep.has(_m.toUpperCase()) ? _m : '' })
+  // 剥离后相邻空格/标点收拢，避免残留空洞
+  cleaned = cleaned.replace(/[ \t]{2,}/g, ' ').replace(/[ \t]+([，。！？、；：”’）】])/g, '$1').replace(/([“（【])[ \t]+/g, '$1')
+  // 🔥 2026-10-28 修复（正文内容标准#10·元叙述禁令）：确定性剥离泄漏进正文的元叙事/脚手架短语。
+  //   META_NARRATIVE_WORDS 已在 repairPlan/pitfallRules 用于检测，此处从正文确定性剥离，杜绝硬废稿漏网。
+  //   注：「即将揭晓」为正常中文短语（真相即将揭晓），不在此剥离，其元叙述用法由摘要/钩子字段层拦截。
+  cleaned = cleaned
+    .replace(/且看[下回这]?[章回]?分解/g, '')
+    .replace(/且看/g, '')
+    .replace(/为下一章/g, '')
+    .replace(/下一章/g, '')
+    .replace(/下章/g, '')
+    .replace(/本章/g, '')
+    .replace(/章末/g, '')
+    .replace(/未完待续|下回分解|欲知后事|预知后事/g, '')
 
   return cleaned
 }
@@ -2211,6 +2391,228 @@ function _deriveTitleFallback(summary: string): string {
   if (_parts.length >= 2) return _parts[0].slice(0, 4) + '，' + _parts[1].slice(0, 4)
   if (_parts.length === 1) return _parts[0].slice(0, 8)
   return _s.slice(0, 8)
+}
+
+// 🔥 章节标题完整性工具（全链路复用）：
+//   标题管线里多处硬截断/滑窗会产出「揭露吴三桂勾」「发现海面下有巨大」这类残句，
+//   统一用 _isCompleteTitleCore 做完整性判定，用 _safeTrimTitle 做边界安全裁剪。
+var _TITLE_STOP_CHARS = '的了着在与和之其为以而则就都是这那他她它们把被将向从对给让使令'
+var _TITLE_PRONOUN_CHARS = '他她它们吧吗呢啊呀哦啦嘛么'
+var _TITLE_BAD_TAIL_CHARS = '勾残巨刻脚指可'
+// 🔥 补强：全文任何位置都不得出现的虚词/连接词/副词——「身后是追」「中兴大又」这类残句的通病。
+//   注意豁免「之」（「移驾之议」「十日之转」是合法文言标题结构）。
+var _TITLE_JUNK_ANY = '是与和其为以而则就都这那他她它们把被将向从对给让使令又也还便即却且或若虽因为所'
+// 🔥 补强2：「3字人名+1字残尾」拦截——「李定国奉(诏)」「孙可望野(心)」这类 4 字核心若前 3 字是历史人物名，
+//   剩余 1 字几乎必然是被截断的尾巴，一律判残句拒收（合法标题不会是「全名+单字」结构）。
+var _TITLE_NAME3_RE = /^(李定国|孙可望|何腾蛟|堵胤锡|郑成功|金声桓|李成栋|尚可喜|耿仲明|孔有德|吴三桂|洪承畴|朱由榔|马吉翔|丁魁楚|张献忠|刘文秀|艾能奇|白文选|多尔衮|济尔哈朗|吴国贵|靳统武|祁三升|张同敞|胡一青|赵印选|李元胤)(.)$/
+// 🔥 补强3：「截断人名残尾」——核心末尾若是某历史人物名的前 2 字（如「洞察李定(国)」「密会孙可(望)」），判残句拒收
+var _TITLE_NAME_PREFIX2 = ['李定', '孙可', '郑成', '吴三', '洪承', '多尔', '济尔', '何腾', '堵胤', '金声', '李成', '尚可', '耿仲', '孔有', '马吉', '丁魁', '张献', '刘文', '艾能', '白文', '朱由']
+var _TITLE_CN_SEQ = ['一', '二', '三', '四', '五', '六', '七', '八', '九', '十', '十一', '十二', '十三', '十四', '十五', '十六', '十七', '十八', '十九', '二十']
+function _titleCnSeq(n: number): string {
+  if (n >= 2 && n <= 20) return _TITLE_CN_SEQ[n - 1]
+  return String(n)
+}
+// 判定「标题核心」是否为完整可读的中文标题（非叙述残句）
+function _isCompleteTitleCore(t: string): boolean {
+  if (!t) return false
+  var _core = String(t).replace(/^第\s*[一二三四五六七八九十百千\d]+\s*章\s*/, '')
+  _core = _core.replace(/（[一二三四五六七八九十百]+）$/, '').replace(/[^\u4e00-\u9fff]/g, '')
+  if (_core.length < 4 || _core.length > 9) return false
+  // 首/末字符不得是停用字
+  if (_TITLE_STOP_CHARS.indexOf(_core.charAt(0)) >= 0) return false
+  if (_TITLE_STOP_CHARS.indexOf(_core.charAt(_core.length - 1)) >= 0) return false
+  // 全文不得含叙述标记 的/了/着/在（排除固定词组）
+  if (_core.indexOf('的') >= 0 && !/目的|真的|似的|等的/.test(_core)) return false
+  if (_core.indexOf('了') >= 0 && !/了解|明了|了悟|了结|了断|了得|一目了然/.test(_core)) return false
+  if (_core.indexOf('着') >= 0 && !/着落|着急|着迷|着想|着眼于/.test(_core)) return false
+  if (_core.indexOf('在') >= 0 && !/存在|现在|意在|在望|在所|事在人为|危在旦夕|箭在弦上/.test(_core)) return false
+  // 不得含代词/语气词
+  for (var _pi = 0; _pi < _TITLE_PRONOUN_CHARS.length; _pi++) {
+    if (_core.indexOf(_TITLE_PRONOUN_CHARS.charAt(_pi)) >= 0) return false
+  }
+  // 🔥 补强：全文不得含虚词/副词（只查首尾拦不住「身后是追」「孙可望率」「中兴大又」这类中间带虚词的碎片）
+  for (var _ji = 0; _ji < _TITLE_JUNK_ANY.length; _ji++) {
+    if (_core.indexOf(_TITLE_JUNK_ANY.charAt(_ji)) >= 0) return false
+  }
+  // 🔥 补强2：4 字核心=「3字人名+1字残尾」→ 判残句拒收（候选链会自动改选其它完整候选）
+  if (_core.length === 4 && _TITLE_NAME3_RE.test(_core)) return false
+  // 🔥 补强3：核心末尾=「截断人名前缀」→ 判残句拒收（「洞察李定」「密会孙可」这类被斩尾的人名）
+  var _tail2 = _core.substring(_core.length - 2)
+  for (var _ni = 0; _ni < _TITLE_NAME_PREFIX2.length; _ni++) {
+    if (_tail2 === _TITLE_NAME_PREFIX2[_ni]) return false
+  }
+  // 末字符不得是明显「半截词」尾巴
+  if (_TITLE_BAD_TAIL_CHARS.indexOf(_core.charAt(_core.length - 1)) >= 0) return false
+  return true
+}
+// 边界安全裁剪：超长时优先在标点处断开取前半，否则截断后循环剔除结尾停用字
+function _safeTrimTitle(t: string, max: number): string {
+  if (!t) return ''
+  var _s = String(t).trim()
+  if (!max || max < 2) max = 8
+  var _plain = _s.replace(/[^\u4e00-\u9fff，。、！？]/g, '')
+  if (_plain.length <= max) {
+    while (_plain.length > 0 && _TITLE_STOP_CHARS.indexOf(_plain.charAt(_plain.length - 1)) >= 0) _plain = _plain.slice(0, -1)
+    return _plain.length >= 2 ? _plain : ''
+  }
+  // 优先按标点断开取前半（若前半长度合适）
+  var _out = ''
+  var _m = _plain.match(/^[^，。、！？]{2,}/)
+  if (_m && _m[0].length >= 2 && _m[0].length <= max) {
+    _out = _m[0]
+  } else {
+    _out = _plain.slice(0, max)
+  }
+  while (_out.length > 0 && _TITLE_STOP_CHARS.indexOf(_out.charAt(_out.length - 1)) >= 0) _out = _out.slice(0, -1)
+  return _out.length >= 2 ? _out : ''
+}
+
+// ===== 章节标题「唯一终审」工具（全链路复用）=====
+// 🔥 用户拍板：全书章节标题统一 4 字。前面所有生成逻辑只提供候选，最终一律以 _finalizeChapterTitles 为准。
+// 标题核心：去「第X章」前缀 + 去「（二）」类后缀 + 仅保留汉字
+function _titleCoreOf(t: string): string {
+  if (!t) return ''
+  return String(t)
+    .replace(/^第\s*[一二三四五六七八九十百千\d]+\s*章\s*/, '')
+    .replace(/（[一二三四五六七八九十百]+）$/, '')
+    .replace(/[^\u4e00-\u9fff]/g, '')
+}
+// 历史题材双字动词表（取自第 1 卷已验证标题词感）
+var _HIST_VERB2 = ['清丈', '整顿', '编练', '督师', '募勇', '驰援', '血战', '收复', '擒斩', '推行', '安抚', '囤积', '演练', '会盟', '论功', '整肃', '筹措', '查办', '开科', '广纳', '操演', '打造', '安定', '运筹', '决胜', '克复', '再造', '中兴', '夺回', '密布', '初见', '断粮', '移驾', '招贤', '抚民', '清剿', '设伏', '筑城', '练军', '兴学', '通商', '通漕', '劝农', '兴修', '练兵', '铸炮', '建仓', '修渠', '平乱', '定策', '预知', '魂穿', '议政', '理财', '缉私', '招降', '分化', '策反', '肃贪', '整饬', '裁汰', '接济', '犒师', '授勋', '册封', '朝觐', '巡边', '戍边', '屯田', '开矿', '设卡', '固守', '夜袭', '策应', '接应', '增援', '断后']
+// 历史题材双字宾语表（用于合成唯一 4 字标题兜底）
+var _HIST_OBJ2 = ['朝纲', '军饷', '粮道', '城防', '民心', '军械', '水师', '州县', '要隘', '新政', '田亩', '火器', '吏治', '漕运', '流民', '诸将', '敌营', '敌帅', '失地', '乾坤', '边镇', '盐铁', '马政', '驿道', '河防', '钱法', '军制', '藩镇', '逆党', '海防', '屯垦', '义仓', '学宫', '商路', '驿传', '武备', '军心', '地利', '人和']
+// 历史题材精选 4 字词池（最末兜底，全部为完整词，非截断）
+var _HIST_4_POOL = ['整肃朝纲', '编练新军', '清丈田亩', '筹措军饷', '火器试演', '演武立威', '平定内乱', '收揽兵权', '整顿吏治', '赈济灾民', '操练水师', '购置火器', '稳固两粤', '击退清骑', '计除权奸', '推行新政', '疏浚漕运', '招抚流民', '修筑城防', '夜袭敌营', '断敌粮道', '收复州县', '会盟诸将', '明正典刑', '整军经武', '固守要隘', '论功行赏', '查办贪墨', '开科取士', '广纳贤才', '操演阵法', '打造军械', '囤积粮草', '安定民心', '擒斩敌将', '运筹帷幄', '决胜疆场', '克复失地', '再造乾坤', '中兴在望', '募勇戍边', '设伏歼敌', '筑城练兵', '通商裕国', '劝农兴学', '练兵铸炮', '建仓修渠', '平乱定策', '策应接应', '增援断后', '缉私肃贪', '招降分化', '策反整饬', '裁汰冗员', '犒师授勋', '册封群臣', '巡边屯田', '开矿设卡', '朝觐议政', '理财通漕']
+// 分句拾取：仅返回「汉字数恰好 === n」的完整分句（不滑窗、不腰斩）
+function _pickClauseAtLength(text: string, n: number): string {
+  if (!text || !n) return ''
+  var _s = String(text).replace(/^第\s*[一二三四五六七八九十百千\d]+\s*章\s*/, '').replace(/（[一二三四五六七八九十百]+）$/, '')
+  var _clauses = _s.split(/[。！？；;，,、：:.\/\\\s（）()【】\[\]《》<>"'“”‘’…—\-～~]+/)
+  for (var _ci = 0; _ci < _clauses.length; _ci++) {
+    var _c = _clauses[_ci].replace(/[^\u4e00-\u9fff]/g, '')
+    if (_c.length === n && _isCompleteTitleCore(_c)) return _c
+  }
+  return ''
+}
+// 从摘要合成 4 字标题（动词2+宾语2 / 前2+动词2）；used 命中时自动换下一个动词
+function _composeFromSummary(summary: string, n: number, used?: Set<string>): string {
+  if (n !== 4) return _pickClauseAtLength(summary, n)
+  var _s = String(summary || '').replace(/[^\u4e00-\u9fff，。！？、；：\s]/g, '')
+  if (!_s) return ''
+  var _taken = used || new Set<string>()
+  for (var _vi = 0; _vi < _HIST_VERB2.length; _vi++) {
+    var _v = _HIST_VERB2[_vi]
+    var _p = _s.indexOf(_v)
+    if (_p < 0) continue
+    var _after = _s.substring(_p + 2).replace(/^[，。！？、；：\s]+/, '')
+    var _obj = _after.substring(0, 2).replace(/[^\u4e00-\u9fff]/g, '')
+    var _cand = _v + _obj
+    if (_obj.length === 2 && _titleCoreOf(_cand).length === 4 && _isCompleteTitleCore(_cand) && !_taken.has(_cand)) return _cand
+    var _before = _s.substring(0, _p).replace(/[，。！？、；：\s]+$/, '')
+    var _pre = _before.length >= 2 ? _before.substring(_before.length - 2) : ''
+    var _cand2 = _pre + _v
+    if (_pre.length === 2 && _titleCoreOf(_cand2).length === 4 && _isCompleteTitleCore(_cand2) && !_taken.has(_cand2)) return _cand2
+    // 🔥 补强：紧邻宾语不可用（含虚词/凑不成词）时，退而在摘要全文里找白名单宾语（优先出现在动词之后），
+    //   保证「动词2+宾语2」内容相关且绝不产生残句；仍找不到才交给 _composeGenericUnique / 题材池
+    for (var _oi2 = 0; _oi2 < _HIST_OBJ2.length; _oi2++) {
+      var _o2 = _HIST_OBJ2[_oi2]
+      if (_s.indexOf(_o2, _p + 2) < 0) continue
+      var _cand3 = _v + _o2
+      if (_titleCoreOf(_cand3).length === 4 && _isCompleteTitleCore(_cand3) && !_taken.has(_cand3)) return _cand3
+    }
+  }
+  return ''
+}
+// 通用合成（动词×宾语）——保证拿到一个未被占用的唯一 4 字
+function _composeGenericUnique(n: number, used?: Set<string>): string {
+  if (n !== 4) return ''
+  var _taken = used || new Set<string>()
+  for (var _vi = 0; _vi < _HIST_VERB2.length; _vi++) {
+    for (var _oi = 0; _oi < _HIST_OBJ2.length; _oi++) {
+      var _c = _HIST_VERB2[_vi] + _HIST_OBJ2[_oi]
+      if (_titleCoreOf(_c).length === 4 && _isCompleteTitleCore(_c) && !_taken.has(_c)) return _c
+    }
+  }
+  return ''
+}
+// 题材池拾取（最末兜底）
+function _pickFromGenrePool(summary: string, n: number, chapterNumber: number, used?: Set<string>): string {
+  if (n !== 4) return ''
+  var _taken = used || new Set<string>()
+  var _start = Math.abs(Number(chapterNumber) || 0) % _HIST_4_POOL.length
+  for (var _i = 0; _i < _HIST_4_POOL.length; _i++) {
+    var _c = _HIST_4_POOL[(_start + _i) % _HIST_4_POOL.length]
+    if (_isCompleteTitleCore(_c) && !_taken.has(_c)) return _c
+  }
+  return ''
+}
+// 目标字数解析：只取【其它卷】通过 _isCompleteTitleCore 的标题核心的汉字数众数；不在 {4,5,6} 或无样本 → 4
+function _resolveTitleLen(existingChaptersFull: any[], volNum: number): number {
+  var _counts: {[k: number]: number} = {}
+  var _arr = Array.isArray(existingChaptersFull) ? existingChaptersFull : []
+  for (var _i = 0; _i < _arr.length; _i++) {
+    var _ec = _arr[_i]
+    if (!_ec || !_ec.title) continue
+    if (Number(_ec.volume) === Number(volNum)) continue          // 排除本卷（存量可能是坏数据）
+    var _core = _titleCoreOf(_ec.title)
+    if (_core.length >= 4 && _core.length <= 9 && _isCompleteTitleCore(_ec.title)) {
+      _counts[_core.length] = (_counts[_core.length] || 0) + 1
+    }
+  }
+  var _best = 0, _bestCnt = -1
+  for (var _k in _counts) {
+    var _kn = Number(_k), _kc = _counts[_k]
+    if (_kc > _bestCnt || (_kc === _bestCnt && _kn === 4)) { _bestCnt = _kc; _best = _kn }
+  }
+  if (_best >= 4 && _best <= 6) return _best
+  return 4
+}
+// 🔥 唯一终审：全书统一字数（本作=4），跨卷防重，逐章定稿；任何上游产物都以本函数结果为准
+function _finalizeChapterTitles(chapters: any[], existingChaptersFull: any[], volNum: number, protagonistName: string): void {
+  if (!Array.isArray(chapters) || chapters.length === 0) return
+  var n = _resolveTitleLen(existingChaptersFull, volNum)
+  var _used = new Set<string>()
+  var _arr = Array.isArray(existingChaptersFull) ? existingChaptersFull : []
+  for (var _i = 0; _i < _arr.length; _i++) {                       // 跨卷防重
+    var _ec = _arr[_i]
+    if (!_ec || !_ec.title) continue
+    if (Number(_ec.volume) === Number(volNum)) continue
+    if (_isCompleteTitleCore(_ec.title)) { var _c0 = _titleCoreOf(_ec.title); if (_c0) _used.add(_c0) }
+  }
+  var _nm = String(protagonistName || '').trim()
+  var _ok = function (_cand: string): boolean {
+    if (!_cand) return false
+    var _core = _titleCoreOf(_cand)
+    if (_core.length !== n) return false                          // 终审里必须「恰好 n 字」
+    if (!_isCompleteTitleCore(_cand)) return false
+    if (_used.has(_core)) return false
+    if (_nm.length >= 2 && _core.indexOf(_nm) >= 0) return false  // 核心含主角名 = 残句碎片
+    return true
+  }
+  for (var _ci = 0; _ci < chapters.length; _ci++) {
+    var _ch = chapters[_ci]
+    var _num = _ch.chapterNumber || _ch.number || (_ci + 1)
+    var _rawCore = String((_ch as any)._llmTitle || _ch.title || '')   // LLM 原始标题
+    var _cands: string[] = [
+      _pickClauseAtLength(_rawCore, n),                       // ① LLM 原题分句
+      // 🔥 ②改为「摘要完整分句」：_deriveTitleFallback 会把分句 slice(0,4) 硬截断（「身后是追兵」→「身后是追」），
+      //    是残句源头之一，终审链里禁用它；这里只收恰好 n 字的完整分句，收不到就走后续合成/词池
+      _pickClauseAtLength(_ch.summary || '', n),              // ② 摘要完整分句
+      _composeFromSummary(_ch.summary || '', n, _used),       // ③ 历史动词+宾语合成
+      _pickFromGenrePool(_ch.summary || '', n, _num, _used),  // ④ 题材池
+    ]
+    var _pick = ''
+    for (var _cdi = 0; _cdi < _cands.length; _cdi++) { if (_ok(_cands[_cdi])) { _pick = _cands[_cdi]; break } }
+    if (!_pick) _pick = _composeGenericUnique(n, _used)                  // 兜底变体：换动词×宾语
+    if (!_pick) _pick = _pickFromGenrePool(_ch.summary || '', n, _num, _used)
+    if (!_pick) { // 理论兜底（几乎不可达，词表组合 3000+）：池内取一 + 读中文序号
+      _pick = _HIST_4_POOL[_num % _HIST_4_POOL.length]
+      var _seq = 2
+      while (_used.has(_titleCoreOf(_pick)) && _seq <= 20) { _pick = _HIST_4_POOL[_num % _HIST_4_POOL.length] + '（' + _titleCnSeq(_seq) + '）'; _seq++ }
+    }
+    _used.add(_titleCoreOf(_pick))
+    _ch.title = '第' + _num + '章 ' + _pick
+  }
 }
 
 // Imitation mode worldview prompt with highest priority constraints
@@ -2396,7 +2798,8 @@ function scanContentViolations(text: string): string[] {
 // 🔥 爽点密度 & 跑题检测（正文质量门·白金爆款强制）
 // ============================================================
 var SHUANG_MARKERS = [
-  '打脸','嘲讽','轻视','看不起','鄙夷','不屑','震惊','骇然','失色','碾压','吊打','秒杀','逆袭','反杀',
+  // 不含「震惊」：CONTENT_PROMPT 明令禁「震惊全场」等套话，避免守规矩的稿子反被此判据惩罚（与 platinum-gate 同口径）
+  '打脸','嘲讽','轻视','看不起','鄙夷','不屑','骇然','失色','碾压','吊打','秒杀','逆袭','反杀',
   '装逼','跪地','臣服','折服','叹服','膜拜','结交','获得','机缘','宝物','突破','觉醒','血脉','传承',
   '身份','地位','势力','收获','晋级','暴打','一招','镇杀','镇压','扬威','惊艳','斩','灭','踏','狠狠',
   '脸面','脑补','倒吸','佩服','臣服','颠覆','完胜','横扫','霸气','碾压','打脸','废物的','废物',
@@ -3615,8 +4018,8 @@ const SKILL_PROMPTS: Record<string, string> = {
   'platform-adaptation-expert': `
 【多平台适配专家·各平台规则全掌握】
 平台差异化适配：
-🍅 番茄小说：短段落（3行内）+快节奏（每300字小刺激）+2000字/章+结尾强钩子+完读率至上，广告位前不能断高潮
-📖 起点中文：允许长段落+重设定重逻辑+3000字/章+开篇铺垫可以5章+月票榜/推荐票数据激励
+🍅 番茄小说：短段落（3行内）+快节奏（每300字小刺激）+2000字/章（区间1800-2200，跟随用户设定）+开篇即入戏（前3行出冲突）+结尾强钩子+完读率至上，广告位前不能断高潮
+📖 起点中文：允许长段落+重设定重逻辑+2000-2400字/章+开篇即入戏（不做大段景物铺陈）+月票榜/推荐票数据激励
 ⚡ 飞卢小说：脑洞大到爆炸+同人综漫无限流+节奏爆炸快+800字/章+每章结尾必须爽+同人文优势大
 🌸 晋江文学：感情线绝对第一位+人设细腻饱满+慢热可以+描写要唯美+标签精准非常重要
 🐱 七猫免费：免费阅读模式+完读率至上+剧情绝不拖沓+广告位前的章节必须留钩子+适合大众口味
@@ -3668,7 +4071,7 @@ const SKILL_PROMPTS: Record<string, string> = {
 5. 文风统一锁定：全书文风语速氛围感对话风格叙事节奏全程统一，杜绝割裂。
 
 第二部分 全题材通用章节写作标准：
-1. 单章稳定2500–3200字，每章必须具备：推进点+冲突点+情绪点+结尾钩子。
+1. 单章稳定 1800-2200 字（默认目标 2000，跟随用户设定），每章必须具备：开篇即入戏（前3行出冲突）+推进点+冲突点+情绪点+结尾硬钩。
 2. 万能黄金节奏模板：开篇30%铺垫（场景/人物状态/处境/遗留矛盾）；中段50%冲突升级/对话博弈/事件推进；结尾20%阶段性收束+强悬念钩子。
 3. 描写优先用动作/对话/行为/细节塑造人物，减少大段旁白；环境描写服务氛围；心理描写克制自然。
 4. 每个角色有专属语气措辞说话风格，大佬不碎嘴、弱者不霸气、反派不弱智、主角不反复，杜绝全员同质化。
@@ -3956,6 +4359,9 @@ const _historyFlowTermReplacements: Array<[RegExp, string]> = [
 // 历史题材【基础】替换表：仅清洗仙侠/修真/洪荒/科幻等【世界观】污染词，不含金手指机制词
 const _historyCrossReplacementsBase: Array<[RegExp, string]> = [
   // 修真/修炼词汇 → 古代权谋替换
+  // 🔥 2026-09-10 #220：历史/权谋题材「爽点模式」反复被LLM填成玄幻流派词"血脉觉醒流"。
+  //   历史清洗表缺失此词（旧表第4127行"龙血觉醒→血脉觉醒"反而把"血脉觉醒"当合法词放行），导致每次都残留。
+  [/血脉觉醒流/g, '朝堂权谋流'], [/血脉觉醒流玩法/g, '朝堂权谋玩法'], [/血脉返祖/g, '家学渊源'],
   [/修仙者/g, '方士'], [/修真/g, '修心'], [/修仙/g, '修道'], [/修士/g, '道士'],
   // 🔥 2026-09-03 #126 修复：原表「金丹→内丹」「内丹→金丹」自相矛盾（修真词→修真词），社会结构里仍有「高层为内丹以上强者」「金丹大道」等明显修真词。
   //   现统一去掉修真境界词，改为儒释道礼学层面的合法表述；修真境界一律翻译为朝代化话语（举人/进士/大夫等科举礼学比照），不允许出现任何修真境界字眼。
@@ -4018,6 +4424,14 @@ const _historyCrossReplacementsBase: Array<[RegExp, string]> = [
   [/灵气/g, '才气'], [/灵气充裕之地/g, '人杰地灵之地'],
   [/灵山福地间/g, '名山大川间'], [/散修势力/g, '游方势力'],
 
+  // 🔥 2026-09-10：金手指/朝堂权力体系“框架词”污染清洗——历史/系统流/签到流作品
+  //   的力量体系常被模型套用修仙“境界划分/修行方式/修行路径”等骨架词（世界观已证明是
+  //   【品阶｜文官｜武将】的科举/官阶结构，却仍用修仙术语分层）。统一译回古代权谋话语。
+  [/境界划分/g, '品秩划分'], [/历练境界/g, '官阶品秩'], [/境界层次/g, '品秩层次'],
+  [/修行方式/g, '进阶方式'], [/修行路径/g, '进阶路径'], [/修行门径/g, '进阶门径'],
+  [/修行途径/g, '进阶途径'], [/修行境界/g, '官阶品秩'], [/修炼境界/g, '官阶品秩'],
+  [/修行之路/g, '仕进之路'], [/晋升境界/g, '晋升品秩'], [/破境/g, '升迁'],
+
   // 🔥 修复 v6.2：补充玄幻模板残留词（星辰战体/星尘境/元力/龙血/星陨等）
   [/星辰战体/g, '将帅之才'], [/星尘境/g, '初窥门径'], [/星芒境/g, '登堂入室'], [/星耀境/g, '小有所成'],
   [/星河境/g, '炉火纯青'], [/星海境/g, '出神入化'], [/星穹境/g, '登峰造极'], [/星域境/g, '一代宗师'],
@@ -4067,6 +4481,22 @@ const _historyCrossReplacementsBase: Array<[RegExp, string]> = [
   // 🔥 2026-09-03 #127-R7 补全：characters 步真实 LLM 实测，单女主沈云姝文本仍泄漏「道侣」（修真词 → 历史题材串味）
   //   →「恋人」：同属关系35枚举合法值（30581），30642 行关系语义分组本就合并 恋人/道侣 处理，不会破坏 relationships 步
   [/道侣/g, '恋人'],
+  // 🔥 2026-09-10 #135：金手指(主角能力/力量体系)组深度玄幻·科幻串味清洗——实测刷新后手动「重新生成」金手指组
+  //   （克制关系/失控形态/融合进化/隐藏来历）时，LLM 仍吐「跨星域签到/超脱时空纵横天下/势之力/净化秘法/佛门禅理
+  //   /污染心神/强行修改命数/血脉深度融合/签到神级系统/带有邪性的祸患」等仙侠玄幻世界观骨架词 → 译回古代权谋话语。
+  //   ⚠️ 规律：更具体/更长的复合短语必须放在更短/通用模式之前。
+  [/跨星域签到、时间回溯预览、命运微调/g, '游走州府间、研习兵要、时局操演'],
+  [/跨星域签到/g, '游走四方签到'], [/跨星域/g, '跨州府'], [/跨星际/g, '跨州府'],
+  [/超脱时空纵横天下/g, '功盖万世济天下'], [/超脱时空/g, '经世济民'],
+  [/佛门禅理类成法可净化之力/g, '朝堂礼法制衡之力'], [/佛门禅理/g, '朝堂礼法'], [/净化之力/g, '制衡之效'],
+  [/特定的净化秘法/g, '祖制典仪'], [/净化秘法/g, '镇邪之典'], [/秘法/g, '成法'],
+  [/势之力/g, '威势'], [/污染心神/g, '损伤神志'], [/心神/g, '神志'],
+  [/强行修改命数/g, '逆改时运'], [/修改命数/g, '逆改时运'], [/命数/g, '时运'],
+  [/命运微调/g, '时局操演'],
+  [/血脉深度融合/g, '家学相承'],
+  [/签到神级系统/g, '签到至强系统'], [/神级系统/g, '至强系统'], [/神级/g, '至强'],
+  [/带有邪性的祸患/g, '莫测的祸患'], [/邪性/g, '凶险'],
+  [/悍勇之气/g, '部族之气'], [/气力/g, '劲力'],
 ]
 // 历史题材【完整】替换表 = 流派机制词规则 + 世界观污染词规则（默认行为，未选流派时使用）
 const _historyCrossReplacements: Array<[RegExp, string]> = _historyFlowTermReplacements.concat(_historyCrossReplacementsBase)
@@ -4200,7 +4630,17 @@ async function generateWithLLM(
   speedOpts?: { speedPriority?: boolean; nocache?: boolean },
   regeneratePrompt?: string,
   activeStyle?: any,
-  bestsellerPrefs?: any
+  bestsellerPrefs?: any,
+  // 🔥 逐章生成正文·右上角控制面板（字数 / 风格 / 新角色）：由前端向导随 step:'content' 请求传入
+  targetWordCount?: number,
+  style?: string,
+  newCharacters?: string,
+  // 🔥 2026-10-18：平台AI检测标准（设置页保存→写页随请求上传）
+  platformStandards?: any[],
+  // 🔥 2026-10-21：统一模型路由结果（用户自有模型优先 + 角色级固定主模型 + 兜底链）
+  routing?: any,
+  // 🔥 2026-10-22：字段级重新生成的冻结快照（其余字段逐字保留）
+  frozen?: any
 ): Promise<any> {
   // 兼容字符串和数组类型的keywords
   var _keywordsArr: string[] = []
@@ -4258,8 +4698,8 @@ async function generateWithLLM(
       stepbystep: '递进打脸风格：一层一层剥开反派的伪装——先证明反派某方面错→再证明他全面错→然后证明他后台也不行→最后连他祖宗十八代都挖出来打脸，爽感层层递进，读者越看越爽',
     }
     var rhythmMap: Record<string, string> = {
-      start: '起点节奏模式：3000字/章，允许5章铺垫，重设定重逻辑重人物，段落可以长，重视世界观和设定完整性，适合长篇玄幻仙侠历史题材',
-      tomato: '【默认·番茄爆款标准】番茄节奏模式：2000字左右一章，每段不超过3行（手机阅读友好），战斗/对话尽量1段1句话，打脸/反转/突破等重要信息单独成段前后空行，"了""的""地"能删就删，句子干巴有劲，章节精准卡在上钩子处结束，绝对不能把一个爽点切两半分到两章',
+      start: '起点节奏模式：2000-2400字/章，开篇即入戏（前3行出冲突，不做景物铺陈），重设定重逻辑重人物，段落可以长，重视世界观和设定完整性，适合长篇玄幻仙侠历史题材',
+      tomato: '【默认·番茄爆款标准】番茄节奏模式：2000字/章（区间1800-2200），开篇即入戏（前3行出冲突），每段不超过3行（手机阅读友好），战斗/对话尽量1段1句话，打脸/反转/突破等重要信息单独成段前后空行，"了""的""地"能删就删，句子干巴有劲，章节精准卡在上钩子处结束，绝对不能把一个爽点切两半分到两章',
       feilu: '飞卢节奏模式：800字/章，节奏爆炸快，每章结尾必须爽，脑洞大于一切，同人和综漫优先，更新速度比质量更重要，800字里必须至少1个爽点',
       balabala: '综合平衡模式：1500字/章，兼顾节奏和设定深度，段落3-5行，爽点400字1个，适合多平台发布，保证所有平台都能吃的开',
     }
@@ -4394,6 +4834,62 @@ ${skillPrompt}
     _parts.push('5. 原著的具体剧情、对话、设定只能作为结构参考，所有内容必须重新原创')
     _parts.push('--- 仿写参考结束 ---')
     return _parts
+  }
+
+  // 🔥 章节级仿写骨架注入（仅 keyPlots / chapters 使用）：黄金三章·单章循环·节奏·伏笔周期·爽点类型
+  //   数据来源兼容 previousData.bookAnalysis / previousData.bookAnalysisJson / previousData.imitate；
+  //   脏数据/非对象一律跳过，不影响正常生成。
+  var getChapterBlueprintData = function(previousData: any): any | null {
+    try {
+      var _pd: any = previousData || {}
+      var _pdBa: any = _pd && typeof _pd.bookAnalysis === 'object' ? _pd.bookAnalysis : null
+      var _bp = _pdBa && _pdBa.chapterBlueprint ? _pdBa.chapterBlueprint : null
+      if (!_bp && _pd.bookAnalysisJson) {
+        var _ba = typeof _pd.bookAnalysisJson === 'string' ? JSON.parse(_pd.bookAnalysisJson) : _pd.bookAnalysisJson
+        if (_ba && typeof _ba === 'object') {
+          _bp = _ba.chapterBlueprint || (_ba.bookAnalysis && _ba.bookAnalysis.chapterBlueprint) || null
+        }
+      }
+      if (!_bp && _pd.chapterBlueprint) _bp = _pd.chapterBlueprint
+      if (!_bp && _pd.imitate && typeof _pd.imitate === 'object') _bp = _pd.imitate.chapterBlueprint || null
+      if (!_bp || typeof _bp !== 'object' || Array.isArray(_bp)) return null
+      return _bp
+    } catch (_e) {
+      return null
+    }
+  }
+
+  var buildChapterBlueprintParts = function(previousData: any): string[] {
+    var bp = getChapterBlueprintData(previousData)
+    if (!bp) return []
+    var _toList = function(v: any, limit: number): string[] {
+      if (!Array.isArray(v)) return []
+      var out: string[] = []
+      for (var i = 0; i < v.length && out.length < limit; i++) {
+        var it = v[i]
+        var s = typeof it === 'string' ? it : (it && typeof it === 'object' ? String(it.text || it.name || it.desc || '') : '')
+        s = s.trim()
+        if (s) out.push(s)
+      }
+      return out
+    }
+    var _lines: string[] = []
+    var _g3 = _toList(bp.goldenThree, 3)
+    if (_g3.length > 0) _lines.push('黄金三章：' + _g3.join('；'))
+    var _loop = _toList(bp.chapterLoop, 12)
+    if (_loop.length > 0) _lines.push('单章循环：' + _loop.join(' → '))
+    var _rhythm = _toList(bp.rhythm, 12)
+    if (_rhythm.length > 0) _lines.push('节奏模板：' + _rhythm.join('；'))
+    var _foreshadow = _toList(bp.foreshadowCycle, 12)
+    if (_foreshadow.length > 0) _lines.push('伏笔周期：' + _foreshadow.join('；'))
+    var _shuang = _toList(bp.shuangPointTypes, 12)
+    if (_shuang.length > 0) _lines.push('爽点类型：' + _shuang.join('、'))
+    if (_lines.length === 0) return []
+    return [
+      '【仿写节奏骨架·仅结构与节奏参考】',
+      _lines.join('\n'),
+      '以下骨架只用于结构与节奏参考，禁止复制原书人名、地名、门派名、事件；必须使用本项目已有设定与人物',
+    ]
   }
 
   // Build context summary from all previous generation steps
@@ -4799,6 +5295,31 @@ ${skillPrompt}
       }
     }
     var _fieldRegenMessages: any[] = []
+    // 🔒 字段级冻结：优先用请求携带的 frozen 快照，为空时回退 previousData[step]
+    var _frFrozenSource: any = (frozen && typeof frozen === 'object' && !Array.isArray(frozen))
+      ? frozen
+      : ((pd as any)?.[step] || null)
+    var _frFrozenFieldsPrompt = ''
+    var _frOocGuardPrompt = '\n【OOC硬约束·必须遵守】\n不得变更：主角姓名与称谓、已确立的人物关系、已发生的关键事件、时代与势力专名；不得新增与既有设定冲突的人物或势力；不得改变叙事人称与时态。\n'
+    // 🔥 2026-11-06 修复（用户实锤：角色重新生成产出玄幻模板垃圾/截断JSON空壳）：
+    //   ① 角色槽字段必须输出完整角色对象（旧提示词模板要求字符串，模型返回对象即解析失败）；
+    //   ② 历史/架空历史题材注入「真实历史人物」铁律（主要人物严格按史实，仅主角身边人可虚构）。
+    var _frCharSlot = step === 'characters' && ['protagonist', 'femaleLead', 'antagonist'].indexOf(field) >= 0
+    var _frHistRule = ''
+    if (/历史|架空|南明|明末|大明|清朝|民国|汉末|三国|战国|春秋|大唐|两宋/.test(String(genre || '') + ' ' + String(keywordsStr || ''))) {
+      _frHistRule = '\n【🔥 历史题材·真实人物铁律·最高优先级·违反即生成失败】主要人物必须从本作时代的真实历史人物中选取（姓名、官职/头衔、阵营与重大生平符合史实，如南明题材使用朱由榔、李定国、瞿式耜、何腾蛟、堵胤锡、张煌言、多尔衮、吴三桂、孙可望等）；禁止玄幻/修仙设定（龙脉、灵根、境界、炼气、渡劫、飞升等词汇一律不得出现）；仅"主角身边的人"（亲卫、幕僚、内侍、家眷、无史载合适人选时的女主）可原创，且必须是明确虚构的次要身份，不得冒充真实历史人物。\n'
+    }
+    try {
+      if (_frFrozenSource && typeof _frFrozenSource === 'object' && !Array.isArray(_frFrozenSource)) {
+        var _frFrozenOthers: any = {}
+        Object.keys(_frFrozenSource).forEach(function (k: string) {
+          if (k !== field) _frFrozenOthers[k] = (_frFrozenSource as any)[k]
+        })
+        if (Object.keys(_frFrozenOthers).length > 0) {
+          _frFrozenFieldsPrompt = '\n【冻结字段·必须逐字保留】\n以下字段必须逐字保留，禁止改写、增删、调整顺序：\n' + JSON.stringify(_frFrozenOthers) + '\n'
+        }
+      }
+    } catch (_frFz) { console.warn('[field-regen] frozen 序列化异常:', _frFz) }
     const { systemPrompt: _frSysPrompt, temperature: _frTemp, maxTokens: _frMaxTokens } = buildSystemPrompt(step, {
       input: (pd?.idea as any)?.title || keywordsStr || '',
       genre: genre || '玄幻',
@@ -4812,7 +5333,7 @@ ${skillPrompt}
 ${_fieldRegenContext || '无上下文'}
 ${_frFanfictionHint}
 ${_frCurrentHint}
-
+${_frFrozenFieldsPrompt}${_frOocGuardPrompt}
 【用户要求】
 ${regeneratePrompt || '提升质量，确保与前序环节设定保持一致'}
 
@@ -4822,21 +5343,87 @@ ${regeneratePrompt || '提升质量，确保与前序环节设定保持一致'}
 3. 必须使用之前已确定的专有名词、角色名、力量体系等
 4. 内容必须充实、具体，不得使用空值、占位符、模板化表述
 5. 只输出包含"${field}"字段的JSON，不要输出任何额外内容
+${_frHistRule}${_frCharSlot ? `6. "${field}" 必须输出为完整的角色JSON对象（包含 name/age/gender/rolePosition/identity/appearance/personality/background/coreSkills/fate/growthArc 等字段），禁止输出为字符串
 
-{"${field}": "你生成的内容"}`
+{"${field}": { "name": "…", "age": 0, "gender": "…", "rolePosition": "…", "identity": "…", "appearance": "…", "personality": "…", "background": "…", "coreSkills": ["…"], "fate": "…", "growthArc": "…" }}` : `
+{"${field}": "你生成的内容"}`}`
     _fieldRegenMessages.push({ role: 'user', content: _fieldRegenUserPrompt })
     try {
       var _frResult = await callLLM(llmConfig, _fieldRegenMessages, { temperature: _frTemp, maxTokens: _frMaxTokens })
       var _frCleaned = cleanAIResponse(_frResult)
-      var _frParsed = extractJSONFromText(_frCleaned)
+      var _frParsed: any = extractJSONFromText(_frCleaned)
       if (_frParsed && typeof _frParsed === 'object') {
+        // 🔥 2026-09-10 #135：字段级重新生成补齐跨题材清洗（此前此处直接 return，绕过 _cleanCrossGenreTermsDeep，
+        //   导致刷新后对「金手指/力量体系」点击重新生成仍泄漏修仙/玄幻世界观词，用户实锤）。
+        try {
+          var _frGenre = String(genre || '').toLowerCase()
+          var _frGt = 'history'
+          if (_frGenre.indexOf('现代') !== -1 || _frGenre.indexOf('都市') !== -1) _frGt = 'modern'
+          else if (_frGenre.indexOf('科幻') !== -1) _frGt = 'scifi'
+          else if (_frGenre.indexOf('修仙') !== -1 || _frGenre.indexOf('仙侠') !== -1) _frGt = 'xiuxian'
+          else if (_frGenre.indexOf('西幻') !== -1 || _frGenre.indexOf('奇幻') !== -1) _frGt = 'western'
+          // keepFlowTerms=true：金手指机制词（系统/签到/面板/任务）需保留，仅清洗仙侠玄幻世界观污染词
+          _cleanCrossGenreTermsDeep(_frParsed, 'field-regen:' + field, new Set<string>(), _frGt, true)
+        } catch (_frCe) { console.warn('[field-regen] #135 清洗异常:', _frCe) }
+        // 🔥 2026-09-10 #220：字段级重新生成同样兜底——单值字段若被LLM返回成对象/数组，扁平化为纯文本字符串，
+        //   杜绝 targetAudience 等字段反复以 JSON 对象形态存入（与 idea 全步骤扁平化逻辑一致）。
         if (_frParsed[field] !== undefined) {
+          // 🔥 2026-11-06 修复：角色槽返回字符串时尝试二次解析（模型常把对象包成字符串）；
+          //   仍无法得到对象则放弃覆盖，杜绝字符串垃圾写入角色卡。
+          if (_frCharSlot && typeof _frParsed[field] === 'string') {
+            try { _frParsed[field] = JSON.parse(_frParsed[field]) } catch (_frCs) {
+              var _frObjM = String(_frParsed[field]).match(/\{[\s\S]*\}/)
+              if (_frObjM) { try { _frParsed[field] = JSON.parse(_frObjM[0]) } catch (_frCs2) {} }
+            }
+            if (typeof _frParsed[field] === 'string') {
+              console.warn('[field-regen] 角色槽返回字符串无法解析为对象，放弃覆盖: ' + field)
+              return { __fieldRegenAbort: true }
+            }
+          }
+          var _ideaSingleSet = ['tagline', 'coreConflict', 'protagonistName', 'targetAudience', 'coreSellingPoint', 'writingStyle', 'emotionalTone', 'commercialPositioning', 'theme', 'subject', 'slogan', 'shuangPattern', 'hook', 'goldenQuote']
+          try {
+            if (_ideaSingleSet.indexOf(field) >= 0 && _frParsed[field] !== null && typeof _frParsed[field] !== 'string') {
+              var _fFlat: (v: any) => string = function (v: any): string {
+                if (v === null || v === undefined) return ''
+                if (typeof v === 'string') return v
+                if (typeof v === 'number' || typeof v === 'boolean') return String(v)
+                if (Array.isArray(v)) return v.map(_fFlat).filter(Boolean).join('；')
+                if (typeof v === 'object') {
+                  var _p: string[] = []
+                  Object.keys(v).forEach(function (kk: string) { var _vv: any = (v as any)[kk]; if (_vv !== null && _vv !== undefined && (typeof _vv === 'string' || typeof _vv === 'number' || typeof _vv === 'boolean')) _p.push(String(_vv)) })
+                  if (_p.length) return _p.join('；')
+                  try { return JSON.stringify(v) } catch (_j) { return '' }
+                }
+                return ''
+              }
+              _frParsed[field] = _fFlat(_frParsed[field])
+            }
+          } catch (_frFlat) { console.warn('[field-regen] #220 扁平化异常:', _frFlat) }
           console.log('[field-regen] 成功生成字段: ' + field)
-          return _frParsed
+          // 🔒 字段级 merge：只回传目标字段（不做整对象替换），其余字段由 frozen 约束保证不变
+          var _frFieldValue: any = _frParsed[field]
+          var _frFieldEmpty = _frFieldValue === null || _frFieldValue === undefined
+            || (typeof _frFieldValue === 'string' && _frFieldValue.trim() === '')
+            || (Array.isArray(_frFieldValue) && _frFieldValue.length === 0)
+            || (typeof _frFieldValue === 'object' && !Array.isArray(_frFieldValue) && Object.keys(_frFieldValue).length === 0)
+          if (_frFieldEmpty) {
+            console.log('[field-regen] 目标字段为空，放弃覆盖: ' + field)
+            return { __fieldRegenAbort: true }
+          }
+          var _frMerged: any = {}
+          _frMerged[field] = _frFieldValue
+          return _frMerged
         } else {
-          console.log('[field-regen] 字段未找到，返回完整数据')
-          return _frParsed
+          console.log('[field-regen] 字段未找到，放弃覆盖（防止整步漂移）')
+          return { __fieldRegenAbort: true }
         }
+      }
+      // 🔥 2026-11-06 修复：解析失败绝不把原始截断文本回写角色槽——
+      //   实测模型返回截断JSON时，原文被直接存入 characters.protagonist，前端角色卡渲染为空壳
+      //   （即用户反馈"角色没成功生成"的真实失败路径）。
+      if (step === 'characters') {
+        console.warn('[field-regen] characters 字段解析失败，放弃覆盖: ' + field)
+        return { __fieldRegenAbort: true }
       }
       console.warn('[field-regen] 解析失败，返回原始文本')
       return { [field]: _frCleaned }
@@ -11604,7 +12191,7 @@ ${_wsWorldBuilding ? '世界观：' + _wsWorldBuilding.substring(0, 300) : ''}
         }
 
         // 🔥 字数合理性校验：如果章节数>100但字数<50万字，说明字数可能解析错误（如207.4万字被解析成20.74万字）
-        //    根据章节数估算合理字数（平均每章2500字）
+        //    根据章节数估算合理字数（平均每章2000字，与正文默认口径一致）
         var _curWStr = String(finalResult.totalWords || finalResult.wordCount || '')
         var _curWNum = parseFloat(_curWStr) || 0
         var _curWIsWan = _curWStr.indexOf('万') >= 0
@@ -11612,7 +12199,7 @@ ${_wsWorldBuilding ? '世界观：' + _wsWorldBuilding.substring(0, 300) : ''}
         var _curChapters = Number(finalResult.totalChapters || finalResult.chapterCount || 0)
         if (_curChapters > 100 && _curWActual > 0 && _curWActual < 500000) {
           // 字数不合理（太低），根据章节数估算
-          var _estimatedWords = _curChapters * 3500
+          var _estimatedWords = _curChapters * 2000
           var _estimatedWan = (_estimatedWords / 10000).toFixed(1)
           console.log('[imitateSearch]   ★ 字数合理性校验: 当前' + _curWStr + '偏低（' + _curWActual + '字/' + _curChapters + '章），估算为' + _estimatedWan + '万字')
           finalResult.totalWords = _estimatedWan + '万字'
@@ -12695,11 +13282,30 @@ ${_wsWorldBuilding ? '世界观：' + _wsWorldBuilding.substring(0, 300) : ''}
         _adpStyleHint = '玄幻/仙侠风格：主角为修仙者/武者/逆袭者，拥有金手指或修炼天赋。'
       }
 
+      // 🔥 2026-11-05 修复：用户已填姓名必须强制沿用（原 prompt 缺姓名要求 → LLM 自由生成覆盖用户设定）
+      var _adpUserName = typeof _adpUserSettings.name === 'string' ? _adpUserSettings.name.trim() : ''
+      var _adpNameHint = _adpUserName ? ('主角姓名：' + _adpUserName + '（用户已指定，name 字段必须原样输出该姓名，禁止改名）') : '姓名根据题材和关键词生成，2-3字中式名字'
       var _adpGenderHint = _adpUserGender === '男' ? '男性主角' : _adpUserGender === '女' ? '女性主角' : '性别不限，根据题材和故事需要判定'
       var _adpAgeHint = _adpUserAge ? ('年龄约' + _adpUserAge + '岁') : '年龄18-25岁之间'
       var _adpIdentityHint = _adpUserIdentity ? ('主角身份：' + _adpUserIdentity) : '身份背景根据题材和关键词设定'
 
-      var _adpSystemPrompt = '你是一位精通全类型小说人物设计的人物塑造大师。请根据用户提供的题材、关键词和主角要求，设计一个完整、立体、有辨识度的主角设定。输出JSON格式。'
+      var _adpUserLocked = (_adpUserName || _adpUserGender || _adpUserAge || _adpUserIdentity) ? ('\n\n【🔥 用户已填设定·铁律·违反则输出作废】用户已在表单中填写以下主角信息，你必须原样采用并以此为基础扩展其余字段，禁止修改/替换/升级用户已填的任何字段：' + (_adpUserName ? '\n- 姓名：' + _adpUserName + '（name 字段必须输出「' + _adpUserName + '」，禁止生成其他姓名）' : '') + (_adpUserGender ? '\n- 性别：' + _adpUserGender : '') + (_adpUserAge ? '\n- 年龄：' + _adpUserAge : '') + (_adpUserIdentity ? '\n- 身份背景：' + _adpUserIdentity + '（identity 字段必须包含「' + _adpUserIdentity + '」这一身份，其余背景描述围绕它扩展）' : '')) : ''
+      // 🔥 2026-11-05 修复：skills 按用户多选类型标签综合判定，不再一刀切禁止——
+      //   标签含「系统流/金手指/签到流/面板流/词条流」→ 允许系统/金手指设定；
+      //   仅当历史类标签与「真实/权谋/群像」组合且无系统流标签时，才建议真实能力；
+      //   玄幻/西幻/科幻等标签 → 各自风格的金手指。
+      var _adpHasSysTag = /系统流|金手指|签到流|面板流|词条流|模拟器/.test(_adpGenreText)
+      var _adpHasXuanhuanTag = /玄幻|奇幻|仙侠|魔法|斗气|洪荒|神话|修真/.test(_adpGenreText)
+      var _adpHasHistTag = /历史|架空历史|两宋元明|大明|大清|大宋|三国|秦汉|隋唐|明清|历史传记|历史考据流/.test(_adpGenreText)
+      var _adpHasRealMark = /真实|权谋|群像|历史氛围|历史背景|明清对峙|抗清|朝堂|帝王/.test(_adpGenreText)
+      var _adpSkillHint = _adpHasSysTag
+        ? '\nskills：核心技能/金手指，【JSON字符串数组】，用户选择了系统流类标签——可设计系统/面板/签到等金手指，与题材贴合即可，格式如["系统","签到奖励","任务面板"]，严禁使用对象数组或嵌套数组'
+        : _adpHasXuanhuanTag
+        ? '\nskills：核心技能/金手指，【JSON字符串数组】，按玄幻/仙侠/魔法题材设计修炼/魔法类金手指，格式如["御剑飞行","炼药","阵法"]，严禁使用对象数组或嵌套数组'
+        : _adpHasHistTag && _adpHasRealMark && !_adpHasXuanhuanTag
+        ? '\nskills：核心技能/能力，【JSON字符串数组】，用户选择了真实历史向组合（历史+真实/权谋/群像）——建议统兵/谋略/理财/识人/火器改良等真实能力；若用户标签含超自然类标签则可按标签设计'
+        : '\nskills：核心技能/金手指，【JSON字符串数组】，元素为技能名称字符串，格式如["御剑飞行","炼药","阵法"]，严禁使用对象数组或嵌套数组'
+      var _adpSystemPrompt = '你是一位精通全类型小说人物设计的人物塑造大师。请根据用户提供的题材、关键词和主角要求，设计一个完整、立体、有辨识度的主角设定。输出JSON格式。' + _adpUserLocked
         + '\n\n【设计原则】'
         + '\n1. 主角必须有鲜明的个性和独特的成长弧光'
         + '\n2. 金手指/能力设定要与题材紧密结合，有创新性'
@@ -12715,6 +13321,7 @@ ${_wsWorldBuilding ? '世界观：' + _wsWorldBuilding.substring(0, 300) : ''}
         + '\n【性别要求】' + _adpGenderHint
         + '\n【年龄要求】' + _adpAgeHint
         + '\n【身份背景】' + _adpIdentityHint
+        + '\n【姓名要求】' + _adpNameHint
         + '\n\n请输出【纯净标准JSON】，包含以下字段（严格遵守字段格式）：'
         + '\nname：主角姓名，2-3字中式名字（字符串）'
         + '\ngender：性别（字符串，男/女）'
@@ -12724,7 +13331,7 @@ ${_wsWorldBuilding ? '世界观：' + _wsWorldBuilding.substring(0, 300) : ''}
         + '\npersonality：性格特点（字符串，50字内）'
         + '\nbackground：背景故事（字符串，100字内）'
         + '\nmotivation：核心动机（字符串）'
-        + '\nskills：核心技能/金手指，【JSON字符串数组】，元素为技能名称字符串，格式如["御剑飞行","炼药","阵法"]，严禁使用对象数组或嵌套数组'
+        + _adpSkillHint
         + '\nweaknesses：弱点/不足，【JSON字符串数组】，元素为弱点描述字符串，格式如["怕水","优柔寡断"]'
         + '\ngrowthArc：成长弧光（字符串，30字内）'
         + '\nfaction：所属势力/阵营（字符串）'
@@ -13004,13 +13611,23 @@ ${_ccSP ? '\n【核心卖点参考】\n' + _ccSP : ''}
           _protagonistSettingsHint += '- 主角年龄：' + _userProtoAge + '\n'
         }
         if (_userProtoIdentity) {
-          _protagonistSettingsHint += '- 主角身份背景：' + _userProtoIdentity + '\n'
+          _protagonistSettingsHint += '- 主角身份背景（🔥 身份铁律）：必须严格使用"' + _userProtoIdentity + '"——tagline/coreConflict/coreIdea/protagonistBrief 中主角的身份表述必须包含该身份（如『桂王世子/永历皇帝』），【严禁】替换为『废柴少爷/落魄公子/无名小卒』等表单外身份，【严禁】使用历史原型的其它称号升级或降级\n'
         }
         if (_inputProtoName) {
           _protagonistSettingsHint += '- 【输入主题指定】主角姓名（穿越后附身的原主名 protagonistName）：必须严格使用"' + _inputProtoName + '"，绝对不得修改、替换或创造"朱慎之/唐阳/陆承渊"等其他名字，tagline/简介/大纲/正文一律沿用该名\n'
         }
         if (_userModernName && _userModernName !== _userProtoName) {
           _protagonistSettingsHint += '- 穿越者现代名（modernName，魂穿前的现代人姓名）：必须严格使用"' + _userModernName + '"，tagline/简介/大纲/正文一律沿用，绝对禁止另编"宋晨/陈默/林远"等其他现代名，禁止把现代名与原主名混淆\n'
+        }
+        // 🔥 2026-11-05 成品短语直供：不靠 LLM 自行组合身份+姓名（组合易出错如「穿桂」），直接给成品
+        var _protoIdFirst = _userProtoIdentity ? _userProtoIdentity.split('/')[0].trim() : ''
+        var _protoPhrase = (_protoIdFirst && _userProtoName) ? ('魂穿明末' + _protoIdFirst + _userProtoName) : ''
+        var _protoNamePhrase = (_protoIdFirst && _userProtoName) ? (_protoIdFirst + _userProtoName) : ''
+        if (_protoPhrase) {
+          _protagonistSettingsHint += '- 【🔥 主角短语·成品直供·必须原样出现】主角短语必须原样写为：「' + _protoPhrase + '」（即身份『' + _protoIdFirst + '』+姓名『' + _userProtoName + '』连写）。tagline 必须以『现代灵魂' + _protoPhrase + '』或『' + _userProtoName + '以' + _protoIdFirst + '之身』开头；protagonistBrief/coreIdea 中主角身份一律写「' + _protoIdFirst + '」。【严禁】把身份拆字/缩写/改写（如把「桂王世子」写成「穿桂」）；【严禁】出现「废柴少爷/落魄公子/无名小卒」等其它身份；【严禁】自编现代人名\n'
+        }
+        if (!_userModernName && _userProtoName) {
+          _protagonistSettingsHint += '- 【🔥 现代名禁编铁律】用户未指定穿越者现代名——tagline 一律使用『现代灵魂魂穿…』句式（不出现任何现代人姓名），【严禁】自编『王超/刘杰/陈默/宋晨』等现代名\n'
         }
         _protagonistSettingsHint += '上述设定必须体现在tagline、protagonistName、protagonistBrief等所有相关字段中，后续所有环节也必须严格沿用。\n'
       }
@@ -13167,11 +13784,14 @@ ${_fanfictionWorldInfoForRegen || `基于你对《${_fanfictionSourceForRegen}�
 ${_regenContext || '无上下文'}
 ${_fanfictionHintForRegen}
 
+【🔥 主角设定铁律·regen 同样生效·违反则输出作废】
+${_protagonistSettingsHint}
+${_protoPhrase ? ('主角短语必须原样包含：「魂穿明末' + _protoPhrase.replace(/^魂穿明末/, '') + '」（即「' + _protoPhrase + '」）。主角身份必须是「' + (_userProtoIdentity || '').split('/')[0] + '」，【严禁】写「废柴少爷/落魄宗室/落魄公子/现代名魂穿」等表单外设定。【严禁】自编现代人名。') : ''}
+
 【用户要求】
 ${keywordsStr || '提升质量'}
 
 【规则·绝对不可违反】
-1. 生成的内容必须与前面环节的设定保持一致
 2. 不得新增与已有设定冲突的内容
 3. 必须使用之前已确定的专有名词、角色名等
 4. 只输出包含"${field}"字段的JSON，不要输出任何额外内容
@@ -13255,7 +13875,7 @@ ${keywordsStr || '提升质量'}
               combat: '凭后世兵法谋略与先知优势扶保社稷、整军经武、对抗强敌',
               goal: '中兴大明/重整山河/再造华夏',
               example: '示例（历史类）：现代青年灵魂穿越至明末，附身于落魄宗室，凭借后世知识辅佐社稷，誓要开创中兴盛世！（注意：穿越者的现代职业/姓名、穿越时间地点、附身对象的封号身份一律以用户实际设定为准，此处仅为句式范例）',
-              sample: '现代青年陈默魂穿明末流亡朝廷中落魄宗室朱明璋，意外觉醒后世先知，自败军孤城中崛起，凭兵法谋略整军经武，立志于明清鼎革之际中兴大明、重整华夏山河。'
+              sample: '（句式结构范例，人名与身份必须替换为用户实际设定）：现代灵魂魂穿明末〔用户设定的附身对象封号身份，如桂王世子〕〔用户设定的主角名〕，觉醒〔用户设定的金手指或后世先知〕，自〔用户设定的开局处境〕崛起，凭〔核心能力〕整军经武，立志于明清鼎革之际中兴大明——本范例中的「陈默/朱明璋/落魄宗室」仅为结构示意，【严禁】照抄到输出中，人物名与身份一律以用户实际设定为准。'
             }
           }
           var _tv = _tVocab[_tGenre] || _tVocab['xuanhuan']
@@ -13300,7 +13920,7 @@ ${_tv.example}
 【穿越/魂穿主题逻辑约束·历史题材专用·最高优先级·绝对不可违反】
 1. 主角身份必须明确区分"穿越者（现代灵魂来源，标注为modernName）"与"穿越后附身对象（故事世界原主，即protagonistName）"
 2. tagline必须严格按六段递进结构生成（历史穿越标准模板）：
-   ①穿越者身份（现代青年/现代灵魂+现代名）→②魂穿对象（南明/明末低微或落魄身份，如流亡宗室/寒门士子/边将之后）→③金手指（后世知识/历史先知/现代思维觉醒，绝非修仙功法或系统面板）→④开局起点（南明流亡朝廷/边关孤城/败军之中底层开局）→⑤核心看点（凭后世兵法谋略与先知优势，在明清易代乱局中扶保社稷、整军经武、对抗清军）→⑥终极志向（中兴大明/驱除鞑虏/重整山河/再造华夏，情绪落点放句末）
+   ①穿越者身份（现代青年/现代灵魂+现代名）→②魂穿对象（南明/明末低微或落魄身份，如流亡宗室/寒门士子/边将之后）→③金手指（后世知识/历史先知/现代思维觉醒，绝非修仙功法或系统面板）→④开局起点（南明流亡朝廷/边关孤城/败军之中底层开局）→⑤核心看点（凭后世兵法谋略与先知优势，在明清易代乱局中扶保社稷、整军经武、对抗清军）→⑥终极志向（中兴大明/驱逐清军/重整山河/再造华夏，情绪落点放句末）
 3. 【🔥 主角名一致性铁律】protagonistName=原主姓名（明代/南明时代中式姓名）；tagline须同时出现"现代人名"和"原主姓名(=protagonistName)"两个不同名字
 4. 【🔥🔥🔥 历史题材绝对禁词·违反则输出作废】tagline/核心冲突/主角简介绝对禁止出现以下任何词汇：
    仙侠、修仙、玄幻、修炼、境界、渡劫、飞升、宗门、灵气、法力、仙魔、鸿蒙、诸天万界、独断万古、证道长生、天道、金丹、元婴、洞府、法宝、御剑、腾云、吐纳、练气、灵根、神魂、仙域、仙尊、道祖、妖兽、灵草、斗气、魔法、异能、系统、面板、签到、任务、商城、强者之路、逆天崛起、独步天下
@@ -13352,7 +13972,7 @@ tagline和coreConflict中出现主角名时也必须使用中式姓名！`
 【🔥🔥🔥 历史题材绝对禁词铁律·最高优先级·违反则输出作废】
 本书为历史/架空历史/王朝权谋题材。你在生成书名、tagline、核心卖点、核心冲突、主角简介、世界设定等任何字段时：
 1. 绝对禁止出现任何仙侠/修仙/玄幻/奇幻/西幻【世界观】元素，禁词清单（命中任一即作废）：仙侠、修仙、玄幻、修炼、境界、渡劫、飞升、宗门、灵气、法力、仙魔、鸿蒙、诸天万界、独断万古、证道长生、天道、金丹、元婴、洞府、法宝、御剑、腾云、吐纳、练气、灵根、神魂、仙域、仙尊、道祖、妖兽、灵草、斗气、魔法、异能、强者之路、逆天崛起、独步天下。
-2. tagline/核心冲突收尾只能用历史式口号：中兴大明、重整山河、再造华夏、驱除鞑虏、扶保社稷、匡复天下——绝不可用"登临鸿蒙之巅""逆斩仙魔""独断万古"等玄幻口号。
+2. tagline/核心冲突收尾只能用历史式口号：中兴大明、重整山河、再造华夏、驱逐清军、扶保社稷、匡复天下——绝不可用"登临鸿蒙之巅""逆斩仙魔""独断万古"等玄幻口号。
 3. 🔥 金手指机制【不属于】上述禁词：系统、面板、签到、打卡、任务、商城、抽奖、属性点等属于"金手指机制词"，与"仙侠世界观词"性质完全不同——历史文配系统/签到金手指是成熟主流品类（历史系统文）。因此：① 若用户在作品类型中显式选择了系统流/签到流/面板流/任务流等流派，则金手指【必须】按该流派机制设计，并【必须】在 systemName/tagline/coreIdea/卖点中明确写出机制名称与玩法（不得因"历史题材"而回避这些词）；② 若用户【未】选择任何流派，则金手指默认表现为后世知识、历史先知、现代军事/科技/制度思维、兵法谋略、帝王心术，不主动引入系统/签到等机制。
 4. 所有设定必须扎根具体历史背景（朝代、帝王、战役、制度、地理），用历史词汇（朝廷/朝堂/兵马/粮草/藩王/督师/清军/北伐/社稷/君臣/边关/山河）。金手指机制可以存在，但其【内容、奖励、目标】必须服务于历史语境（如签到奖励是粮草/火器/人才/民心，任务是收复城池/推行新政/整编新军），不得脱离历史架空成修仙升级流。`
         }
@@ -13538,7 +14158,28 @@ ${_fanfictionWorldInfo || `基于你对《${_fanfictionSource}》原作的了解
 【绝对禁止】无视流派做成通用"神秘传承/血脉觉醒/老爷爷/戒指"式敷衍设定。禁止因"历史题材"而回避流派词——历史题材禁的是"仙侠玄幻世界观"（修仙/法力/金丹/灵气/天道/魔法/异能/斗气），【不禁止且必须使用】金手指机制词（系统/签到/面板/任务/打卡/抽奖）。机制内容须服务于历史语境（奖励=粮草/火器/人才/民心/城池，任务=收复失地/推行新政/整编新军）。
 `
         }
-        const userPrompt = `${_flowPreHint}根据以下关键词生成完整的小说灵感设定：${keywordsStr || ''}。
+        // 🔥 2026-11-05 无金手指题材检测：关键词指向真实历史/无系统 → 注入禁玄幻金手指铁律
+        const _nfKeywordHit = /真实|无系统|非系统|权谋|群像|历史氛围|历史背景|明清对峙|抗清|朝堂/.test(keywordsStr || '')
+        const _nfGenreHit = /历史|明|清|宋|唐|三国/.test(genre || '')
+        // 🔥 2026-11-05 平台合规禁词（idea 输出严禁出现）
+        const _complianceHintIdea = '\n【🔥🔥🔥 平台合规禁词铁律·违反则输出作废】所有字段严禁出现以下词汇及其变体：鞑虏、鞑子、异族、胡虏、蛮夷、侵略者（针对少数民族）、灭族、屠尽——历史冲突一律用「清军/明军/后金/八旗」等中性称谓。' 
+        // 🔥 2026-11-05 主角名漂移修复：从用户输入文本提取主角名（原逻辑只认主角设定表单——
+        //   用户把主角名写在关键词/详细设定里时 _canonName 为 null，LLM 自由发挥产出乱码名如「岑宋出幡」「李 вик sia」）
+        var _ideaCanonName = ''
+        try {
+          var _nameSrc = String(keywordsStr || '') + ' ' + String((previousData as any)?.detailedDesignInput || '') + ' ' + String(input || '')
+          var _nmM = _nameSrc.match(/主角(?:名字|名称|名)?[是为：:\s]*([\u4e00-\u9fa5]{2,6})/)
+          if (_nmM && _nmM[1]) _ideaCanonName = _nmM[1]
+          // 历史专名直取（本作场景：永历帝朱由榔）
+          if (!_ideaCanonName && /朱由榔/.test(_nameSrc)) _ideaCanonName = '朱由榔'
+          if (!_ideaCanonName) {
+            var _nmM2 = _nameSrc.match(/(?:魂穿|附身|穿越成|成为)\s*([\u4e00-\u9fa5]{2,6})/)
+            if (_nmM2 && _nmM2[1]) _ideaCanonName = _nmM2[1]
+          }
+        } catch (_nmE) {}
+        var _ideaNameHint = _ideaCanonName ? ('\n【🔥🔥🔥 主角名铁律·最高优先级·违反则输出作废】用户已明确主角姓名为「' + _ideaCanonName + '」——tagline、coreConflict、coreIdea、protagonistBrief、keyword 等所有字段中的主角必须统一使用「' + _ideaCanonName + '」这个名字。【严禁】生成任何其它人名作为主角名；【严禁】输出乱码名、生造词、中英文混杂名称（如"岑宋出幡""李 вик sia"之类）；【严禁】使用历史人物的其它称谓替换（用户写朱由榔就是朱由榔，不得写成朱慈烜/朱由检等）。若用户关键词中出现该名，必须原样保留。') : ''
+        const _noGoldenFingerHint = (_nfKeywordHit && _nfGenreHit) ? '\n【🔥 本作金手指铁律·违反则输出作废】本作是真实历史向/无系统作品：主角优势只能是"六百年后读史知识/现代见识/历史先知"这类现实型优势，【严禁】生成"觉醒血脉/龙脉之力/系统/修炼功法/超自然金手指"等玄幻设定。tagline、coreIdea、coreConflict、keyword 中出现任何玄幻金手指表述都视为失败。\n【🔥 keyword 字段格式铁律】输出的 keyword（灵感关键词）必须是 3-6 个独立的完整词语（每个 2-6 字，如"明末抗清 帝王权谋 历史穿越"），禁止病句、禁止超长短语、禁止把一句话拆成碎片。' : ''
+        const userPrompt = `${_flowPreHint}根据以下关键词生成完整的小说灵感设定：${keywordsStr || ''}。${_noGoldenFingerHint}${_ideaNameHint}${_protagonistSettingsHint}
 题材类型：${genre || '未指定'}。
 ${_imitateHint}
 ${_detailedDesignPrompt}
@@ -13565,8 +14206,8 @@ ${_flowSpiritHint}
 【🔥🔥🔥 各字段独立设计铁律·必须遵守·违反则输出视为截取/抄袭】
 每个字段都必须【独立原创设计】，使用输入信息作为创作基础，但绝不能只是复制/换措辞/截取输入内容或彼此复制。具体要求：
 - title（书名）：5-15字，要新颖有记忆点，可凝练主题/金手指/主角特质；不能是题材词+主角名的拼凑（如"明末朱由榔传"）
-- tagline（一句话简介）：30-60字钩子，用最强悬念吸引读者；必须含主角名+核心处境+明确金手指/能力，不能只是把"主角身份背景"输入原样或换措辞复述
-- coreIdea（小说介绍/完整故事设定）：200-400字，必须包含【时代背景/世界观设定/主角来历/核心矛盾/金手指/预期发展主线】六大要素，且要素须丰富具体（如时代背景要写明具体年份/在位皇帝/主要政治格局），不能只是"主角身份背景"的扩写或微调版
+- tagline（一句话简介）：30-60字钩子，用最强悬念吸引读者；必须含主角名+核心处境+主角的核心优势（有金手指题材=明确金手指/能力；真实历史/无系统题材=主角基于现代知识、历史先知的现实优势，严禁虚构血脉/龙脉/系统等超自然金手指），不能只是把"主角身份背景"输入原样或换措辞复述
+- coreIdea（小说介绍/完整故事设定）：200-400字，必须包含【时代背景/世界观设定/主角来历/核心矛盾/主角核心优势（金手指或真实历史题材的知识/先知优势）/预期发展主线】六大要素，且要素须丰富具体（如时代背景要写明具体年份/在位皇帝/主要政治格局），不能只是"主角身份背景"的扩写或微调版
 - coreConflict（核心戏剧冲突）：30-60字，必须包含【主要对手/具体阻碍来源/两难抉择/失败代价/最终目标】四要素，不能只是 tagline 的同义改写/精简/截取（这条另由后处理脚本二次校验）
 - coreSellingPoint（核心卖点）：3-5条，每条15-30字，从爽点/钩子/差异化等不同维度设计，不能是同一信息的换措辞罗列
 - targetAudience（目标读者）：50-100字，刻画读者画像而非复述卖点
@@ -13580,6 +14221,125 @@ ${_flowSpiritHint}
       console.log(`[idea] Using model: ${usedModel}, content length: ${content.length}`)
 
       const result = parseJSON(content)
+
+      // 🔥 2026-11-05 _latinNameGuard 主角名漂移守卫：用户输入已明确主角名时——
+      //   ① tagline/coreConflict/coreIdea/protagonistBrief 中出现「中英文混杂人名」（拉丁字母人名特征）→ 整字段替换为权威名版本（正则把该人名槽换成权威名）
+      //   ② 若字段完全不含权威名 → 不强改正文（防误伤），但 result.protagonistName 由下方既有 _canonName 链兜底
+      var _latinNameGuard = (function () {
+        try {
+          if (!_ideaCanonName) {
+            var _psNameFallback = (previousData as any)?.protagonistSettings?.name
+            if (typeof _psNameFallback === 'string' && _psNameFallback.trim().length >= 2) _ideaCanonName = _psNameFallback.trim()
+          }
+          if (!_ideaCanonName) return 0
+          var _hit = 0
+          var _fields = ['tagline', 'coreConflict', 'coreIdea', 'protagonistBrief']
+          // 中英混杂人名特征：2-6 个汉字后跟空格+2 段以上拉丁字母（如"李 вик sia"），且上下文含穿越/附身/主角词
+          var _mixedNameRe = /[\u4e00-\u9fa5]{1,6}\s+[a-zA-Z]{2,12}(?:\s+[a-zA-Z]{2,12}){1,3}/g
+          for (var _fi = 0; _fi < _fields.length; _fi++) {
+            var _fk = _fields[_fi]
+            var _fv = result && result[_fk]
+            if (typeof _fv !== 'string' || !_fv) continue
+            if (_fv.indexOf(_ideaCanonName) !== -1) continue
+            var _mLN = _fv.match(_mixedNameRe)
+            if (_mLN && _mLN.length && /魂穿|附身|穿越|主角|少爷|皇帝|世子/.test(_fv)) {
+              // 把首个混杂人名槽替换为权威名（保留前后语境）
+              var _fixed = _fv.replace(_mLN[0], _ideaCanonName)
+              if (_fixed !== _fv) { result[_fk] = _fixed; _hit++ }
+            }
+          }
+          // protagonistName 统一
+          if (result && typeof result.protagonistName === 'string' && result.protagonistName && result.protagonistName !== _ideaCanonName) {
+            try { var _r3 = _deepReplaceName(result, result.protagonistName, _ideaCanonName); if (_r3 > 0) _hit += _r3 } catch (_e3) {}
+            result.protagonistName = _ideaCanonName
+          }
+          if (!result.protagonistName) result.protagonistName = _ideaCanonName
+          return _hit
+        } catch (_gE) { return 0 }
+      })();
+      
+          // 🔥 2026-11-05 _identityGuard：用户表单身份背景为第一依据——
+          //   ① tagline/coreConflict/coreIdea 中「表单外身份短语+权威名」→ 替换为用户身份+权威名
+          //   ② 用户未指定现代名时，「现代灵魂XXX魂穿」→「现代灵魂魂穿」（剥离自编现代名）
+          var _identityGuard = (function () {
+            try {
+              var _ps = (previousData as any)?.protagonistSettings || {}
+              var _uId = typeof _ps.identity === 'string' ? _ps.identity.trim() : ''
+              var _uName = typeof _ps.name === 'string' ? _ps.name.trim() : ''
+              var _uModern = typeof _ps.modernName === 'string' ? _ps.modernName.trim() : ''
+              var _hit2 = 0
+              var _idFirst = _uId.split('/')[0].trim()
+              var _fields2 = ['tagline', 'coreConflict', 'coreIdea', 'protagonistBrief']
+              for (var _fi2 = 0; _fi2 < _fields2.length; _fi2++) {
+                var _fk2 = _fields2[_fi2]
+                var _fv2 = result && result[_fk2]
+                if (typeof _fv2 !== 'string' || !_fv2) continue
+                var _nv2 = _fv2
+                if (_uName && _nv2.indexOf(_uName) !== -1) {
+                  // 🔥 成品短语替换：非「桂王世子朱由榔」的身份+名组合 → 换成成品短语
+                  var _protoPhraseGuard = (_idFirst && _uName) ? (_idFirst + _uName) : ''
+                  if (_protoPhraseGuard && _nv2.indexOf(_protoPhraseGuard) === -1) {
+                    // 🔥 强制重写：把「权威名」前紧邻的 2-6 字身份短语整体替换为用户身份（字符串拼接，防 LLM 变体逃逸）
+                    var _namePos = _nv2.lastIndexOf(_uName)
+                    if (_namePos > 0) {
+                      var _head = ''
+                      for (var _hc = 1; _hc <= 6; _hc++) {
+                        var _ch = _nv2.charAt(_namePos - _hc)
+                        if (/[\u4e00-\u9fa5]/.test(_ch)) _head = _ch + _head; else break
+                      }
+                      if (_head && _head !== _idFirst && _head !== _uName) {
+                        _nv2 = _nv2.slice(0, _namePos - _head.length) + _idFirst + _uName + _nv2.slice(_namePos + _uName.length)
+                      }
+                    }
+                  }
+                  // 🔥 现代名/句式统一：「现代灵魂+任意2-4字+任意穿系动词」→「现代灵魂魂穿」
+                  _nv2 = _nv2.replace(/现代灵魂[\u4e00-\u9fa5]{0,4}(?=魂穿|穿到|穿越到|附身|重生到|夺舍)/g, '现代灵魂')
+                  if (!_uModern) _nv2 = _nv2.replace(/现代灵魂[\u4e00-\u9fa5]{2,4}魂穿/g, '现代灵魂魂穿')
+                }
+                if (_nv2 !== _fv2) { result[_fk2] = _nv2; _hit2++ }
+              }
+              try {
+                require('fs').appendFileSync('/tmp/guard_debug.txt', JSON.stringify({
+                  t: new Date().toISOString(),
+                  uId: _uId || '',
+                  uName: _uName || '',
+                  idFirst: _idFirst || '',
+                  hit: _hit2,
+                  tagline: String((result && result.tagline) || '').slice(0, 80),
+                }) + '\n')
+              } catch (_gdE) {}
+              return _hit2
+            } catch (_ie) { return 0 }
+          })();
+          if (_identityGuard > 0) console.log('[idea] _identityGuard 身份/现代名修复:', _identityGuard, '处')
+if (_latinNameGuard > 0) console.log('[idea] _latinNameGuard 主角名漂移修复:', _latinNameGuard, '处 →', _ideaCanonName)
+
+      // 🔥 2026-11-05 regen 结构兜底：单字段重新生成时 LLM 常把内容塞进错误字段（如要求 tagline 却返回 coreConflict）——
+      //   若 result[field] 缺失/过短，取 result 中最长的字符串字段值回填
+      if (field && typeof field === 'string') {
+        var _fvMain = result && result[field]
+        // 🔥 2026-11-05 双层 JSON 解码：LLM 有时把值写成序列化 JSON（如 tagline='{"coreConflict":...}'）——解码取最长字符串字段
+        if (typeof _fvMain === 'string' && _fvMain.trim().charAt(0) === '{') {
+          try {
+            var _inner = JSON.parse(_fvMain)
+            var _bk2 = '', _bl2 = 0
+            for (var _k4 in (_inner || {})) {
+              if (typeof _inner[_k4] === 'string' && _inner[_k4].trim().length > _bl2) { _bl2 = _inner[_k4].trim().length; _bk2 = _k4 }
+            }
+            if (_bk2 && _bl2 >= 15) { result[field] = _inner[_bk2]; _fvMain = _inner[_bk2]; console.log('[idea] 双层 JSON 解码: field=' + field + ' 自 '+ _bk2 +' 回填') }
+          } catch (_pe2) {}
+        }
+        if (typeof _fvMain !== 'string' || _fvMain.trim().length < 15) {
+          var _bestK = '', _bestLen = 0
+          for (var _k3 in (result || {})) {
+            if (typeof result[_k3] === 'string' && result[_k3].trim().length > _bestLen && _k3 !== 'protagonistName') { _bestLen = result[_k3].trim().length; _bestK = _k3 }
+          }
+          if (_bestK && _bestLen >= 15) {
+            console.log('[idea] regen 结构兜底: field=' + field + ' 缺失/过短，回填自 ' + _bestK)
+            result[field] = result[_bestK]
+          }
+        }
+      }
 
       // 🔥 2026-08-21：清洗立体化字段的模板占位符污染（如 coreGoldenQuote: "[核心金句]" / commercialPositioning: "[商业定位]"）
       //   防御性兜底，确保前端不显示"[字段名]"这种残留标签
@@ -14850,11 +15610,28 @@ if (_tlChanged) {
           if (!_eraM && /都市|现代|职场|校园|总裁|娱乐圈|年代/.test(_ciBlob)) _eraM = ['现代']
           if (_eraM) _ciEra = _eraM[1]
           if (_ciTitle) _ciParts.push('本书名为《' + _ciTitle + '》。')
-          if (_ciEra) _ciParts.push('故事背景设定在' + _ciEra + '，乱世风云、群雄并起，正是英雄逐鹿的时代。')
+          // 🔥 2026-09-08 修复：「乱世风云、群雄并起、英雄逐鹿」是权谋/历史腔，套在科幻/都市/西幻题材上会串味
+          if (_ciEra) {
+            var _ciEraTail = '乱世风云、群雄并起，正是英雄逐鹿的时代。'
+            if (_ideaGenreDetect.isScifi) _ciEraTail = '科技与生存资源是各方角力的核心，正是变局频出、强者崛起的时代。'
+            else if (_ideaGenreDetect.isModern) _ciEraTail = '机遇与陷阱并存，正是草根逆袭、格局重洗的时代。'
+            else if (_ideaGenreDetect.isWestern) _ciEraTail = '魔法与剑影交织，正是冒险者辈出、诸国纷争的时代。'
+            else if (_ideaGenreDetect.isCultivation || _ideaGenreDetect.isXuanhuan || _ideaGenreDetect.isHonghuang) _ciEraTail = '灵机涌动、宗门林立，正是天骄争锋、大道可期的时代。'
+            _ciParts.push('故事背景设定在' + _ciEra + '，' + _ciEraTail)
+          }
           if (_ciBrief) _ciParts.push(_ciBrief)
           if (_ciConflict) _ciParts.push('核心冲突在于：' + _ciConflict)
           if (_ciSys) _ciParts.push('主角的金手指为「' + _ciSys + '」，这是他于绝境中改变命运、逆转乾坤的关键底牌。')
-          if (_ciKws) _ciParts.push('本作融合' + _ciKws.slice(0, 40) + '等核心元素，主线围绕主角运用金手指步步为营、破解困局、逐步达成宏图展开，兼顾权谋博弈与成长爽点。')
+          if (_ciKws) {
+            // 🔥 2026-09-08 修复：原句「兼顾权谋博弈与成长爽点」对所有题材一刀切，科幻/都市题材同样出现权谋腔
+            var _ciTail = '主线围绕主角运用金手指破局成长、层层递进达成目标，兼顾成长爽点与剧情张力。'
+            if (_ideaGenreDetect.isHistory) _ciTail = '主线围绕主角运用金手指步步为营、破解困局、逐步达成宏图展开，兼顾权谋博弈与成长爽点。'
+            else if (_ideaGenreDetect.isScifi) _ciTail = '主线围绕主角以科技与进化之力破解困局、层层升级，兼顾探索爽点与生存张力。'
+            else if (_ideaGenreDetect.isModern) _ciTail = '主线围绕主角凭借金手指在都市格局中破局逆袭，兼顾事业爽点与情感张力。'
+            else if (_ideaGenreDetect.isWestern) _ciTail = '主线围绕主角凭借金手指在剑与魔法的世界里崛起，兼顾冒险爽点与成长张力。'
+            else if (_ideaGenreDetect.isCultivation || _ideaGenreDetect.isXuanhuan || _ideaGenreDetect.isHonghuang) _ciTail = '主线围绕主角凭借金手指逆天改命、登临绝顶，兼顾修炼爽点与恩怨情仇。'
+            _ciParts.push('本作融合' + _ciKws.slice(0, 40) + '等核心元素，' + _ciTail)
+          }
           var _ciFull = _ciParts.join('')
           if (_ciFull.length < 60) {
             _ciFull = '本书《' + (_ciTitle || '未命名') + '》讲述' + String(result.protagonistName || '主角') + '的故事。' + (_ciBrief || _ciTag || '在乱世中崛起，凭自身智谋与际遇书写传奇。')
@@ -14982,6 +15759,52 @@ if (_tlChanged) {
       }
 
       console.log('[idea] 🏁 最终返回前: systemName=' + String((result && result.systemName) || '(空)') + ' | coreIdea前60=' + String((result && result.coreIdea) || '').slice(0, 60))
+      // 🔥 2026-11-05 出口守卫（最终防线）：用户表单主角设定为最终权威——所有后处理（身份去重/语法修复/查重重试）
+      //   都可能用旧上下文重写 tagline（如「废柴少爷朱由榔」），在返回前做最后一次强制矫正
+      try {
+        var _psFinal = (previousData as any)?.protagonistSettings || {}
+        var _fName = typeof _psFinal.name === 'string' ? _psFinal.name.trim() : ''
+        var _fId = typeof _psFinal.identity === 'string' ? _psFinal.identity.trim() : ''
+        var _fIdFirst = _fId.split('/')[0].trim()
+        if (_fName && _fIdFirst) {
+          var _fPhrase = _fIdFirst + _fName
+          // 双层 JSON 解码：LLM 有时把字段值写成序列化 JSON——先解码再校验身份
+          var _flds0 = ['tagline', 'coreConflict', 'coreIdea', 'protagonistBrief', 'coreSellingPoint', 'targetAudience']
+          for (var _fi0 = 0; _fi0 < _flds0.length; _fi0++) {
+            var _fv0 = result && result[_flds0[_fi0]]
+            if (typeof _fv0 === 'string' && _fv0.trim().charAt(0) === '{') {
+              try {
+                var _in0 = JSON.parse(_fv0)
+                var _bk0 = '', _bl0 = 0
+                for (var _k0 in (_in0 || {})) {
+                  if (typeof _in0[_k0] === 'string' && _in0[_k0].trim().length > _bl0) { _bl0 = _in0[_k0].trim().length; _bk0 = _k0 }
+                }
+                if (_bk0 && _bl0 >= 15) { result[_flds0[_fi0]] = _in0[_bk0]; console.log('[idea] 🛡️ 出口守卫双层解码: ' + _flds0[_fi0] + ' 自 ' + _bk0) }
+              } catch (_pE0) {}
+            }
+          }
+          var _flds3 = ['tagline', 'coreConflict', 'coreIdea', 'protagonistBrief']
+          for (var _fi3 = 0; _fi3 < _flds3.length; _fi3++) {
+            var _fk3 = _flds3[_fi3]
+            var _fv3 = result && result[_fk3]
+            if (typeof _fv3 !== 'string' || !_fv3) continue
+            if (_fv3.indexOf(_fName) === -1) continue
+            if (_fv3.indexOf(_fPhrase) !== -1) continue
+            var _np3 = _fv3.lastIndexOf(_fName)
+            if (_np3 > 0) {
+              var _hd3 = ''
+              for (var _hc3 = 1; _hc3 <= 6; _hc3++) {
+                var _ch3 = _fv3.charAt(_np3 - _hc3)
+                if (/[一-龥]/.test(_ch3)) _hd3 = _ch3 + _hd3; else break
+              }
+              if (_hd3 && _hd3 !== _fIdFirst && /废柴|落魄|少爷|公子|宗室|无名|破落|潦倒|乱世|血脉|觉醒|废土|异族|进化|平凡出身/.test(_hd3)) {
+                result[_fk3] = _fv3.slice(0, _np3 - _hd3.length) + _fPhrase + _fv3.slice(_np3 + _fName.length)
+                console.log('[idea] 🛡️ 出口守卫: ' + _fk3 + ' 身份「' + _hd3 + '」→「' + _fIdFirst + '」')
+              }
+            }
+          }
+        }
+      } catch (_egE) { console.warn('[idea] 出口守卫异常（不影响返回）:', _egE) }
       return cleanStructuredData(result)
     }
 
@@ -15404,14 +16227,14 @@ ${isPanlong || _isWesternFantasy ? `
 ` : ''}
 ${isHistory ? `
 【🔥🔥🔥 历史/权谋/种田题材·强制约束·最高优先级·必须100%遵守】
-1. 时代背景(era)：必须设定在真实历史时期或符合历史逻辑的架空时代，如南明、明末、三国、隋唐、明清等，绝对禁止出现"灵气复苏""末法时代""宗门林立"等玄幻设定！
-2. 地理环境(geography)：必须包含具体的历史地名，如南京、北京、山海关、江南、中原、岭南等，绝对禁止出现"五大域""神州""东域西域"等玄幻地理！
-3. 历史背景(history)：必须包含真实历史事件或符合历史逻辑的事件，如清军入关、崇祯自缢、李自成起义、东林党争等，绝对禁止出现"诸仙大战""灵气复苏"等玄幻设定！
+1. 时代背景(era)：必须设定在真实历史时期或符合历史逻辑的架空时代，【🔥 #171 最高优先级：必须严格贴合用户输入主题/灵感所指的具体朝代——主题是夏商就设夏商，是三国就设三国，是明末清初才可用南明/明末背景；严禁把用户主题未涉及的朝代强加给本作】，绝对禁止出现"灵气复苏""末法时代""宗门林立"等玄幻设定！
+2. 地理环境(geography)：必须包含与本作设定朝代相符的具体历史地名（如中原、江南、岭南、关中、河洛等通用地理，或设定朝代的真实城邑关隘），绝对禁止出现"五大域""神州""东域西域"等玄幻地理！
+3. 历史背景(history)：必须包含与【本作设定朝代】相符的真实历史事件或符合该朝代历史逻辑的事件（清军入关、崇祯自缢、李自成起义、东林党争等仅是"明末清初"题材的示例，其他朝代严禁套用），绝对禁止出现"诸仙大战""灵气复苏"等玄幻设定！
 4. 力量体系(powerSystem)：必须围绕权力体系、军事体系、科举体系等现实力量，如文官体系、武将体系、权谋体系、兵法体系等，绝对禁止出现"修炼""灵气""灵根""血脉""金丹""元婴""武道"等玄幻词汇！
 5. 社会结构(socialStructure)：必须体现历史时期的社会特征，如皇权专制、科举制度、士农工商、门阀世家等，绝对禁止出现"宗门弟子、坊市交易、修炼等级"等玄幻社会结构！
 6. 文化特色(culturalFeatures)：必须体现历史时期的文化特征，如儒家思想、科举文化、诗词歌赋、传统节庆等，绝对禁止出现"宗门大比、飞升大典"等玄幻设定！
 7. 科技水平(technology)：必须符合历史时期的科技水平，如火器、造船、冶金、印刷术等，绝对禁止出现"炼丹、炼器、阵法、符箓"等玄幻技艺！
-8. 隐秘历史(secretHistory)：【🔥 2026-09-02 新增·修复用户反馈"隐秘历史需要设计明末清初各种隐秘历史"】必须围绕真实历史或符合历史逻辑的未解之谜/秘辛设计，示例（明末清初）：崇祯自缢与传国玉玺下落之谜、吴三桂引清军入关的真实动机与背后交易、南明朝廷党争（东林党/马士英/阮大铖）的隐秘勾当、弘光/隆武/永历诸帝权力斗争内幕、郑成功北伐南京功败垂成的内部原因、闯王李自成兵败九宫山的真实结局、孝庄与多尔衮的隐秘关系、明朝锦衣卫/东厂遗留秘档、反清复明组织的暗线布局、清廷对汉臣的拉拢与监视等——必须具体、有历史依据或符合历史逻辑，与主角处境/剧情主线强关联，绝对禁止出现"上古大劫、天道隐秘、仙人遗府"等玄幻设定！
+8. 隐秘历史(secretHistory)：【🔥 2026-09-02 新增·#171 修订】必须围绕【本作设定朝代】的真实历史或符合该朝代历史逻辑的未解之谜/秘辛设计，与主角处境/剧情主线强关联，必须具体、有历史依据或符合历史逻辑——示例（仅当题材为明末清初时才可参考，其他朝代必须按本作朝代另行设计）：崇祯自缢与传国玉玺下落之谜、吴三桂引清军入关的真实动机、南明朝廷党争的隐秘勾当、郑成功北伐南京功败垂成的内部原因等。绝对禁止出现"上古大劫、天道隐秘、仙人遗府"等玄幻设定，也严禁把明末清初事件套用到其他朝代！
 9. 【最严重禁忌】绝对禁止出现任何"修炼""灵气""灵根""血脉""金丹""元婴""化神""宗门""魔法""斗气"等玄幻词汇！违者视为生成失败！
 ` : ''}
 ${isSciFi ? `
@@ -16733,15 +17556,26 @@ ${isModern ? `
         }
         if (_locPairs.length >= 1) {
           normalized.importantLocations = _locPairs.slice(0, 8).map(function(p) { return { name: p.name, desc: p.desc } })
-          normalized.forbiddenZones = _locPairs.slice(0, 8).map(function(p) { return { name: p.name, desc: p.desc, danger: '中' } })
+          // 🔥 2026-09-08 修复：此前 importantLocations / forbiddenZones / locations 三份内容完全相同
+          //   （实测《废土机甲》5 个地点在前端重复展示三遍），且 forbiddenZones 的 danger 全部硬编码为"中"。
+          //   现：locations/importantLocations 保留完整地点表；forbiddenZones 只收「危险语义」命中的地点
+          //   （辐射/污染/禁区/封锁/荒原/遗迹/废墟/战场/深渊/裂隙…），并按危险程度分级，不再与前者雷同。
+          var _DANGER_WORDS161 = /辐射|污染|禁区|封锁|管制|隔离|荒原|废墟|遗迹|未探索|未知|危险|禁忌|凶险|深渊|裂隙|战场|毒|异变|失控|废弃|陨石|风暴|极寒|炽热|高压|黑洞|丧尸|变异/
+          var _dz161 = _locPairs.filter(function(p: any) { return _DANGER_WORDS161.test(String(p.desc || '') + String(p.name || '')) })
+          if (_dz161.length < 2) _dz161 = _locPairs.slice(-3)
+          if (_dz161.length < 2) _dz161 = _locPairs.slice()
+          var _DANGER_LV161 = ['中', '高', '极高', '高', '中']
+          normalized.forbiddenZones = _dz161.slice(0, 5).map(function(p: any, _di: number) { return { name: p.name, desc: p.desc, danger: _DANGER_LV161[Math.min(_di, _DANGER_LV161.length - 1)] } })
           normalized.locations = normalized.importantLocations
-          console.log('[worldbuilding] 重要地点已按本作生成(' + _locPairs.length + '个，真实地名+描述，无模板)')
+          console.log('[worldbuilding] 重要地点已按本作生成(' + _locPairs.length + '个)；禁地按危险语义筛出 ' + normalized.forbiddenZones.length + ' 个并分级')
         }
       } else if (Array.isArray(normalized.importantLocations) && normalized.importantLocations.length >= 3 && (!Array.isArray(normalized.forbiddenZones) || normalized.forbiddenZones.length < 3)) {
-        normalized.forbiddenZones = normalized.importantLocations.map(function(l: any) {
-          return {name: l.name || '', desc: l.desc || '', danger: l.danger || '中'}
+        // 🔥 2026-09-08：同上，转换填充时 danger 按序分级，避免全部为"中"
+        var _DANGER_LV161b = ['中', '高', '极高', '高', '中', '低']
+        normalized.forbiddenZones = normalized.importantLocations.map(function(l: any, _li: number) {
+          return {name: l.name || '', desc: l.desc || '', danger: l.danger || _DANGER_LV161b[Math.min(_li, _DANGER_LV161b.length - 1)]}
         })
-        console.log('[worldbuilding] forbiddenZones从importantLocations转换填充(' + normalized.forbiddenZones.length + '个)')
+        console.log('[worldbuilding] forbiddenZones从importantLocations转换填充(' + normalized.forbiddenZones.length + '个，danger 已分级)')
       }
 
       // 9. 种族体系（raceSystem）：基于题材补全
@@ -17422,6 +18256,60 @@ function _deriveWorldSystemType(abilityType: string, genre: string): string {
     '无金手指': '无等级体系',
   }
   return map[at] || (isWestern ? '魔法体系' : (isHistory ? '朝堂权力体系' : (isScifi ? '科技进化体系' : '修炼体系')))
+}
+
+// 🔥 #188（2026-09-08）卷摘要出口净化器：LLM 产出的卷摘要常带句级复读（wusong9 V1 首句在卷末原句复读）、
+//    模板连接腔（「故事从/徐徐展开/最终走向/的高潮/期间经历/最终迎来」）与标点杂讯（。，/。；/。。）。
+//    处理链：模板腔剥离 → 句级切分 → 4-gram 句间去重（保留首现）→ 标点修复 → 空句丢弃。
+//    幂等：对已净化文本再次净化输出不变。
+function _sanitizeVolSummaryText(raw: string): string {
+  let _s = String(raw || '').trim()
+  if (!_s) return ''
+  // ① 模板连接腔 / 病句剥离
+  _s = _s.replace(/故事从/g, '')
+    .replace(/徐徐展开[，,]?/g, '')
+    .replace(/最终走向/g, '')
+    .replace(/期间经历/g, '')
+    .replace(/最终迎来/g, '')
+    .replace(/。的高潮。?/g, '。')
+    .replace(/的高潮。?$/g, '。')
+  // ② 句级切分（保留终止符）
+  const _sents: string[] = []
+  let _buf = ''
+  for (let _ci = 0; _ci < _s.length; _ci++) {
+    const _ch = _s[_ci]
+    _buf += _ch
+    if (_ch === '。' || _ch === '！' || _ch === '？' || _ch === '；') {
+      const _t = _buf.trim()
+      if (_t) _sents.push(_t)
+      _buf = ''
+    }
+  }
+  const _tail = _buf.trim()
+  if (_tail) _sents.push(_tail)
+  // ③ 句间去重（4-gram 重合；含包含关系）
+  const _kept: string[] = []
+  for (let _si = 0; _si < _sents.length; _si++) {
+    const p = _sents[_si].replace(/[，、；]/g, '')
+    if (p.length < 4) continue
+    let _dup = false
+    for (let _qi = 0; _qi < _kept.length; _qi++) {
+      const q = _kept[_qi].replace(/[，、；]/g, '')
+      if (q.indexOf(p) !== -1 || p.indexOf(q) !== -1) { _dup = true; break }
+      let _shared = 0
+      for (let _gi = 0; _gi <= p.length - 4; _gi++) {
+        if (q.indexOf(p.substring(_gi, _gi + 4)) !== -1) { _shared++; _gi += 3 }
+      }
+      if (p.length >= 8 && _shared >= Math.max(2, Math.floor((p.length - 4) / 3))) { _dup = true; break }
+    }
+    if (!_dup) _kept.push(_sents[_si])
+  }
+  if (_kept.length === 0) return ''
+  // ④ 标点修复重组：句间统一「。」；顿号/逗号连续修复；句内残留分号保留
+  let _out = _kept.join('。')
+  _out = _out.replace(/，\s*，+/g, '，').replace(/。\s*。+/g, '。').replace(/；\s*。+/g, '。').replace(/，。/g, '。').replace(/；；+/g, '；')
+  if (!/[。！？]$/.test(_out)) _out += '。'
+  return _out
 }
 
 function splitGoldenFingerNames(systemName: string): string[] {
@@ -19065,7 +19953,10 @@ ${_psFanfictionWorldInfo || `基于你对《${_psIdea.fanfictionSource}》原作
         var sciFiSysTypes = ['基因进化体系', '科技进化体系', '精神力体系', '异能等级体系', '星际航行体系', '量子力场体系', '机甲体系', '末世进化体系', '变异体系', '赛博朋克体系', '虚拟现实体系', '维度体系']
         var westernAbilityTypes = ['血脉类', '血脉', '神器类', '神器', '功法类', '功法', '天赋类', '天赋', '灵魂类', '灵魂', '空间类', '空间', '契约类', '契约', '轮回类', '轮回', '时间类', '时间']
         var easternAbilityTypes = ['血脉类', '血脉', '功法类', '功法', '神器类', '神器', '天赋类', '天赋', '灵魂类', '灵魂', '空间类', '空间', '时间类', '时间', '契约类', '契约', '轮回类', '轮回', '吞噬类', '吞噬', '领域类', '领域', '系统类', '系统', '异能类', '异能']
-        var sciFiAbilityTypes = ['基因进化', '基因进化类', '星舰科技', '精神力量子流', '机械飞升', '吞噬进化', '吞噬进化类', '超能力觉醒流', '系统类', '系统', '天赋类', '天赋', '异能类', '异能', '知识类', '知识', '神器类', '神器'
+        // 🔥 2026-09-08 修复：删除 '神器类','神器' —— 科幻题材允许"神器类"会让 LLM 套用玄幻法宝模板
+        //   （实测《废土机甲》主角金手指"机械之心"被判为神器类，source/costBacklash/runawayForm 全是
+        //    「血脉印记/灵物/经脉/器灵/夺舍/天地灵气」等修仙词，属跨题材污染）。
+        var sciFiAbilityTypes = ['基因进化', '基因进化类', '星舰科技', '精神力量子流', '机械飞升', '机械飞升流', '吞噬进化', '吞噬进化类', '超能力觉醒流', '基因进化流', '系统类', '系统', '天赋类', '天赋', '异能类', '异能', '知识类', '知识'
           // 🔥 已删除：'宇宙传承/精神念师/星际武者/宇宙法则/吞噬宇宙/文明等级' 等吞噬星空专属金手指类型
         ]
         var modernAbilityTypes = ['知识', '知识类', '智谋', '智谋类', '气运', '气运类', '无金手指']
@@ -19178,6 +20069,23 @@ ${_psFanfictionWorldInfo || `基于你对《${_psIdea.fanfictionSource}》原作
           cleanedPS.protagonistAbility.type = '知识记忆'
           if (Array.isArray(cleanedPS.protagonistAbilities)) {
             cleanedPS.protagonistAbilities.forEach(function(a: any) { if (a && /神器|法宝|血脉|功法/.test(String(a.type || ''))) a.type = '知识记忆' })
+          }
+        }
+        // 🔥 2026-09-08 修复：科幻/现代题材同样禁止玄幻道具型金手指类型（与历史题材同款守卫）。
+        //   实测《废土机甲》（科幻）金手指"机械之心"被判为"神器类"，导致后续深度字段套用修仙法宝模板。
+        //   科幻按金手指名称语义改判：机械/义体/芯片/机甲 → 机械飞升流；基因/进化 → 基因进化流；
+        //   精神/念力/量子 → 精神力量子流；其余 → 超能力觉醒流。
+        if ((isSciFiGenre || isModernGenre) && cleanedPS.protagonistAbility && /神器|法宝|神兵|仙器|灵宝|戒指|至宝|丹田|灵根/.test(String(cleanedPS.protagonistAbility.type || ''))) {
+          var _sfAbilityName = String(cleanedPS.protagonistAbility.name || '') + ' ' + String(rawSystemName || '')
+          var _sfFixedType = '超能力觉醒流'
+          if (/机械|义体|芯片|机甲|钢铁|赛博|改造/.test(_sfAbilityName)) _sfFixedType = '机械飞升流'
+          else if (/基因|进化|变异|血脉/.test(_sfAbilityName)) _sfFixedType = '基因进化流'
+          else if (/精神|念力|量子|脑域|意识/.test(_sfAbilityName)) _sfFixedType = '精神力量子流'
+          else if (/系统|签到|面板/.test(_sfAbilityName)) _sfFixedType = '系统类'
+          console.log(`[powerSystem] 科幻/现代题材金手指类型纠正: "${cleanedPS.protagonistAbility.type}" → "${_sfFixedType}"`)
+          cleanedPS.protagonistAbility.type = _sfFixedType
+          if (Array.isArray(cleanedPS.protagonistAbilities)) {
+            cleanedPS.protagonistAbilities.forEach(function(a: any) { if (a && /神器|法宝|神兵|仙器|灵宝|至宝/.test(String(a.type || ''))) a.type = _sfFixedType })
           }
         }
 
@@ -20313,6 +21221,35 @@ ${_psFanfictionWorldInfo || `基于你对《${_psIdea.fanfictionSource}》原作
             cultivationRealm: [],
             powerBalance: _fsPowerBalance,
           }
+        } else if (isHonghuangGenre) {
+          // 🔥 #181 修复：兜底链此前缺失洪荒分支，「洪荒修仙」等复合题材在 LLM 结果清洗失败时
+          // 会误落修仙/都市模板（输出与题材无关的宗门/都市内容）。现补洪荒三大体系兜底（贴本作标题，不含具体神话人名）。
+          var hhTitle = (previousData?.idea as any)?.title || '洪荒证道'
+          var hhSeed = (hhTitle || '').substring(0, 2)
+          var hhGoldFinger = hhSeed ? hhSeed + '血脉' : '上古血脉'
+          cleanedPS = {
+            worldPowerSystem: {
+              name: '洪荒体系',
+              type: '洪荒体系',
+              description: '洪荒大世界三大体系并存：巫族只修肉身不修元神，走肉身成圣路线；妖族吞吐日月精华修炼天赋神通；仙道炼气化神、以元神感悟天地法则。圣人与天道博弈，量劫交织',
+              levels: systemLevelPresets['洪荒体系'],
+            },
+            protagonistAbility: {
+              name: hhGoldFinger,
+              type: '血脉类',
+              description: '主角身负独特上古禀赋，在巫妖争霸与量劫之中自微末崛起',
+              abilities: [
+                '初期：禀赋觉醒，肉身与神魂初获增益',
+                '中期：禀赋成长，得机缘与传承加持',
+                '后期：禀赋大成，参与大劫博弈、触及圣道',
+              ],
+              limitations: ['禀赋觉醒依赖机缘', '强敌觊觎', '量劫因果缠身', '修行资源争夺激烈'],
+              evolution: '微末崛起 → 量劫历练 → 证道超脱',
+            },
+            powerLevels: [],
+            cultivationRealm: [],
+            powerBalance: '巫族、妖族、仙道多方博弈，圣人布局与量劫走向带来变数',
+          }
         } else if (isCultivationGenre) {
           // 东方修仙/仙侠类：传统修仙体系
           var xcTitle = (previousData?.idea as any)?.title || '修仙问道'
@@ -20480,12 +21417,23 @@ ${_psFanfictionWorldInfo || `基于你对《${_psIdea.fanfictionSource}》原作
       var _psKeywords = Array.isArray(_psIdeaData?.keywords) ? _psIdeaData.keywords.join('、') : (_psIdeaData?.keywords || keywordsStr || '')
       var _psTagline = _psIdeaData?.tagline || ''
       var _psLocName = ''
-      var _psLocM = (_psTagline + ' ' + (_psWbData?.geography || '') + ' ' + (_psWbData?.era || '')).match(/([\u4e00-\u9fa5]{2,6}(?:王朝|帝国|皇朝|大陆|世界|星域))/)
+      var _psLocSrc = _psTagline + ' ' + (_psWbData?.geography || '') + ' ' + (_psWbData?.era || '') + ' ' + (_psWbData?.socialStructure || '')
+      // 🔥 2026-09-08 扩展：联邦/联盟/共和国/城邦/星港/废土/荒原/星球/星域/殖民/要塞/都市/城 均可作为世界名后缀
+      var _psLocM = _psLocSrc.match(/([\u4e00-\u9fa5]{2,6}(?:王朝|帝国|皇朝|联邦|联盟|共和国|城邦|公国|王国|大陆|世界|星域|星区|星港|废土|荒原|星球|殖民地|要塞|都市|圣城|皇城))/)
       if (_psLocM) _psLocName = _psLocM[1]
       // 🔥 修复：删除硬编码"太华王朝"，改为基于本作关键词动态生成
       if (!_psLocName) {
-        var _psLocKw = (_psKeywords || '').replace(/[,，、\s]+/g, ' ').split(' ').filter(function(k: string) { return k && k.length >= 2 })[0] || ''
-        _psLocName = _psLocKw.substring(0, 4) || '本作世界'
+        // 🔥 2026-09-08 修复：关键词是「主题描述」而非世界名（如"废土机甲：觉醒机械之心的少年"），
+        //   此前直接取前 4 字 → 金手指模板里出现"在废土机甲中""废土机甲第一宗"等荒诞表述。
+        //   现：①先取冒号/破折号前的短段（2-6字）②剔除含"的/与/和/之"等叙述词的片段
+        //      ③仍不合格则回退中性词"本作世界"，绝不把主题串当世界名。
+        var _psLocRaw = String(_psKeywords || '').split(/[,，、\s]+/)[0] || ''
+        _psLocRaw = _psLocRaw.split(/[：:·—–\-]/)[0].trim()
+        if (_psLocRaw.length >= 2 && _psLocRaw.length <= 6 && !/[的与和之其这那在是为]/.test(_psLocRaw) && /^[\u4e00-\u9fa5A-Za-z0-9]+$/.test(_psLocRaw)) {
+          _psLocName = _psLocRaw
+        } else {
+          _psLocName = '本作世界'
+        }
       }
       var _psGfNameShort = _psGoldenFingerName.replace(/(系统|面板|戒|鼎|镜|珠|塔|印|诀|经|典|体|血脉)/g, '')
       if (!_psGfNameShort) _psGfNameShort = '签到'
@@ -20524,8 +21472,12 @@ ${_psFanfictionWorldInfo || `基于你对《${_psIdea.fanfictionSource}》原作
         // 🔥 2026-09-04：历史题材强制走本中性分支——法宝/血脉/修炼分支自带修仙词
         //   （法宝/血脉/丹药/灵物/器灵/宗门/封印/阵法/经脉/修为等），历史书命中即串味
         var _isSignIn = /签到|系统/.test(_gfTypeHint + _gfName) || _psIsHist
-        var _isTreasure = /法宝|神器|戒|鼎|镜|珠|塔|印/.test(_gfTypeHint + _gfName)
-        var _isBody = /体质|血脉|圣体|神体|道体/.test(_gfTypeHint + _gfName)
+        // 🔥 2026-09-08 修复（跨题材模板污染）：法宝/血脉分支的文本自带宗门/经脉/丹药/器灵/夺舍等修仙词，
+        //   此前它们在 isSF/isW 之前判断，导致科幻/西幻/历史题材只要金手指名或类型含"神器/戒/塔/印/血脉"等字
+        //   就套上玄幻模板。现按题材收口：科幻/西幻/历史三种题材一律不进法宝/血脉分支，改走题材专属分支。
+        var _psGenreLocked = !!isSF || !!isW || !!_psIsHist
+        var _isTreasure = !_psGenreLocked && /法宝|神器|戒|鼎|镜|珠|塔|印/.test(_gfTypeHint + _gfName)
+        var _isBody = !_psGenreLocked && /体质|血脉|圣体|神体|道体/.test(_gfTypeHint + _gfName)
         
         if (fieldName === 'source') {
           if (_isSignIn) {
@@ -22148,9 +23100,26 @@ ${_psFanfictionWorldInfo || `基于你对《${_psIdea.fanfictionSource}》原作
         if (!_antList.length) _antList = [String((_charsForOutline.antagonist && _charsForOutline.antagonist.name) || '强敌')]
         var _agcThreats = ['极高', '高', '高', '中', '中', '低']
         var _agcTier = ['首要强敌', '中期劲敌', '后期障碍', '内患割据', '降臣暗桩', '残敌负隅']
+        // 🔥 2026-09-07 QA-7：旧兜底每行 powerLevel/growthPoint 全部同文（仅替换反派名），用户实测纯模板。
+        //   改为：①每档独立 powerLevel/成长点模板 ②注入该反派自身 identity/background 首句（去阵营括号、≤24 字）
+        //   ③补全提示词同步要求 LLM 按各反派身份写具体成长点。
+        var _agcPower = ['倾国之力·兵锋正盛', '拥兵自重·步步进逼', '据险固守·困兽犹斗', '割据一方·暗蓄异志', '潜藏暗处·伺机而动', '残喘苟延·负隅顽抗']
+        var _agcPlot = [
+          '以倾国之兵南压，前期构成本作最大外部威胁，其锋芒与主角崛起正面相撞',
+          '在主力受挫后接替成为主要对手，或战或和反复摇摆，把冲突拖入相持与博弈',
+          '于大势倾颓时据险固守，成为中兴路上最后一道必须击碎的障碍',
+          '坐观成败、拥兵自重，以割据之实成为腹心之患',
+          '表面归附暗怀异心，在关键时刻倒戈牵制中兴大业',
+          '大势已去仍负隅顽抗，是清算阶段的最后对手'
+        ]
         var _agcRows: any[] = []
+        var _antObjs: any[] = (_charsForOutline.antagonists || [])
         for (var _ai = 0; _ai < _antList.length && _ai < 6; _ai++) {
-          _agcRows.push({ stage: _agcTier[_ai] || '反派对手', antagonist: _antList[_ai], powerLevel: '与主角阵营对抗中势力消长', growthPoint: _antList[_ai] + '与主角的博弈随战局推进而起伏，是主角中兴路上递进的对手与考验', threatLevel: _agcThreats[Math.min(_ai, 5)] })
+          var _antObj = _antObjs[_ai] || {}
+          var _antId = String(_antObj.identity || _antObj.background || _antObj.title || '').replace(/[（(][^）)]*[)）]/g, '').split(/[。；;，,]/)[0].trim()
+          if (_antId.length < 4 || _antId.length > 24) _antId = _antId.slice(0, 24)
+          var _gp = _antList[_ai] + (_antId ? '（' + _antId + '）' : '') + _agcPlot[_ai]
+          _agcRows.push({ stage: _agcTier[_ai] || '反派对手', antagonist: _antList[_ai], powerLevel: _agcPower[_ai] || '与主角阵营对抗中势力消长', growthPoint: _gp, threatLevel: _agcThreats[Math.min(_ai, 5)] })
         }
         if (_agcRows.length < 3) {
           _agcRows.push({ stage: '受挫相持', antagonist: _antList[0], powerLevel: '战线拉长、初尝败绩', growthPoint: '被火器新军所阻，由攻转守、内部主战主和之争抬头', threatLevel: '高' })
@@ -22418,6 +23387,10 @@ ${_psFanfictionWorldInfo || `基于你对《${_psIdea.fanfictionSource}》原作
       if (previousData?.bookAnalysis) {
         contextLines.push(...buildBookAnalysisContextParts(previousData.bookAnalysis))
       }
+      // 🔥 章节级仿写骨架：黄金三章/单章循环/节奏/伏笔周期/爽点类型（仅结构参考）
+      var _chapBlueprintParts = buildChapterBlueprintParts(previousData)
+      console.log('[imitate] blueprint=' + (_chapBlueprintParts.length > 0 ? 1 : 0))
+      if (_chapBlueprintParts.length > 0) contextLines.push(..._chapBlueprintParts)
       if (previousData?.idea) {
         var chapIdea = previousData.idea as any
         if (chapIdea.title) {
@@ -22773,7 +23746,15 @@ _chapGenreResult.isModern ? '都市/现代题材：章节必须发生在现代�
     "summary": "章节摘要(150-250字)",
     "phase": "剧情阶段",
     "shuangPoints": ["本章爽点"],
-    "rewards": ["本章实质收益"]
+    "rewards": ["本章实质收益"],
+    "writingGoal": "本章写作目标(20-40字，从本卷核心目标拆解出本章要完成的具体叙事任务)",
+    "foreshadowing": "本章埋设的伏笔(15-40字，必须与后续卷的剧情节点呼应，写具体的人/物/话)",
+    "turningPoint": "本章转折点(15-40字，写本章局势/认知/力量关系的具体改变)",
+    "characterGrowth": "主角或重要配角在本章的成长变化(15-40字，写具体能力/心态/关系变化)",
+    "hook": "本章结尾钩子(15-30字，停在一个具体动作或反常细节上)",
+    "sceneSetting": "本章主场景(5-12字，具体地点，如：肇庆行宫正堂)",
+    "informationGap": "读者知道而剧中人物不知道的信息差(15-40字，制造悬念张力)",
+    "estimatedWords": 本章预计字数(整数，2600-3000)
   }]
 }
 
@@ -22791,6 +23772,13 @@ _chapGenreResult.isModern ? '都市/现代题材：章节必须发生在现代�
 4. 【🔥 防重复强化·最高优先级】每章摘要必须围绕该章独有的剧情事件展开，绝对禁止与其他章节摘要有超过15%的文字重复！每章必须有独特的冲突点、转折点和爽点设计，禁止多章共用同一冲突模式或爽点套路！
 5. 章节标题必须体现本章独特剧情，禁止重复或高度相似
 6. 【🔥 章节标题格式铁律】本卷所有章节的标题必须使用"4字+4字"双段式格式！生成时严格遵循"XXXX，XXXX"结构，每段4字，中间用中文逗号分隔。例如："第X章 觉醒血脉，横扫宗门"、"第X章 突破境界，斩杀强敌"、"第X章 夺得传承，震惊四座"...所有标题都必须是4字+4字双段式
+
+【🔥🔥🔥 深度字段设计要求·最高优先级】每个章节的 writingGoal/foreshadowing/turningPoint/characterGrowth/hook/sceneSetting/informationGap 七个深度字段必须逐章独立设计，严禁用"推动剧情发展""埋下伏笔"之类通用词敷衍：
+1. 所有深度字段必须从本卷的核心目标/开篇节点/高潮节点/卷末钩子与本作的关键剧情节点中推导，写具体的人名、地点、事件、物件
+2. foreshadowing（伏笔）必须能与其后卷的某个关键剧情节点对上（如本作节点「山海关铁血决战」「昆明最后一战」等），前后呼应成网
+3. informationGap（信息差）必须写清"谁知道/谁不知道+这个差距会引发什么"，制造戏剧张力
+4. sceneSetting 必须是贴合本作题材的具体地点（历史题材用真实地名+建筑，如"肇庆行宫正堂""桂林督师府"），严禁"密室""秘境"等通用词
+5. 相邻章节的深度字段内容严禁雷同，每章独立成文
 
 【卷摘要格式要求·禁止套用任何具体示例】
 - 严禁复制任何示例文本，必须根据上方注入的本卷核心目标、开篇剧情、本卷高潮、卷末钩子整合生成
@@ -22810,7 +23798,7 @@ _chapGenreResult.isModern ? '都市/现代题材：章节必须发生在现代�
 6. 爽点密度：每10章内至少包含1次打脸、突破、夺宝、结盟、复仇类正向爽点！
 7. 冲突梯度：小冲突→中型冲突→大型高潮层层递进，禁止长期低烈度拉扯！
 
-【输出格式】纯JSON数组：[{"number": 章节号, "title": "第X章 章节标题", "summary": "150-250字的章节摘要（有场景、有动作、有情绪、有钩子，字数宁多勿少）", "phase": "剧情阶段", "shuangPoints": ["爽点"], "rewards": ["收益"]}]`
+【输出格式】纯JSON数组：[{"number": 章节号, "title": "第X章 章节标题", "summary": "150-250字的章节摘要（有场景、有动作、有情绪、有钩子，字数宁多勿少）", "phase": "剧情阶段", "shuangPoints": ["爽点"], "rewards": ["收益"], "writingGoal": "本章写作目标(20-40字，具体叙事任务)", "foreshadowing": "本章伏笔(15-40字，具体人/物/话)", "turningPoint": "本章转折点(15-40字，具体改变)", "characterGrowth": "本章成长变化(15-40字)", "hook": "本章结尾钩子(15-30字)", "sceneSetting": "本章主场景(5-12字，具体地点)", "informationGap": "读者与人物的信息差(15-40字)", "estimatedWords": "2600-3000"}]`
         chapTemperature = 0.65
         chapMaxTokens = 9000
       }
@@ -22843,20 +23831,72 @@ _chapGenreResult.isModern ? '都市/现代题材：章节必须发生在现代�
       var _chapOutline = (previousData?.outline as any) || {}
       var _chapKP = (previousData?.keyPlots as any) || {}
       // 🔥 卷摘要去重与细分设计：获取当前卷的卷摘要，禁止章节摘要重复卷摘要内容，章节摘要必须基于卷摘要内容进行细分设计
+      // 🔥 QA-8 卷摘要叙事重组器：四字段（核心目标/开篇/高潮/钩子）先剥首尾标点→去重→短句并入邻句→连接词按卷号轮换，
+      //     杜绝「。；」乱标点（来源：字段自带尾标点+join叠加）与「灭族满清。」式 5 字碎句（<10 字并入邻句）
+      var _volSumCleanPart = function(raw: any): string {
+        var s = String(raw == null ? '' : raw).trim()
+        s = s.replace(/^[。；;，,、！？\s·]+/, '').replace(/[。；;，,、！？\s·]+$/, '')
+        s = s.replace(/[；;]/g, '，').replace(/\s+/g, '')
+        return s
+      }
+      var _composeVolNarrative = function(parts: string[], volNum: number): string {
+        var _kept: string[] = []
+        for (var _pi = 0; _pi < parts.length; _pi++) {
+          var p = _volSumCleanPart(parts[_pi])
+          if (p.length < 4) continue
+          var _isDupP = false
+          for (var _qi = 0; _qi < _kept.length; _qi++) {
+            var q = _kept[_qi]
+            if (q.indexOf(p) !== -1 || p.indexOf(q) !== -1) { _isDupP = true; break }
+            var _shared = 0
+            for (var _gi = 0; _gi <= p.length - 4; _gi++) {
+              if (q.indexOf(p.substring(_gi, _gi + 4)) !== -1) { _shared++; _gi += 3 }
+            }
+            if (p.length >= 8 && _shared >= Math.max(2, Math.floor((p.length - 4) / 3))) { _isDupP = true; break }
+          }
+          if (!_isDupP) _kept.push(p)
+        }
+        if (_kept.length === 0) return ''
+        // 短句（<10 字）并入邻句，避免「灭族满清。」式碎句；首句过短时前向并入次句（「为X，」句式）
+        var _merged: string[] = []
+        for (var _mi = 0; _mi < _kept.length; _mi++) {
+          if (_kept[_mi].length < 10 && _merged.length > 0) _merged[_merged.length - 1] += '，' + _kept[_mi]
+          else _merged.push(_kept[_mi])
+        }
+        if (_merged.length > 1 && _merged[0].length < 10) {
+          _merged[1] = '为' + _merged[0] + '，' + _merged[1]
+          _merged.shift()
+        }
+        // 叙事连接词按卷号轮换，避免每卷同模板
+        var _ocIdx = (volNum - 1) % 3
+        var _openConns = ['本卷开篇，', '卷首，', '一开卷，']
+        var _climaxConns = ['随着局势推进，', '中段，', '剧情走向深处，']
+        var _hookConns = ['卷末，', '至卷终，', '收卷之际，']
+        var _out = _merged[0]
+        if (_merged.length > 1) _out += '。' + _openConns[_ocIdx] + _merged[1]
+        if (_merged.length > 2) _out += '。' + _climaxConns[_ocIdx] + _merged[2]
+        if (_merged.length > 3) _out += '。' + _hookConns[_ocIdx] + _merged[3]
+        for (var _ei = 4; _ei < _merged.length; _ei++) _out += '。' + _merged[_ei]
+        return _out + '。'
+      }
+      var _kpExtractVolParts = function(kp: any): string[] {
+        if (!kp) return []
+        var _ps: string[] = []
+        if (kp.coreObjective) _ps.push(String(kp.coreObjective))
+        if (kp.openingNode && kp.openingNode.event) _ps.push(String(kp.openingNode.event))
+        if (kp.climaxNode && kp.climaxNode.event) _ps.push(String(kp.climaxNode.event))
+        if (kp.endHook && kp.endHook.content) _ps.push(String(kp.endHook.content))
+        return _ps
+      }
       var _currentVolSummary = ''
       if (_chapKP.volumes && Array.isArray(_chapKP.volumes)) {
         var _currentVolKP = _chapKP.volumes[volNum - 1]
         if (_currentVolKP) {
-          // 🔥 优先使用summary字段，若为空则从核心目标+开篇节点+高潮节点+卷末钩子去重组合生成
+          // 🔥 优先使用summary字段（#188：出口净化后才采纳——句级去重/模板腔/标点修复），若为空则从核心目标+开篇节点+高潮节点+卷末钩子叙事重组
           if (_currentVolKP.summary && _currentVolKP.summary.length > 20) {
-            _currentVolSummary = _currentVolKP.summary
+            _currentVolSummary = _sanitizeVolSummaryText(_currentVolKP.summary) || _currentVolKP.summary
           } else {
-            var _volSumParts: string[] = []
-            if (_currentVolKP.coreObjective && String(_currentVolKP.coreObjective).length > 5) _volSumParts.push(String(_currentVolKP.coreObjective))
-            if (_currentVolKP.openingNode && _currentVolKP.openingNode.event && String(_currentVolKP.openingNode.event).length > 5 && _volSumParts.indexOf(String(_currentVolKP.openingNode.event)) === -1) _volSumParts.push(String(_currentVolKP.openingNode.event))
-            if (_currentVolKP.climaxNode && _currentVolKP.climaxNode.event && String(_currentVolKP.climaxNode.event).length > 5 && _volSumParts.indexOf(String(_currentVolKP.climaxNode.event)) === -1) _volSumParts.push(String(_currentVolKP.climaxNode.event))
-            if (_currentVolKP.endHook && _currentVolKP.endHook.content && String(_currentVolKP.endHook.content).length > 5 && _volSumParts.indexOf(String(_currentVolKP.endHook.content)) === -1) _volSumParts.push(String(_currentVolKP.endHook.content))
-            if (_volSumParts.length > 0) _currentVolSummary = _volSumParts.join('。') + '。'
+            _currentVolSummary = _sanitizeVolSummaryText(_composeVolNarrative(_kpExtractVolParts(_currentVolKP), volNum)) || _composeVolNarrative(_kpExtractVolParts(_currentVolKP), volNum)
           }
         }
       }
@@ -22919,6 +23959,8 @@ _chapGenreResult.isModern ? '都市/现代题材：章节必须发生在现代�
       userContent += '\n   - 禁止使用"关键剧情""剧情发展""章节内容""待生成""高潮迭起""转折点"等无意义懒标题！'
       userContent += '\n   - 禁止所有章节使用相同或高度相似的标题！每章标题必须不同！'
       userContent += '\n   - 章节标题必须使用"4字+4字"双段式格式（逗号分隔），画面感强，只抓本章核心一幕，格式必须统一为"XXXX，XXXX"'
+      userContent += '\n   - 【🔥 字数统一铁律（#190）】同一卷内所有章节标题格式与字数必须完全一致：一律为 4字+逗号+4字（总长9字符），同卷内禁止出现任何长度不一的标题；所有标题必须从本章摘要中提炼（核心动作/核心冲突/核心转折），禁止无语义编号（如"第N卷·卷名·第M节"）'
+      userContent += '\n   - 【🔥 摘要反模板铁律（#190）】章节摘要禁止出现"承接第N卷…主线，按本章章纲推进剧情""本章讲述…的发展"等零信息模板句；每章摘要必须写出：本章具体事件（谁在哪做了什么）+ 冲突/阻力 + 章末钩子，且必须承接卷摘要中该卷主线在本章区段的推进位置'
       userContent += '\n\n【🔥🔥🔥🔥🔥 章节标题命名范式·基于本作题材定位·最高优先级】'
       userContent += '\n章节标题是吸引读者点击的第一要素！必须达到爆款级别，按以下命名范式（基于本作题材定位选择）：'
       userContent += '\n'
@@ -23061,7 +24103,8 @@ _chapGenreResult.isModern ? '都市/现代题材：章节必须发生在现代�
       }
 
       userContent += '\n\n输出纯JSON对象，格式：'
-      userContent += '\n{"volumeName": "卷名", "volumeSummary": "卷摘要", "chapters": [{"number": 章节号, "title": "第X章 章节标题", "summary": "章节摘要", "phase": "剧情阶段", "shuangPoints": ["本章爽点"], "rewards": ["本章收益"]}]}'
+      userContent += '\n{"volumeName": "卷名", "volumeSummary": "卷摘要", "chapters": [{"number": 章节号, "title": "第X章 章节标题", "summary": "章节摘要", "phase": "剧情阶段", "shuangPoints": ["本章爽点"], "rewards": ["本章收益"], "writingGoal": "本章写作目标(具体叙事任务)", "foreshadowing": "本章伏笔(具体人/物/话，呼应后续剧情节点)", "turningPoint": "本章转折点(具体改变)", "characterGrowth": "本章成长变化", "hook": "本章结尾钩子", "sceneSetting": "本章主场景(具体地点)", "informationGap": "读者与人物的信息差", "estimatedWords": "2600-3000"}]}'
+      userContent += '\n\n【🔥 深度字段铁律】以上 writingGoal/foreshadowing/turningPoint/characterGrowth/hook/sceneSetting/informationGap 七个深度字段每章必须独立设计，从本卷核心目标/开篇/高潮/卷末钩子与关键剧情节点推导，写具体人名地点事件，严禁"推动剧情发展""埋下伏笔"等通用空话，相邻章节严禁雷同。'
       if (contextLines.length > 0) {
         userContent = contextLines.join('\n') + keyPlotInfo + '\n\n---\n\n' + userContent
       }
@@ -23216,12 +24259,8 @@ _chapGenreResult.isModern ? '都市/现代题材：章节必须发生在现代�
       if ((!_volSummary || _volSummary.length < 20) && _chapKP.volumes && Array.isArray(_chapKP.volumes)) {
         var _earlyVolKP = _chapKP.volumes[volNum - 1]
         if (_earlyVolKP) {
-          var _earlyParts: string[] = []
-          if (_earlyVolKP.coreObjective && String(_earlyVolKP.coreObjective).length > 5) _earlyParts.push(String(_earlyVolKP.coreObjective))
-          if (_earlyVolKP.openingNode && _earlyVolKP.openingNode.event && String(_earlyVolKP.openingNode.event).length > 5 && _earlyParts.indexOf(String(_earlyVolKP.openingNode.event)) === -1) _earlyParts.push(String(_earlyVolKP.openingNode.event))
-          if (_earlyVolKP.climaxNode && _earlyVolKP.climaxNode.event && String(_earlyVolKP.climaxNode.event).length > 5 && _earlyParts.indexOf(String(_earlyVolKP.climaxNode.event)) === -1) _earlyParts.push(String(_earlyVolKP.climaxNode.event))
-          if (_earlyVolKP.endHook && _earlyVolKP.endHook.content && String(_earlyVolKP.endHook.content).length > 5 && _earlyParts.indexOf(String(_earlyVolKP.endHook.content)) === -1) _earlyParts.push(String(_earlyVolKP.endHook.content))
-          if (_earlyParts.length > 0) _volSummary = _earlyParts.join('。') + '。'
+          // 🔥 QA-8：叙事重组（清洗+去重+短句并入），不再简单 join
+          _volSummary = _sanitizeVolSummaryText(_composeVolNarrative(_kpExtractVolParts(_earlyVolKP), volNum)) || _composeVolNarrative(_kpExtractVolParts(_earlyVolKP), volNum)
         }
       }
 
@@ -23619,6 +24658,8 @@ _chapGenreResult.isModern ? '都市/现代题材：章节必须发生在现代�
         var chNum = batchStart + ci
         var chData = chapterList[ci] || {}
         var chTitle = (chData && chData.title) || ('' + chNum + '')
+        // 🔥 2026-09-06（#133）：LLM 偶尔在 title 里自带“第N章”前缀，剥离后再统一重建，避免存储格式不一致
+        chTitle = String(chTitle).replace(/^第\s*\d+\s*章[\s·:：]*/, '').trim() || chTitle
         var chSummary = (chData && chData.summary) || ''
 
         // 检查重复元素（改进：同时检查全局历史）
@@ -23678,6 +24719,23 @@ _chapGenreResult.isModern ? '都市/现代题材：章节必须发生在现代�
         // 摘要太短、内容不合格或触发重复，使用 fallback（低于80字视为不合格）
         // 🔥 2026-08-30 问题6：保留 LLM 依本作剧情(keyPlots/大纲/卷纲)生成的章节摘要，不再因"缺场景动词"等启发式把正常摘要替换成通用场景模板池。
         //   仅当摘要基本为空(<40字)时，才用基于前序设定的兜底补一句；不再拼接 _sceneDetailPool 通用细节。
+        // 🔥 2026-09-07（#154）0漂移/0重复摘要兜底升级：优先用本章 LLM 真实深度字段（writingGoal/turningPoint/hook）
+        //   确定性拼装摘要——每章唯一、严格贴合本卷 keyPlot、零模板零漂移。旧的 _generateDynamicChapterSummary
+        //   场景模板池是仙侠画面（南天门/三界六道/清气漩涡），历史/都市等题材 fallback 到 early_eastern 池即跨题材漂移，
+        //   且种子选择跨卷复用同一模板（实测 9 卷重生成后 31 个跨卷重复前缀）。模板池仅剩最后兜底作用。
+        if (!chSummary || chSummary.trim().length < 40) {
+          var _wg = String(chData.writingGoal || '').trim().replace(/[。.]$/, '')
+          var _tp = String(chData.turningPoint || '').trim().replace(/[。.]$/, '')
+          var _hk = String(chData.hook || '').trim().replace(/[。.]$/, '')
+          var _ss = String(chData.sceneSetting || '').trim().replace(/[。.]$/, '')
+          if (_wg && _wg.length >= 12 && !/随正文生成|待生成|占位/.test(_wg)) {
+            var _composed = _wg
+            if (_tp && _tp !== _wg && !/随正文生成/.test(_tp)) _composed += '，' + _tp
+            if (_composed.length < 40 && _hk && _hk !== _tp && !/随正文生成/.test(_hk)) _composed += '，章末留下悬念：' + _hk
+            if (_composed.length < 40 && _ss.length >= 6 && !/随正文生成/.test(_ss)) _composed = _ss.slice(0, 30) + '。' + _composed
+            chSummary = _composed + '。'
+          }
+        }
         if (!chSummary || chSummary.trim().length < 40) {
           var _dynChNum = chNum + _dynSeedBase + ci * 3
           chSummary = _generateDynamicChapterSummary(_dynChNum, volNum, _chapProtagonistName, _chapGFName, _chapIsWestern, _chapIsHonghuang, cleanedVolName || '', cleanedVolObj || '', _chapIsScifi)
@@ -23717,8 +24775,20 @@ _chapGenreResult.isModern ? '都市/现代题材：章节必须发生在现代�
         }
 
         processedChapters.push({
+          // 🔥 2026-09-06 修复（#131）：先整体保留 LLM 原始章节对象（含 phase/shuangPoints/rewards/
+          //    writingGoal/foreshadowing/turningPoint/characterGrowth/hook/sceneSetting/informationGap/
+          //    estimatedWords 等深度字段），再覆盖规范化字段。历史实现只挑 4 个字段重组，
+          //    LLM 按卷剧情设计的深度字段在这里被整体丢弃，下游词池兜底全是通用空话。
+          ...(chData && typeof chData === 'object' ? chData : {}),
           number: chNum,
+          // 🔥 2026-09-06 修复（#130）：前端 StepChapters/回填逻辑只读 `chapterNumber`，
+          //    后端只输出 `number` → 恒为 undefined → 第 2 卷起 localIdx 计算为负、整卷章节被跳过，
+          //    章节标题/摘要永远停在占位值。这里两个字段同时输出，彻底消除命名不一致。
+          chapterNumber: chNum,
           title: chTitle,
+          // 🔥 2026-09-07（#133+）终审终稿：保存 LLM 原始标题，供 _finalizeChapterTitles 作为「① 原题分句」候选，
+          //   避免被前面各清洗/去重环节覆盖后拿不到原题。
+          _llmTitle: chTitle,
           summary: chSummary,
         })
       }
@@ -23751,6 +24821,37 @@ _chapGenreResult.isModern ? '都市/现代题材：章节必须发生在现代�
           var _identical = (_sumI === _sumJ) || (_sumI.length > 30 && _sumJ.length > 30 && _sumI.substring(0, 30) === _sumJ.substring(0, 30))
           var _sim = _textSim(_sumI, _sumJ)
           if (_identical || _sim > 0.15) {
+            // 🔥 2026-09-07（#155）去重替换优先用本章深度字段「变体」重组（暗线/信息差/成长——与 #154 首拼装
+            //   用的 writingGoal+turningPoint 不同字段），杜绝仙侠场景模板池回流到正文规划。
+            //   实测（V3 重生成插桩）：LLM 摘要仅 33-39 字 → #154 拼装生效 → 同卷句式相近 _textSim>0.15
+            //   → 旧逻辑用模板池候选替换 → 模板全量回流。变体足够不同（<0.15）才采用，否则仍走模板候选。
+            var _pdJ = processedChapters[_j]
+            var _fsJ = String(_pdJ.foreshadowing || '').trim().replace(/[。.]$/, '')
+            var _igJ = String(_pdJ.informationGap || '').trim().replace(/[。.]$/, '')
+            var _cgJ = String(_pdJ.characterGrowth || '').trim().replace(/[。.]$/, '')
+            var _ssJ = String(_pdJ.sceneSetting || '').trim().replace(/[。.]$/, '')
+            var _wgJ = String(_pdJ.writingGoal || '').trim().replace(/[。.]$/, '')
+            var _deepOk = function (s2: string) { return s2 && !/随正文生成|待生成|占位|推动剧情发展/.test(s2) }
+            if (_wgJ && _deepOk(_wgJ)) {
+              var _deepVariant = _wgJ
+              if (_deepOk(_fsJ)) _deepVariant += '。本章暗线：' + _fsJ
+              if (_deepOk(_igJ)) _deepVariant += '，' + _igJ
+              if (_deepOk(_cgJ)) _deepVariant += '。' + _cgJ
+              if (_deepVariant.length < 40 && _ssJ.length >= 4 && _deepOk(_ssJ)) _deepVariant = _ssJ + '。' + _deepVariant
+              _deepVariant += '。'
+              if (_deepVariant.length >= 40) {
+                var _varMaxSim = 0
+                for (var _vi2 = 0; _vi2 < processedChapters.length; _vi2++) {
+                  if (_vi2 === _j) continue
+                  var _vs2 = _textSim(_deepVariant, processedChapters[_vi2].summary || '')
+                  if (_vs2 > _varMaxSim) _varMaxSim = _vs2
+                }
+                if (_varMaxSim < 0.15) {
+                  processedChapters[_j].summary = _deepVariant
+                  continue
+                }
+              }
+            }
             // 🔥 尝试多次生成不同的替换摘要，挑选与所有已有章节最不相似的一个
             var _bestReplaceSum = ''
             var _bestMinSim = 1.0
@@ -23821,8 +24922,9 @@ _chapGenreResult.isModern ? '都市/现代题材：章节必须发生在现代�
               // 名词必须在动词后面10字以内出现（标题要紧邻）
               if (_afterVerb.indexOf(_noun) >= 0 && _afterVerb.indexOf(_noun) <= 8) {
                 var _combo = _verb + _noun
-                if (_combo.length >= numChars - 1 && _combo.length <= numChars + 1) {
-                  _titleCandidates.push(_combo.substring(0, numChars))
+                // 🔥 只收恰好 numChars 的完整动宾组合，禁止 substring 盲截（截断会产生「洞察李定」类残句）
+                if (_combo.length === numChars) {
+                  _titleCandidates.push(_combo)
                 }
               }
             }
@@ -23834,11 +24936,9 @@ _chapGenreResult.isModern ? '都市/现代题材：章节必须发生在现代�
         var _voMatch
         while ((_voMatch = _voPattern.exec(_sum)) !== null) {
           var _voCombo = _voMatch[1] + _voMatch[2]
-          if (_voCombo.length >= numChars - 1 && _voCombo.length <= numChars + 2) {
-            var _voTitle = _voCombo.substring(0, numChars)
-            if (_titleCandidates.indexOf(_voTitle) === -1) {
-              _titleCandidates.push(_voTitle)
-            }
+          // 🔥 只收恰好 numChars 的完整动宾组合，禁止 substring 盲截
+          if (_voCombo.length === numChars && _titleCandidates.indexOf(_voCombo) === -1) {
+            _titleCandidates.push(_voCombo)
           }
         }
 
@@ -23920,16 +25020,24 @@ _chapGenreResult.isModern ? '都市/现代题材：章节必须发生在现代�
         var _rawTitle = _procChapter.title || ''
         var _chSummary = _procChapter.summary || ''
         
-        // 🔥🔥🔥 关键修复：优先根据章节摘要内容生成标题，而不是简单清洗旧标题
+        // 🔥 优先信任 LLM 自己给出的标题：清洗「第X章」前缀后若为完整标题核心且不与已有标题重复，直接采用；
+        //   仅在无效/重复时才用摘要重造，避免「造词」覆盖 LLM 的好标题（残句/串味根因之一）。
         var _cleanedTitle = ''
-
-        // 1. 先尝试从摘要中提取标题（最高优先级）
-        var _genTitle = _generateTitleFromSummary(_chSummary, _titleCharCount)
-        if (_genTitle && _genTitle.length >= 2) {
-          _cleanedTitle = _genTitle
+        var _trustRawTitle = false
+        var _rawTitleCore = String(_rawTitle)
+          .replace(/第\d+章\s*/g, '')
+          .replace(/第[一二三四五六七八九十百千\d]+章\s*/g, '')
+          .replace(/^\d+\s*/, '')
+          .replace(/^(关键剧情|剧情发展|章节内容|待生成|高潮迭起|转折点|剧情高潮|正文)[\s：:·]*/g, '')
+          .trim()
+        var _rawTitleKey = _rawTitleCore.replace(/[^\u4e00-\u9fff，]/g, '')
+        if (_isCompleteTitleCore(_rawTitleCore) && !_seenTitles.has(_rawTitleKey)) {
+          _cleanedTitle = _rawTitleCore
+          _trustRawTitle = true
         } else {
-          // 2. 如果无法从摘要生成，则清洗原有标题
-          _cleanedTitle = _rawTitle
+          // 无法信任原题 → 从摘要重造
+          var _genTitle = _generateTitleFromSummary(_chSummary, _titleCharCount)
+          _cleanedTitle = (_genTitle && _genTitle.length >= 2) ? _genTitle : _rawTitle
         }
 
         // 🔥 修复双重"第X章"前缀bug：无论标题来源（_generateTitleFromSummary或_rawTitle），
@@ -23974,8 +25082,9 @@ _chapGenreResult.isModern ? '都市/现代题材：章节必须发生在现代�
 
         // 🔥 P2.11.1 修复：将单段标题转换为4字+4字双段式格式
         // 检查标题是否已经是4字+4字双段式格式（含中文逗号）
+        // 🔥 信任原题时（_trustRawTitle）跳过双段式强转，避免把 LLM 的 4 字好标题塞进「…，震惊四座」。
         var _isDualFormat = /^[^\s，,]{4}[，,][^\s，,]{4}$/.test(_cleanedTitle)
-        if (!_isDualFormat && _cleanedTitle.length >= 2) {
+        if (!_trustRawTitle && !_isDualFormat && _cleanedTitle.length >= 2) {
           // 移除现有标点（除中文逗号外）
           var _titleForSplit = _cleanedTitle.replace(/[，。！？、；：""''（）《》\s]/g, '')
           if (_titleForSplit.length >= 8) {
@@ -24015,9 +25124,10 @@ _chapGenreResult.isModern ? '都市/现代题材：章节必须发生在现代�
           }
         }
 
-        // 4. 调整标题字数到本卷统一字数
+        // 4. 调整标题字数到本卷统一字数（🔥 Bug修复：按边界安全裁剪，不再词中腰斩）
         if (_cleanedTitle.length > _titleCharCount + 2) {
-          _cleanedTitle = _cleanedTitle.substring(0, _titleCharCount)
+          var _trimmed = _safeTrimTitle(_cleanedTitle, _titleCharCount)
+          if (_trimmed) _cleanedTitle = _trimmed
         }
         
         // 5. 重新添加唯一的"第X章"前缀
@@ -24163,16 +25273,9 @@ _chapGenreResult.isModern ? '都市/现代题材：章节必须发生在现代�
         // 调用方对空返回值有现成的fallback逻辑（保留原标题或追加差异化词）
         if (!summary || summary.length < 5) return ''
         
-        // 🔥 确定目标字数（4/5/6字），优先使用传入的targetLen，否则根据卷号决定（整卷统一）
-        var _targetLen = targetLen || 5 // 默认5字，更符合网文标题习惯
-        if (!targetLen) {
-          // 根据卷号确定字数，同一卷保持一致
-          var _volNumForTitle = Math.ceil(chapterNum / (chaptersPerVolume || 30))
-          var _titleLenHash = (_volNumForTitle + _dynSeedBase) % 3
-          if (_titleLenHash === 0) _targetLen = 4
-          else if (_titleLenHash === 1) _targetLen = 5
-          else _targetLen = 6
-        }
+        // 🔥 确定目标字数：优先使用传入的 targetLen；未传入时【确定性】取 4（与第 1 卷一致）。
+        //   原实现按 (卷号+种子)%3 逐章随机取 4/5/6 字，是线上标题字数混乱（4~8 混杂）的根因之一，已移除。
+        var _targetLen = targetLen || 4
         
         var s = summary.trim()
         // 清理标点和无关字符
@@ -24210,6 +25313,20 @@ _chapGenreResult.isModern ? '都市/现代题材：章节必须发生在现代�
           // 检查首位字符是否为叙述性单字（如"的"、"了"等）
           if (_narrativeSingleChars.indexOf(text.charAt(0)) >= 0) return true
           if (_narrativeSingleChars.indexOf(text.charAt(text.length - 1)) >= 0) return true
+          // 🔥 QA-8 章节标题补修：拒绝含代词/语气词的半截叙述（如「签到系统在他」——旧版末字「他」不在单字黑名单导致漏放）
+          var _badAnyChars = ['他', '她', '它', '们', '吧', '吗', '呢', '啊', '呀', '哦', '啦', '嘛', '么']
+          for (var _bai = 0; _bai < _badAnyChars.length; _bai++) {
+            if (text.indexOf(_badAnyChars[_bai]) >= 0) return true
+          }
+          // 「在」字白名单（存在/现在/意在/在望等固定词组放行，其余「XX在YY」结构均为叙述句）
+          var _okZaiPatterns = ['存在', '现在', '意在', '在望', '在所', '事在人为', '危在旦夕', '箭在弦上']
+          if (text.indexOf('在') >= 0) {
+            var _isOkZai2 = false
+            for (var _ozi = 0; _ozi < _okZaiPatterns.length; _ozi++) {
+              if (text.indexOf(_okZaiPatterns[_ozi]) >= 0) { _isOkZai2 = true; break }
+            }
+            if (!_isOkZai2) return true
+          }
           // 🔥 Bug修复：检查标题中间是否包含"的"字（叙述性标志）
           // 排除固定词组：目的、真的、似的、等的、目的性
           if (text.indexOf('的') >= 0) {
@@ -24282,36 +25399,10 @@ _chapGenreResult.isModern ? '都市/现代题材：章节必须发生在现代�
           }
         }
 
-        // 策略2&3：从摘要中提取动宾结构短语（严格模式：短语必须以动词开头，不能是叙述片段）
-        // 🔥 Bug修复：不再从前N字盲目截取，而是搜索以动词开头的连续短语
-        var cleanText = s.replace(/[^\u4e00-\u9fff]/g, '')
-        // 构建动词起始2字词集合（用于快速判断短语是否以动词开头）
-        var _verb2CharStarts: {[key: string]: boolean} = {}
-        for (var _vci = 0; _vci < actionWords.length; _vci++) {
-          if (actionWords[_vci].length >= 2) {
-            _verb2CharStarts[actionWords[_vci].substring(0, 2)] = true
-          }
-        }
-        // 遍历文本，寻找以动词开头的连续_targetLen字短语
-        if (cleanText.length >= _targetLen) {
-          for (var ci = 0; ci <= cleanText.length - _targetLen; ci++) {
-            var frag = cleanText.substring(ci, ci + _targetLen)
-            // 首2字必须是动词起始
-            var _fragStart = frag.substring(0, 2)
-            if (!_verb2CharStarts[_fragStart]) continue
-            // 必须通过叙述性片段检测
-            if (_isNarrativeFragment(frag)) continue
-            // 不能是纯地名/场景描写（含"之滨""之畔""之巅""山脚""山顶""洞中"等）
-            var _placePatterns = ['之滨', '之畔', '之巅', '之上', '之下', '之中', '之间', '山脚', '山顶', '洞中', '谷中', '林中', '海中', '空中', '天上', '地下', '门前', '门外', '殿内', '殿外', '宫内', '宫外']
-            var _isPlace = false
-            for (var _ppi = 0; _ppi < _placePatterns.length; _ppi++) {
-              if (frag.indexOf(_placePatterns[_ppi]) !== -1) { _isPlace = true; break }
-            }
-            if (_isPlace) continue
-            candidates.push(frag)
-            if (candidates.length > 10) break
-          }
-        }
+        // 🔥 Bug修复（章节标题残句）：原「策略2&3」在裸文本上滑窗，凡窗口前2字命中动词前缀即收为候选，
+        //   产出「发现海面下有巨大」「修行室墙壁上刻满」这类原始叙述切片。已整体删除。
+        //   标题候选仅保留「策略1（动词+名词，带 _isNarrativeFragment 黑名单）」与下方题材兜底池，
+        //   残句不再进入候选；若策略1无命中则走兜底池（干净、不截断）。
 
         // 过滤掉重复和无效候选
         var uniqueCands: string[] = []
@@ -24417,7 +25508,7 @@ _chapGenreResult.isModern ? '都市/现代题材：章节必须发生在现代�
           if (_prevTitle && _title && _title === _prevTitle) {
             _round1Issues++
             // 标题完全重复：生成一个新标题（从本章摘要提取关键词）
-            var _newTitle = generateChapterTitleFromSummary(_sum, _r1i + batchStart)
+            var _newTitle = generateChapterTitleFromSummary(_sum, _r1i + batchStart, _titleCharCount)
             if (_newTitle && _newTitle !== _prevTitle) {
               _ch.title = _newTitle
               _title = _ch.title
@@ -24432,7 +25523,7 @@ _chapGenreResult.isModern ? '都市/现代题材：章节必须发生在现代�
             var _tSim = _textSim(_title, _prevTs)
             if (_tSim > 0.7) {
               _round1Issues++
-              var _newTitle2 = generateChapterTitleFromSummary(_sum, _r1i + batchStart)
+              var _newTitle2 = generateChapterTitleFromSummary(_sum, _r1i + batchStart, _titleCharCount)
               if (_newTitle2 && _newTitle2 !== _prevTs) {
                 _ch.title = _newTitle2
                 _title = _ch.title
@@ -24455,7 +25546,7 @@ _chapGenreResult.isModern ? '都市/现代题材：章节必须发生在现代�
               _sum = _replaceSum
               _ch.summary = _sum
               // 同时更新标题
-              var _newTitle3 = generateChapterTitleFromSummary(_sum, _r1i + batchStart)
+              var _newTitle3 = generateChapterTitleFromSummary(_sum, _r1i + batchStart, _titleCharCount)
               if (_newTitle3) _ch.title = _newTitle3
             } else {
               // fallback：追加细节
@@ -24481,7 +25572,7 @@ _chapGenreResult.isModern ? '都市/现代题材：章节必须发生在现代�
               if (_replaceSum2 && typeof _replaceSum2 === 'string' && _replaceSum2.length > 30 && _textSim(_replaceSum2, _exSum) < 0.15) {
                 _sum = _replaceSum2
                 _ch.summary = _sum
-                var _newTitle4 = generateChapterTitleFromSummary(_sum, _r1i + batchStart)
+                var _newTitle4 = generateChapterTitleFromSummary(_sum, _r1i + batchStart, _titleCharCount)
                 if (_newTitle4) _ch.title = _newTitle4
               } else {
                 // fallback：追加不同细节
@@ -24615,31 +25706,15 @@ _chapGenreResult.isModern ? '都市/现代题材：章节必须发生在现代�
         var _volChars = (previousData?.characters as any) || {}
         var _protagName = _volChars.protagonist?.name || '主角'
 
-        // 🔥🔥🔥 最高优先级：采用关键剧情节点中分卷剧情结构的核心目标+开篇节点+高潮节点+卷末钩子（去重）组合生成卷摘要
+        // 🔥🔥🔥 最高优先级：采用关键剧情节点中分卷剧情结构的核心目标+开篇节点+高潮节点+卷末钩子（去重）叙事重组
         var _volKpParts: string[] = []
         if (cleanedVolObj && cleanedVolObj.length > 10) _volKpParts.push(cleanedVolObj)
         if (cleanedVolOpening && cleanedVolOpening.length > 10 && _volKpParts.indexOf(cleanedVolOpening) === -1) _volKpParts.push(cleanedVolOpening)
         if (cleanedVolClimax && cleanedVolClimax.length > 10 && _volKpParts.indexOf(cleanedVolClimax) === -1) _volKpParts.push(cleanedVolClimax)
         if (cleanedVolEndHook && cleanedVolEndHook.length > 10 && _volKpParts.indexOf(cleanedVolEndHook) === -1) _volKpParts.push(cleanedVolEndHook)
-        // 去重：移除高度相似的片段
-        var _dedupKpParts: string[] = []
-        for (var _kpi2 = 0; _kpi2 < _volKpParts.length; _kpi2++) {
-          var _partCandidate = _volKpParts[_kpi2]
-          var _isDup = false
-          for (var _dpi = 0; _dpi < _dedupKpParts.length; _dpi++) {
-            var _existingPart = _dedupKpParts[_dpi]
-            // 计算重合度：如果两个片段有超过40%的字符重合，视为重复
-            var _overlap = 0
-            var _minLen = Math.min(_partCandidate.length, _existingPart.length)
-            for (var _ci2 = 0; _ci2 < _partCandidate.length - 4; _ci2 += 4) {
-              if (_existingPart.indexOf(_partCandidate.substring(_ci2, _ci2 + 4)) !== -1) _overlap += 4
-            }
-            if (_minLen > 0 && _overlap / _minLen > 0.4) { _isDup = true; break }
-          }
-          if (!_isDup) _dedupKpParts.push(_partCandidate)
-        }
-        if (_dedupKpParts.length > 0) {
-          _volSummary = _dedupKpParts.join('。') + '。'
+        // 🔥 QA-8：_composeVolNarrative 内部已做清洗+去重+短句并入+连接词轮换，替代原 join('。') 拼接
+        if (_volKpParts.length > 0) {
+          _volSummary = _sanitizeVolSummaryText(_composeVolNarrative(_volKpParts, volNum)) || _composeVolNarrative(_volKpParts, volNum)
         }
 
         // 如果关键剧情节点信息不足，使用LLM返回的卷摘要
@@ -24652,18 +25727,10 @@ _chapGenreResult.isModern ? '都市/现代题材：章节必须发生在现代�
           var _volKeyPlots = (previousData.keyPlots as any)?.volumes || []
           if (_volKeyPlots[volNum - 1]) {
             var _vkPlot = _volKeyPlots[volNum - 1]
-            var _vkParts: string[] = []
-            if (_vkPlot.coreObjective) _vkParts.push(String(_vkPlot.coreObjective))
-            if (_vkPlot.openingNode && _vkPlot.openingNode.event) _vkParts.push(String(_vkPlot.openingNode.event))
-            if (_vkPlot.climaxNode && _vkPlot.climaxNode.event) _vkParts.push(String(_vkPlot.climaxNode.event))
-            if (_vkPlot.endHook && _vkPlot.endHook.content) _vkParts.push(String(_vkPlot.endHook.content))
-            // 去重
-            var _vkDedup: string[] = []
-            for (var _vkpi = 0; _vkpi < _vkParts.length; _vkpi++) {
-              if (_vkParts[_vkpi].length > 10 && _vkDedup.indexOf(_vkParts[_vkpi]) === -1) _vkDedup.push(_vkParts[_vkpi])
-            }
-            if (_vkDedup.length > 0) {
-              _volSummary = _vkDedup.join('。') + '。'
+            // 🔥 QA-8：叙事重组（清洗+去重+短句并入），不再简单 join
+            var _vkNarr = _sanitizeVolSummaryText(_composeVolNarrative(_kpExtractVolParts(_vkPlot), volNum)) || _composeVolNarrative(_kpExtractVolParts(_vkPlot), volNum)
+            if (_vkNarr && _vkNarr.length >= 40) {
+              _volSummary = _vkNarr
             } else if (_vkPlot.summary) {
               _volSummary = String(_vkPlot.summary).substring(0, 180)
             }
@@ -24688,7 +25755,19 @@ _chapGenreResult.isModern ? '都市/现代题材：章节必须发生在现代�
           var _volGFName = ((previousData?.powerSystem as any)?.protagonistAbility?.name) || '金手指'
           _volSummary = _protagName + '在本卷围绕' + (cleanedVolObj || '主线剧情的推进') + '展开，凭借' + _volGFName + '的力量应对新的挑战。'
         }
-        
+
+        // 🔥 2026-09-06（#133 R2）设计稿优先·最终覆盖：关键剧情节点「分卷剧情结构」的 summary（≥60字）
+        //   在所有分支与兜底之后最终生效，绝对不允许被通用兜底模板/扩展句库拼接覆盖。
+        //   R1 教训：设计稿块放在兜底之前时，兜底条件 length<100（设计稿93字）会再次触发，
+        //   把设计稿覆盖成“在本卷围绕…展开”的空话 —— 设计稿覆盖必须放在兜底之后。
+        {
+          var _designVolSum = (((previousData?.keyPlots as any)?.volumes || [])[volNum - 1] || {}).summary
+          if (_designVolSum && String(_designVolSum).trim().length >= 60) {
+            _volSummary = String(_designVolSum).trim()
+            console.log('[chapters] 卷摘要最终采用分卷剧情结构设计稿（#133R2），长度=' + _volSummary.length)
+          }
+        }
+
         _volSummary = cleanCliches(_volSummary)
 
         // 🔥 卷摘要字数校验：必须120-180字
@@ -24797,6 +25876,8 @@ _chapGenreResult.isModern ? '都市/现代题材：章节必须发生在现代�
           }
         }
         _volSummary = _uniqueSentences.join('。') + '。'
+        // 🔥 QA-8：杜绝「。；」类乱标点（句号后不得再接分号；残留分号统一降为逗号）
+        _volSummary = _volSummary.replace(/[。！？]+[；;]+/g, '。').replace(/[；;]/g, '，')
         
         // 检测并移除重复的段落模式（如连续重复的相同事件描述）
         var _volLen = _volSummary.length
@@ -25039,68 +26120,17 @@ _chapGenreResult.isModern ? '都市/现代题材：章节必须发生在现代�
         console.log('[chapters] 🔥章节去重校验完成: 检查了' + processedChapters.length + '个章节，卷摘要共' + _volSentences.length + '个核心句子')
       }
 
-      // 🔥🔥🔥 强制统一章节标题字数：整卷所有章节标题必须字数一致（4/5/6字）
-      // 🔥 Bug修复：使用前面确定的_titleCharCount作为基准，而非重新从processedChapters计算
-      var _unifiedTitleLen = _titleCharCount
-      if (processedChapters.length > 0) {
-        // 🔥 优先使用已确定的_titleCharCount（从previousData或同卷已有章节推断）
-        // 🔥🔥🔥 问题3修复：只有当_titleCharCount不是来自用户配置时，才从AI标题推断
-        // 根因：原代码用 _unifiedTitleLen === 5 判断"是否是默认值"，无法区分"前端明确传5字"和"默认5字"
-        // 导致AI生成的4字标题覆盖了用户配置的5字，标题字数不统一
-        if (!_titleCharCountFromUser && _unifiedTitleLen === 5) {
-          for (var _uti = 0; _uti < processedChapters.length; _uti++) {
-            var _utRaw = processedChapters[_uti].title || ''
-            var _utCore = _utRaw.replace(/第\d+章\s*/g, '').trim()
-            var _utCoreLen = _utCore.replace(/[^\u4e00-\u9fff]/g, '').length
-            if (_utCoreLen >= 4 && _utCoreLen <= 6) {
-              _unifiedTitleLen = _utCoreLen
-              break
-            }
-          }
-        }
-        console.log('[chapters] 🔥本卷统一标题字数: ' + _unifiedTitleLen + '字 (基准来自_titleCharCount=' + _titleCharCount + ', fromUser=' + _titleCharCountFromUser + ')')
-        
-        // 重新生成所有章节标题，确保字数一致
-        var _unifiedUsedTitles = new Set<string>()
-        for (var _ui = 0; _ui < processedChapters.length; _ui++) {
-          var _uch = processedChapters[_ui]
-          var _uchNum = _uch.chapterNumber || (_ui + batchStart)
-          var _utCore = (_uch.title || '').replace(/第\d+章\s*/g, '').trim()
-          var _utCoreClean = _utCore.replace(/[^\u4e00-\u9fff]/g, '')
-          
-          var _newTitleCore = ''
-          // 如果现有标题字数符合要求且不重复，直接使用
-          if (_utCoreClean.length === _unifiedTitleLen && !_unifiedUsedTitles.has(_utCoreClean)) {
-            _newTitleCore = _utCoreClean
-          } else {
-            // 重新生成符合字数要求的标题，最多重试10次确保不重复
-            for (var _utr = 0; _utr < 15; _utr++) {
-              var _candidate = generateChapterTitleFromSummary(_uch.summary || '', _uchNum + _utr * 7, _unifiedTitleLen)
-              var _candClean = _candidate.replace(/[^\u4e00-\u9fff]/g, '')
-              if (_candClean.length === _unifiedTitleLen && !_unifiedUsedTitles.has(_candClean)) {
-                _newTitleCore = _candClean
-                break
-              }
-            }
-            // 如果重试后还是重复，追加序号确保唯一
-            if (!_newTitleCore || _newTitleCore.length !== _unifiedTitleLen) {
-              _newTitleCore = generateChapterTitleFromSummary(_uch.summary || '', _uchNum, _unifiedTitleLen)
-              _newTitleCore = _newTitleCore.substring(0, _unifiedTitleLen)
-              var _unq = 1
-              while (_unifiedUsedTitles.has(_newTitleCore) && _unq < 100) {
-                _newTitleCore = _newTitleCore.substring(0, _unifiedTitleLen - 1) + String.fromCharCode(0x4e00 + _unq)
-                _unq++
-              }
-            }
-          }
-          
-          if (_newTitleCore) {
-            _uch.title = '第' + _uchNum + '章 ' + _newTitleCore
-            _unifiedUsedTitles.add(_newTitleCore)
-          }
-        }
-        console.log('[chapters] 🔥标题统一完成，共' + processedChapters.length + '章，每章' + _unifiedTitleLen + '字')
-      }
+      // 🔥🔥🔥 统一章节标题字数（终审前置）：以【其它卷】通过完整性校验的标题核心众数解析（排除本卷，防坏数据污染），
+      //   本作第 1 卷有 60 条干净 4 字标题 → 解析恒为 4。逐章定稿统一交给 _finalizeChapterTitles（本块不再改标题）。
+      var _unifiedTitleLen = _resolveTitleLen(existingChaptersFull, volNum)
+      console.log('[chapters][DBG] unifiedTitleLen=' + _unifiedTitleLen + ' titleCharCount=' + _titleCharCount + ' fromUser=' + _titleCharCountFromUser)
+      // 🔥 DBG 落盘：pm2 未捕获 Next.js stdout，故同步写入 .tuzhong-data/title_dbg.log 便于真机回读（失败不影响主流程）
+      try {
+        appendFileSync(join(process.cwd(), '.tuzhong-data', 'title_dbg.log'),
+          '[' + new Date().toISOString() + '] vol=' + volNum + ' batch=' + batchStart + '-' + batchEnd +
+          ' [chapters][DBG] unifiedTitleLen=' + _unifiedTitleLen + ' titleCharCount=' + _titleCharCount +
+          ' fromUser=' + _titleCharCountFromUser + '\n')
+      } catch (_dbgErr) { /* ignore */ }
       
       // 🔥🔥🔥 最终强制去重：确保100%不重复（标题+摘要双重去重）
       var _finalSeenTitles = new Set<string>()
@@ -25141,7 +26171,7 @@ _chapGenreResult.isModern ? '都市/现代题材：章节必须发生在现代�
         while (_fTitleKey.length >= 2 && _finalSeenTitles.has(_fTitleKey) && _fTitleRetry < 10) {
           _fTitleRetry++
           // 生成新标题
-          var _fNewTitle = generateChapterTitleFromSummary(_fSum, _fCh.chapterNumber || (_fi + batchStart))
+          var _fNewTitle = generateChapterTitleFromSummary(_fSum, _fCh.chapterNumber || (_fi + batchStart), _titleCharCount)
           if (_fNewTitle) {
             _fTitle = _fNewTitle
             _fTitleKey = _fTitle.replace(/第\d+章\s*/g, '').trim()
@@ -25212,7 +26242,7 @@ _chapGenreResult.isModern ? '都市/现代题材：章节必须发生在现代�
           if (_fBestSum && _fBestSim < 0.10) {
             _fSum = _fBestSum
             // 同步更新标题
-            var _fNewTitle2 = generateChapterTitleFromSummary(_fSum, _fCh.chapterNumber || (_fi + batchStart))
+            var _fNewTitle2 = generateChapterTitleFromSummary(_fSum, _fCh.chapterNumber || (_fi + batchStart), _titleCharCount)
             if (_fNewTitle2) {
               var _fNewTitleKey = _fNewTitle2.replace(/第\d+章\s*/g, '').trim()
               if (!_finalSeenTitles.has(_fNewTitleKey) && _fNewTitleKey.length >= 2) {
@@ -25233,6 +26263,12 @@ _chapGenreResult.isModern ? '都市/现代题材：章节必须发生在现代�
       }
       
       console.log('[chapters] 🔥最终强制去重完成: 处理了' + processedChapters.length + '个章节，已有标题' + _finalSeenTitles.size + '个，已有摘要指纹' + _finalSeenSummaries.size + '个')
+
+      // 🔥🔥🔥 唯一终审（全链路唯一权威）：全书统一 4 字 + 跨卷防重 + 拒绝残句/主角名碎片。
+      //   任何上游产物（LLM 原题 / 摘要派生 / 合成 / 题材池）在此全部收敛，最终一律以本函数结果为准。
+      //   目标字数由 _resolveTitleLen 以「其它卷清洁标题核心众数」解析（本作=4），本卷存量坏数据不参与投票。
+      _finalizeChapterTitles(processedChapters, existingChaptersFull, volNum, _chapProtagonistName)
+      console.log('[chapters] ✅ 标题终审完成：' + processedChapters.length + '章，每章 ' + _resolveTitleLen(existingChaptersFull, volNum) + ' 字（跨卷防重已启用）')
 
       var finalResult: any = {
         chapters: processedChapters,
@@ -25373,17 +26409,99 @@ _chapGenreResult.isModern ? '都市/现代题材：章节必须发生在现代�
           _chFill.conflict = _confPool[(_chapFillIdx + batchStart + 3) % _confPool.length]
         }
         // 8. 出场人物characters（数组）
-        if (!Array.isArray(_chFill.characters) || _chFill.characters.length < 1) {
-          var _defChars = [_chapProtagonistName || '主角']
-          if (_chapFillIdx % 3 === 1) _defChars.push('反派角色')
-          else if (_chapFillIdx % 3 === 2) _defChars.push('配角盟友')
-          _chFill.characters = _defChars
+        // 🔥 修复：原先只填「主角」+「反派角色/配角盟友」这类仙侠通用占位，历史题材下毫无信息量。
+        //   改为从本作角色名单（previousData.characters）中提取「本章正文/标题里真实出现」的人物名，
+        //   命中为空时才退回主角名兜底；主角恒定置首。
+        if (!Array.isArray(_chFill.characters) || _chFill.characters.length < 1 || (_chFill.characters.length === 1 && /^(主角|反派角色|配角盟友)$/.test(String(_chFill.characters[0])))) {
+          var _rosterNames: string[] = []
+          try {
+            var _pcAny: any = (previousData as any)?.characters || {}
+            var _pushRoster = function (_o: any) {
+              if (_o && typeof _o.name === 'string') {
+                var _n = _o.name.trim()
+                if (_n.length >= 2 && _rosterNames.indexOf(_n) < 0) _rosterNames.push(_n)
+              }
+            }
+            _pushRoster(_pcAny.protagonist); _pushRoster(_pcAny.femaleLead); _pushRoster(_pcAny.antagonist)
+            ;(_pcAny.femaleLeads || []).forEach(_pushRoster)
+            ;(_pcAny.antagonists || []).forEach(_pushRoster)
+            ;(_pcAny.supporting || []).forEach(_pushRoster)
+            ;(_pcAny.supportingCharacters || []).forEach(_pushRoster)
+          } catch (_eRoster) { /* 名单缺失时静默退回兜底 */ }
+          var _chText = String(_chFill.title || '') + ' ' + String(_chFill.summary || '') + ' ' + String(_chFill.writingGoal || '')
+          var _hitChars: string[] = []
+          for (var _rcI = 0; _rcI < _rosterNames.length; _rcI++) {
+            if (_chText.indexOf(_rosterNames[_rcI]) >= 0) _hitChars.push(_rosterNames[_rcI])
+          }
+          if (!_hitChars.length) _hitChars = [_chapProtagonistName || '主角']
+          if (_chapProtagonistName && _hitChars.indexOf(_chapProtagonistName) > 0) {
+            _hitChars.splice(_hitChars.indexOf(_chapProtagonistName), 1)
+            _hitChars.unshift(_chapProtagonistName)
+          }
+          _chFill.characters = _hitChars.slice(0, 6)
         }
-        // 9. 场景地点locations（数组，基于sceneSetting）
+        // 9. 场景地点locations（数组）
+        // 🔥 修复：优先用 _chFill.sceneSetting（按 、，/ 切分）作为地点来源，正则仅作最后手段；
+        //   并用人物名册过滤候选：含人名 / 被人名包含 / 首部与人名尾部重叠（如「榔潜入敌营」来自「朱由榔」）、
+        //   或候选非末位含功能字/动词字，一律丢弃 —— 杜绝「榔潜入敌营」「离化解扬州」这类碎片。
+        //   注：名册就地自 previousData.characters 重建（与 characters 字段构建同源），避免跨块引用未赋值变量。
+        var _locRoster: string[] = []
+        if (_locRoster.length === 0) {
+          try {
+            var _pcLoc: any = (previousData as any)?.characters || {}
+            var _pushLocR = function (_o: any) {
+              if (_o && typeof _o.name === 'string') { var _nn = _o.name.trim(); if (_nn.length >= 2 && _locRoster.indexOf(_nn) < 0) _locRoster.push(_nn) }
+            }
+            _pushLocR(_pcLoc.protagonist); _pushLocR(_pcLoc.femaleLead); _pushLocR(_pcLoc.antagonist)
+            ;(_pcLoc.femaleLeads || []).forEach(_pushLocR); (_pcLoc.antagonists || []).forEach(_pushLocR)
+            ;(_pcLoc.supporting || []).forEach(_pushLocR); (_pcLoc.supportingCharacters || []).forEach(_pushLocR)
+          } catch (_eLocR) { /* 名单缺失时静默退回 */ }
+        }
+        var _locFuncChars = '的了在是与和之其为以而则就都还把被将向从对给让使令潜化入出离发见欲遂乃因故'
+        var _locReject = function (_cand: string): boolean {
+          if (!_cand || _cand.length < 2) return true
+          for (var _ri = 0; _ri < _locRoster.length; _ri++) {
+            var _rn = _locRoster[_ri]
+            if (!_rn) continue
+            if (_cand.indexOf(_rn) >= 0) return true               // ① 候选包含人名
+            if (_rn.indexOf(_cand) >= 0) return true               // ② 候选被人名包含
+            var _ovMax = Math.min(3, _rn.length - 1)
+            for (var _ov = 1; _ov <= _ovMax; _ov++) {              // ③ 候选首部与人名尾部重叠
+              if (_cand.substring(0, _ov) === _rn.substring(_rn.length - _ov)) return true
+            }
+          }
+          for (var _fi = 0; _fi < _cand.length - 1; _fi++) {       // 非末位含功能字/动词字
+            if (_locFuncChars.indexOf(_cand.charAt(_fi)) >= 0) return true
+          }
+          return false
+        }
+        // 已有 locations：先剔除人名/句读碎片
+        if (Array.isArray(_chFill.locations) && _chFill.locations.length > 0) {
+          _chFill.locations = (_chFill.locations as any[]).map(function (x: any) { return String(x) }).filter(function (x: string) { return x && !_locReject(x) })
+        }
         if (!Array.isArray(_chFill.locations) || _chFill.locations.length < 1) {
-          var _locs = [_chFill.sceneSetting || '密室']
-          if (_chapFillIdx % 2 === 0) _locs.push(['后山','内堂','密室二层','演武场','前厅','密室深处'][_chapFillIdx % 6])
-          _chFill.locations = _locs
+          var _locHits: string[] = []
+          // 优先：sceneSetting（按 、，, / ; ； 空格 切分）
+          if (_chFill.sceneSetting && String(_chFill.sceneSetting).trim().length >= 2 && !/基于本作/.test(String(_chFill.sceneSetting))) {
+            var _ssParts = String(_chFill.sceneSetting).split(/[、，,\/;；\s]+/).map(function (x: string) { return x.trim() }).filter(function (x: string) { return x.length >= 2 })
+            for (var _spi = 0; _spi < _ssParts.length; _spi++) {
+              var _sp = _ssParts[_spi]
+              if (!_locReject(_sp) && _locHits.indexOf(_sp) < 0) { _locHits.push(_sp); if (_locHits.length >= 5) break }
+            }
+          }
+          // 最后手段：正则从本章文本抽取地名（同样过滤人名碎片）
+          if (!_locHits.length) {
+            var _locText = String(_chFill.title || '') + ' ' + String(_chFill.summary || '') + ' ' + String(_chFill.writingGoal || '') + ' ' + String(_chFill.sceneSetting || '')
+            var _locRe = /[\u4e00-\u9fa5]{2,4}(?:府|城|州|关|京|镇|寨|营|宫|殿|驿|港|岛|行在|山|岭|江|河|渡|桥|寺|庙|楼|台|园|卫|所|堡)/g
+            var _locMatch: RegExpExecArray | null
+            while ((_locMatch = _locRe.exec(_locText)) !== null) {
+              var _lv = _locMatch[0]
+              if (_locReject(_lv)) continue
+              if (_locHits.indexOf(_lv) < 0) _locHits.push(_lv)
+              if (_locHits.length >= 5) break
+            }
+          }
+          _chFill.locations = _locHits.length ? _locHits : [`第${volNum}卷`]
         }
         // 10. 信息差informationGap
         if (!_chFill.informationGap || String(_chFill.informationGap).trim().length < 3 || /基于本作/.test(String(_chFill.informationGap || ''))) {
@@ -25396,23 +26514,92 @@ _chapGenreResult.isModern ? '都市/现代题材：章节必须发生在现代�
           ]
           _chFill.informationGap = _gapPool[(_chapFillIdx + batchStart + 5) % _gapPool.length]
         }
-        // 11. 预估字数estimatedWords（2000-2500区间）
-        if (!_chFill.estimatedWords || typeof _chFill.estimatedWords !== 'number' || _chFill.estimatedWords < 500) {
-          var _baseWords = 2100 + ((_chapFillIdx * 37) % 300)
+        // 11. 预估字数estimatedWords（🔥 2026-10-16 绍宋级口径：默认 2600-3000 区间；兼容「2500-4000」范围串写法）
+        var _ewValid = (function () {
+          var _v = _chFill.estimatedWords
+          if (typeof _v === 'number' && _v >= 500) return true
+          if (typeof _v === 'string' && /^\d{3,4}\s*-\s*\d{3,4}$/.test(_v.trim())) return true
+          return false
+        })()
+        if (!_ewValid) {
+          var _baseWords = 2600 + ((_chapFillIdx * 37) % 400)
           if (_chFill.phase === '爆发' || _chFill.phase === '破局') _baseWords += 100
+          if (_baseWords > 3000) _baseWords = 3000
           _chFill.estimatedWords = _baseWords
         }
       }
 
+      // 🔥 2026-09-07（#156）模板摘要后置重拼：深度字段补全完成后，检测仍残留的场景模板摘要
+      //   （仙侠画面签名：南天门/三界六道/天兵天将/轮回之井/法则涟漪/空间裂缝等，或 <40 字），
+      //   用补全后的真实深度字段重拼——此时 writingGoal 等已 100% 就绪（LLM 原生或 _goalMap 兜底），
+      //   拼装必成功、每章唯一、严格贴题。实测 V3：主流程 #154 依赖 chData 深度字段时序，LLM 快速响应
+      //   （22s 无深度字段）时模板仍会回流；后置兜底彻底封死该路径。
+      var _tmplSig = /南天门|三界六道|天兵天将|轮回之井|天地法则|法则涟漪|空间裂缝|雷劫|仰天长啸|仙光缭绕|脚踏飞剑|御风而行|灵气波动|御剑|修士|远古修士|仙界|云海之中|议事殿中|最终决战|时间长河|万丈深渊|两败俱伤|天地初开|前世今生|雷云之中|天劫|时空裂缝|崩塌的|空间乱流|星辰跳跃/
+      var _usedSumPrefixes: Record<string, boolean> = {}
+      for (var _rsIdx = 0; _rsIdx < finalResult.chapters.length; _rsIdx++) {
+        var _rsCh = finalResult.chapters[_rsIdx]
+        if (!_rsCh) continue
+        var _rsSum = String(_rsCh.summary || '').trim()
+        var _rWg = String(_rsCh.writingGoal || '').trim().replace(/[。.]$/, '')
+        var _rTp = String(_rsCh.turningPoint || '').trim().replace(/[。.]$/, '')
+        var _rHk = String(_rsCh.hook || '').trim().replace(/[。.]$/, '')
+        var _rFs = String(_rsCh.foreshadowing || '').trim().replace(/[。.]$/, '')
+        var _rIg = String(_rsCh.informationGap || '').trim().replace(/[。.]$/, '')
+        var _rOk = function (s3: string) { return s3 && !/随正文生成|待生成|占位|推动剧情发展/.test(s3) }
+        // 🔥 #159 摘要内复读检测：LLM 摘要长度达标且无模板签名、但 writingGoal 与其余深度字段
+        //   4-gram 相似度 >0.5（实测残留瑕疵：tp≈wg「策反孙可望部下」复读）时也触发重拼——
+        //   重拼走 _notDup 守卫自动剔除重复字段，内容不丢失（均来自同一组深度字段）。
+        var _sumDup = false
+        if (_rsSum.length >= 40 && _rOk(_rWg) && _rWg.length >= 6) {
+          var _dupProbe = [_rTp, _rFs, _rIg, _rHk]
+          for (var _dpi = 0; _dpi < _dupProbe.length; _dpi++) {
+            if (_rOk(_dupProbe[_dpi]) && _textSim(_rWg, _dupProbe[_dpi]) > 0.5) { _sumDup = true; break }
+          }
+        }
+        if (!(_rsSum.length < 40 || _tmplSig.test(_rsSum) || _sumDup)) { _usedSumPrefixes[String(_rsSum).replace(/\s+/g, '').slice(0, 25)] = true; continue }
+        // 🔥 #157 复读守卫：字段与已拼内容前 10 字重合即视为语义重复，跳过（防 writingGoal≈turningPoint 复读）
+        // 🔥 #159：头匹配会漏「长字段变体复读」（前 10 字不同但主体重复）——补 4-gram 相似度 >0.45 守卫
+        var _notDup = function (s4: string, base: string) {
+          if (!s4) return false
+          var _h = s4.slice(0, 10)
+          if (base.indexOf(_h) !== -1 || s4.indexOf(base.slice(0, 10)) !== -1) return false
+          return _textSim(s4, base) <= 0.45
+        }
+        if (_rOk(_rWg) && _rWg.length >= 6) {
+          var _rComposed = _rWg
+          if (_rOk(_rTp) && _rTp !== _rWg && _notDup(_rTp, _rComposed)) _rComposed += '，' + _rTp
+          if (_rComposed.length < 40 && _rOk(_rFs) && _notDup(_rFs, _rComposed)) _rComposed += '。本章暗线：' + _rFs
+          if (_rComposed.length < 40 && _rOk(_rIg) && _notDup(_rIg, _rComposed)) _rComposed += '，' + _rIg
+          if (_rComposed.length < 40 && _rOk(_rHk) && _notDup(_rHk, _rComposed)) _rComposed += '，章末留下悬念：' + _rHk
+          // 卷内前缀去重：与本章其它已定摘要撞车时，改用「暗线」起头并追加钩子，保证 25 字前缀唯一
+          var _rKey = _rComposed.replace(/\s+/g, '').slice(0, 25)
+          if (_usedSumPrefixes[_rKey]) {
+            var _rAlt = _rOk(_rFs) ? ('本章暗线：' + _rFs + '。' + _rWg) : _rComposed
+            if (_rOk(_rHk)) _rAlt += '，' + _rHk
+            _rComposed = _rAlt + '。'
+            _rKey = _rComposed.replace(/\s+/g, '').slice(0, 25)
+            if (_usedSumPrefixes[_rKey] && _rOk(_rHk)) {
+              _rComposed = _rWg + '（本章侧重' + String(_rsCh.phase || '推进') + '，' + _rHk + '）。'
+            }
+          }
+          finalResult.chapters[_rsIdx].summary = _rComposed + '。'
+          _usedSumPrefixes[String(finalResult.chapters[_rsIdx].summary).replace(/\s+/g, '').slice(0, 25)] = true
+        }
+      }
+
       // 🔥 跨题材词汇清洗（章节标题和摘要）
-      var _chapGenreTypeForClean = _chapGenreDetectForClean.isScifi ? 'scifi' : _chapGenreDetectForClean.isWestern ? 'western' : _chapGenreDetectForClean.isCultivation ? 'xiuxian' : ''
+      // 🔥 2026-09-10 #243 修复：历史/架空题材分卷章节此前 genreType 映射为 ''（只映射了 scifi/western/xiuxian），
+      //   导致 _cleanCrossGenreTermsDeep 里 replacements 为空、直接 return，历史章节的玄幻词汇（宗门/修仙/法宝/秘境等）完全不过滤。
+      //   现补上 history 分支（keepFlowTerms=true 用 Base 表，保留剧情流程词、仅清洗玄幻/修真污染词），与整体大纲环节一致。
+      var _chapGenreTypeForClean = _chapGenreDetectForClean.isScifi ? 'scifi' : _chapGenreDetectForClean.isWestern ? 'western' : _chapGenreDetectForClean.isCultivation ? 'xiuxian' : (_chapGenreDetectForClean.isHistory ? 'history' : '')
+      var _chapCleanFlowTerms = _chapGenreTypeForClean === 'history'
       var _chapSkipFields = new Set<string>(['id', 'number', 'volumeIndex', 'chapterInVolumeIndex'])
       finalResult.chapters = finalResult.chapters.map(function(ch: any) {
-        _cleanCrossGenreTermsDeep(ch, 'chapters', _chapSkipFields, _chapGenreTypeForClean)
+        _cleanCrossGenreTermsDeep(ch, 'chapters', _chapSkipFields, _chapGenreTypeForClean, _chapCleanFlowTerms)
         return ch
       })
       if (finalResult.volumeSummary) {
-        var _vsCleaned = _cleanCrossGenreTermsDeep(finalResult.volumeSummary, 'volumeSummary', _chapSkipFields, _chapGenreTypeForClean)
+        var _vsCleaned = _cleanCrossGenreTermsDeep(finalResult.volumeSummary, 'volumeSummary', _chapSkipFields, _chapGenreTypeForClean, _chapCleanFlowTerms)
         if (_vsCleaned > 0 && typeof finalResult.volumeSummary === 'string') {
           // 字符串按值传递，清洗在函数内部已处理，这里无需额外操作
         }
@@ -25427,6 +26614,9 @@ _chapGenreResult.isModern ? '都市/现代题材：章节必须发生在现代�
 
       var _charDetect = detectGenre(genre || '', keywordsStr || '')
       console.log('[characters] 题材检测: genreKey=' + _charDetect.genreKey + ', genre=' + genre)
+      // 🔥 2026-11-06：历史题材统一判定（与 _charHistRule 注入条件一致），
+      //   供取名铁律/第8条/12.3 等「必须原创姓名」冲突条款做历史豁免，消除提示词自相矛盾
+      var _isHistGenreChar = !!(_charDetect && _charDetect.isHistory) || /历史|架空|南明|明末|大明|清朝|民国|汉末|三国|战国|春秋|大唐|两宋/.test(String(genre || '') + ' ' + String(keywordsStr || ''))
 
       // 🔥 从灵感创作中提取主角名字，确保贯穿全流程
       var forcedProtagonistName = ''
@@ -25589,7 +26779,7 @@ _chapGenreResult.isModern ? '都市/现代题材：章节必须发生在现代�
       }
 
       var namingRulesConstraint = `
-【取名铁律·所有角色必须严格遵守】
+【取名铁律·所有角色必须严格遵守】${_isHistGenreChar ? '\n⚠️【历史题材豁免·最高优先级】本作为历史/架空历史题材：主要人物（主角、反派、朝堂重臣、统兵将领、后妃宗室等主线核心角色）必须使用真实历史人物姓名（详见【历史题材·主要人物必须为真实历史人物】铁律），不受本取名铁律「原创取名/100%原创」要求约束，第4条黑名单中的古代史实人物（如曹操/刘备/关羽等）在其本朝题材作品中同样不受限制；仅主角身边原创人物（亲卫/内侍/幕僚/家眷等次要身份）按以下原创规则取名。' : ''}
 1. 主角名字固定为"${forcedProtagonistName || '主角'}"，禁止修改！
 2. 所有原创角色（女主/反派/盟友/导师/配角）必须根据题材和角色身份原创取名：
    - 姓氏匹配身份：世家大族用顾/沈/萧/陆/傅/谢等雅姓，寒门草根用陈/刘/张/赵/周等朴实姓氏，皇室可用复姓
@@ -25854,28 +27044,6 @@ ${_charFanfictionWorldInfo || `基于你对《${_charIdea.fanfictionSource}》�
       charConfigStr = _buildCharConfigStr()
       console.log('[characters] charConfigStr 已按最终女主模式重建（单=' + isSingleHeroine + ' 双=' + isDualHeroine + ' 后宫=' + isHaremTheme + '）')
 
-      if (_charBatch) {
-        var _needCount: Record<string, number> = {}
-        for (var _ni = 0; _ni < _charBatch.needs.length; _ni++) {
-          var _nk = _charBatch.needs[_ni]
-          _needCount[_nk] = (_needCount[_nk] || 0) + 1
-        }
-        var _needParts: string[] = []
-        for (var _nk2 in _needCount) { if (Object.prototype.hasOwnProperty.call(_needCount, _nk2)) _needParts.push(_nk2 + ' ×' + _needCount[_nk2]) }
-        var _existHint = _charBatch.existing.length > 0
-          ? '\n- 【已存在角色·绝对禁止重复】' + _charBatch.existing.slice(0, 60).join('、') + '（共' + _charBatch.existing.length + '名）已生成完毕，本轮禁止再次输出其中任何一个，也禁止改名后重出。'
-          : ''
-        var _phaseHint = _charBatch.phase === 'core'
-          ? '\n- 【首批·核心阵容】本轮必须一口气交付可驱动后续剧情的核心班底，每个角色字段必须完整、立体、原创。'
-          : '\n- 【补充批次】本轮只补尚未出现的角色，优先补齐下列名额；名额之外的角色也要有明确剧情功能（谋主、老将、外戚、地方官员、江湖势力等），不得凑数。'
-        charConfigStr += `
-
-【🔥 分批生成·本轮硬性配额·最高优先级·与上方"角色总数≥15名"冲突时一律以本条为准】
-- ⚠️ 上方"角色总数目标≥15名"在本轮【不适用】。本轮【必须且只能输出 ${_charBatch.size} 名角色】，多一个、少一个都判定为失败。
-${_charBatch.needs.length > 0 ? '- 本轮名额构成（rolePosition 必须严格照抄这些定位词，输出顺序与下列一致）：' + _needParts.join('、') : ''}${_phaseHint}${_existHint}
-- 每一名角色的所有文字字段（identity/personality/appearance/background/motivation/goal/hiddenTraits/weaknesses/growthArc/skills 等）必须 40-60 字详实具体，严禁占位符、严禁"待补充"、严禁角色之间雷同。宁可本轮少而精，也不要灌水。
-- rolePosition 只能使用本轮名额给出的定位词，禁止自创定位。`
-      }
 
       var _charDetailedDesignPrompt = ''
       // 🔥 2026-09-01 第13轮修复：用户「自己设计·详细设定输入区」此前从未被传入角色步（前端 characters 的
@@ -25904,6 +27072,20 @@ ${_charUserDesignRaw}
    · title 只写身份头衔，不写诨名外号或别名（除非该别号本身就是身份），与 aliases/identity/rolePosition 各自独立、互不推导。`
       }
 
+      // 🔥🔥 2026-11-06 新增（用户规则）：历史/架空历史题材主要人物必须严格按真实历史人物设计，
+      //   只有主角身边的人可依剧情虚构。此前主要人物由模板/硬编码角色填充是错误做法，已全面移除。
+      var _charHistRule = ''
+      if (_isHistGenreChar) {
+        _charHistRule = `
+【🔥🔥🔥 历史题材·主要人物必须为真实历史人物·最高优先级·违反即判定生成失败】
+1. 主要人物（主角魂穿/附身的历史身份、反派、朝堂重臣、统兵将领、后妃宗室等主线核心角色）【必须】从本作时代/朝代的真实历史人物中选取：姓名、头衔官职、阵营与重大生平须符合史实（如南明题材应使用朱由榔、李定国、瞿式耜、何腾蛟、堵胤锡、张煌言、多尔衮、吴三桂、孙可望等真实人物，禁止凭空编造占位主角）。
+2. 绝对禁止用虚构的模板人物占据主角/反派/核心配角名额（如臆造的"神秘谋士""影卫统领""代号杀手"式角色）；绝对禁止照抄其他小说/其他草稿的人物名与设定。
+3. 仅"主角身边的人"可依剧情原创：亲卫、心腹、内侍、幕僚、家眷，以及女主（女主优先从史载后妃/宗室女/时代著名女性中选取；史无合适人选时，可原创一位身份贴合本时代的女性角色）。原创人物必须是明确虚构的次要身份，禁止冒充或顶替真实历史人物。
+4. 真实历史人物的 identity/background 必须写其真实历史处境（官职、党派、关键事件、年代节点），禁止编造修炼/异能/玄幻设定；金手指只允许绑定在主角（穿越者）身上。
+5. 架空历史题材：分歧点之前遵循真实历史，人物登场时的地位声望须贴合史实，剧情演绎必须基于史实合理推演，禁止把后世才出现的人物提前拉入或凭空捏造朝堂格局。`
+      }
+      console.log('[characters] 历史真实人物铁律注入=' + (_charHistRule ? 'YES' : 'NO') + '（genre=' + String(genre || '') + ', keywords=' + String(keywordsStr || '').slice(0, 60) + '）')
+
       var charPrompt = `根据前文所有设定，生成完整的角色阵容。
 
 【作品信息】
@@ -25923,7 +27105,7 @@ ${(((previousData?.powerSystem as any)?.protagonistAbility?.name ? '主角金手
 
 【🔥🔥🔥 题材贴合铁律·最高优先级·违反任意一条即判定生成失败】
 人物姓名、身份、能力、组织、境界体系必须严格贴合当前题材与世界观设定，绝对禁止跨题材混用！例如：科幻宇宙题材（吞噬星空类）绝对禁止出现修仙、练气、炼虚、宗门、灵根、道号、飞升、金丹、元婴等修真词汇；角色身份、技能、成长路径、realmLevel（能力等级/境界）必须使用当前题材与世界观对应的体系。若你的输出与本作题材/世界观冲突或串用其他题材设定，一律视为生成失败并重设为贴合当前题材的设定。
-
+${_charHistRule}
 ${_charFanfictionHint}
 ${_charDetailedDesignPrompt}
 ${charConfigStr}
@@ -25948,15 +27130,15 @@ ${charConfigStr}
    - 女主/魅惑型角色魅力值75-95
    - 反派型角色通常某一项属性突出（80+），其他偏低
    严禁所有角色使用相同的属性值（如全部50）
-7. 【🔥 角色命名铁律·最高优先级】角色姓名必须严格根据题材决定命名风格，且必须是原创姓名：
+7. 【🔥 角色命名铁律·最高优先级】角色姓名必须严格根据题材决定命名风格，且必须是原创姓名${_isHistGenreChar ? '（历史题材豁免：主要人物按【历史题材·主要人物必须为真实历史人物】铁律使用真实历史人物姓名，不适用原创姓名要求）' : ''}：
    - 西幻/魔法斗气/盘龙题材：所有角色必须使用中文音译的西式姓名（名·姓结构，用"·"分隔）。绝对禁止中式姓名！绝对禁止纯英文拼写的名字！
    - 东方玄幻/仙侠题材：使用原创中式姓名（2-4个汉字）
    - 洪荒/上古/封神题材：使用上古先秦风格名，巫族用蛮荒名、妖族用妖兽名、仙道用道门名
-   - 历史题材：使用符合朝代特征的姓名
+   - 历史题材：${_isHistGenreChar ? '主要人物必须使用本作时代真实历史人物姓名（见【历史题材·主要人物必须为真实历史人物】铁律）；主角身边原创人物使用符合朝代特征的姓名' : '使用符合朝代特征的姓名'}
    - 都市题材：使用现代中式姓名
    严禁跨题材混用姓名风格！${namingConstraint}
 7.1 【题材匹配】角色身份、势力、技能必须严格符合题材时代背景，禁止穿越朝代内容：洪荒用巫族部落/妖族妖庭/仙道宗门（禁止墨家等后世学派），历史题材必须严格对应朝代。违反则重新设计。
-8. 【原创性】绝对禁止出现其他作品知名角色名（如萧炎、林动、唐三、韩立、叶凡、石昊、林雷、乔峰、郭靖、杨过等）和常见串名（林默、叶尘、秦风、萧尘）。必须使用100%原创姓名！
+8. 【原创性】绝对禁止出现其他作品知名角色名（如萧炎、林动、唐三、韩立、叶凡、石昊、林雷、乔峰、郭靖、杨过等）和常见串名（林默、叶尘、秦风、萧尘）。必须使用100%原创姓名！${_isHistGenreChar ? '（历史题材豁免：真实历史人物姓名按【历史题材·主要人物必须为真实历史人物】铁律使用，不视为违反原创性；仅主角身边原创人物适用本条）' : ''}
 9. 每个角色必须有独立的motivation（动机）和goal（目标），不得与其他角色相同
 10. 【核心技能/金手指字段·最重要】每个角色必须有skills字段（数组），包含2-4个核心技能或能力：
    - 主角的skills必须包含金手指/系统能力（参考前文金手指设定），例如：["神秘宝物·空间收纳与传承", "神兵利器·剑意感悟", "特殊血脉·肉体强化"]
@@ -25964,20 +27146,20 @@ ${charConfigStr}
    - 反派的skills应体现其威胁性，如：["暗影遁术·隐匿无踪", "噬魂大法·精神控制"]
    - 配角的skills根据其定位设计，不得为空数组
 11. identity（身份背景）必须结合世界观和剧情设定，举例：玄幻主角应为"${forcedProtagonistName || '主角'}，${_ideaTagline || '身份神秘'}，在${_wbEra || '乱世'}中"这类包含具体时代、身份、剧情的描述
-12. 【角色数量·分批可补充】目标为完整阵容约15-20名，但允许分2-3次补充：本轮请优先产出一批高质量核心角色（主角、女主、主要反派、关键朋友/配角），每个都字段完整、立体原创；数量可以少于目标，后续轮次再增补。绝对禁止为凑数而生成"待补充/占位/模板/角色N"等空壳角色——宁可本轮少而精，也不要灌水。
+12. 【角色数量·名册权威】必须一次性输出人物名册蓝图中的全部角色（≥15名），每张卡字段完整、立体原创；绝对禁止生成"待补充/占位/模板/角色N"等空壳角色，禁止增删或改名册之外的角色。
 12.1 【主题绑定】所有角色必须紧密围绕本作【${keywordsStr ? keywordsStr.replace(/[\s，、]+/g, '+').replace(/^\+|\++$/g, '') : '核心主题'}】主题设计。女主必须与主角成长线紧密相关，反派必须是与本作势力/世界观匹配的对手，每个角色必须明确标注与主角${forcedProtagonistName || '林渊'}的关系和剧情功能。禁止通用模板角色。
 12.2 【用户已设计人物·必须原样纳入】若下方【用户已设计的详细设定】中已命名了具体人物（含身份/性格/关系），必须把这些人物按其定位原样纳入对应类别（主角/女主/反派/朋友/配角），沿用其姓名与设定，不得改名、遗漏或用自创角色替换；自创角色仅用于补足各类别数量。
-12.3 【用户人物姓名豁免·最高优先级·优先于第7/8条】凡用户设定中已命名的人物，必须原样沿用用户姓名与身份设定——历史题材即使用真实历史人物姓名（如丁魁楚、瞿式耜、李定国、郑成功），本条优先于第7条命名铁律与第8条原创性禁令，绝对禁止以"原创姓名"为由将其改名、谐音替换或判定为违规。
-12.4 【具体剧情定位·朋友/反派/配角必填】每个朋友、反派、配角的 identity 首句必须按「所属阵营 + 具体职能」格式写明具体剧情定位，例如「永历阵营（主角阵营）·忠臣文官」「清军阵营·统兵大将」「永历阵营·御前侍卫亲随」「永历阵营·内廷司礼宦官」，禁止只写"重要配角""反派头目""关键人物"等笼统定位；同一阵营内不同角色的职能（文官/武将/谋士/内廷/地方官员等）必须互不雷同。
+12.3 【用户人物姓名豁免·最高优先级·优先于第7/8条】🔥 #174 修订：本条【仅当】下方【用户已设计的详细设定】中确已命名该人物时才生效——此时必须原样沿用用户设定的姓名与身份（历史题材即使用真实历史人物姓名），优先于第7/8条命名铁律，绝对禁止以"原创姓名"为由将其改名。${_isHistGenreChar ? '若用户未设定任何人物：主要人物（主角/反派/朝堂重臣/将领/后妃宗室等）仍必须按【历史题材·主要人物必须为真实历史人物】铁律选取本作时代的真实历史人物（如南明题材用朱由榔、李定国、瞿式耜、多尔衮、吴三桂等）；仅主角身边次要身份人物（亲卫/内侍/幕僚/家眷等）使用符合本作朝代风格的原创姓名，且禁止冒充真实历史人物。' : '若用户未设定任何人物，则【严禁】套用任何真实历史人物姓名（包括但不限于丁魁楚、瞿式耜、李定国、郑成功等南明人物示例），必须使用符合本作设定朝代风格的100%原创姓名。'}
+12.4 【具体剧情定位·朋友/反派/配角必填】每个朋友、反派、配角的 identity 首句必须按「所属阵营 + 具体职能」格式写明具体剧情定位（🔥 #174：阵营名必须用本作世界观中的真实势力名，示例格式：「主角阵营·忠臣文官」「敌对阵营·统兵大将」「主角阵营·御前侍卫亲随」「主角阵营·内廷司礼宦官」，严禁照搬示例字面），禁止只写"重要配角""反派头目""关键人物"等笼统定位；同一阵营内不同角色的职能（文官/武将/谋士/内廷/地方官员等）必须互不雷同。
 13. 【角色立体化】每个角色必须100%原创、多维度立体，基于本作前序世界观/势力/大纲设定。必填字段：faction(势力归属)、personalityOrigin(性格成因)、speechHabit(语言习惯)、catchphrase(口头禅)、relationToProtagonist(与主角关系)、quirks(特殊癖好/标志)、mentor(导师/传承)，所有字段详细具体。禁止套用其他作品。
-14. 【分批首屏·精炼优先·不削字段】本轮为首屏核心批次，硬性要求在 30 秒内返回。请保持上方全部字段不缺失，但每条字段值用精炼短句表达（建议每条 ≤16 字，关键信息到位即可），严禁冗长铺垫、重复展开与空话。深度心理/背景延展留给后续补充批次。此约束只收紧长度，不减字段数量。
+14. 【字段完整·禁止缩水】每张角色卡的全部字段必须完整输出且内容充实（identity/background 40-60字、growthArc 40-80字、personality 35-50字），严禁以"后续补充"为由留短或留空。
 
 【JSON格式铁律·违反即解析失败·必须严格遵守】
 ① 只输出纯JSON，绝对禁止用 markdown 代码块（如 json 围栏）包裹，也不要输出任何解释性文字，直接从首个 { 开始。
 ② 字符串值内部绝对禁止出现未转义的 ASCII 双引号。如需在文字中引用，必须使用中文引号「」或『』（例如口头禅写成：角色口头禅为「守护即是责任」，绝不能写成 "守护即是责任"）。
 ③ 所有 JSON 字符串中的双引号必须正确转义为 \" ，确保整段输出语法合法可被JSON.parse解析。
 ④ 数组与对象必须完整闭合，禁止末尾多余逗号。
-⑤ title 字段（真实身份头衔·徽章文案·键必须保留）：取值规则——凡以上设定以「姓名（身份/头衔）」括号形式明确了该人物身份的（如「多尔衮（满清睿亲王）」「李定国（大西军晋王）」「王太后（皇太后）」「郑成功（国姓爷）」），title【必须原样】写括号内身份（如 title:"满清睿亲王"）；其余角色也【必须】输出一个真实、具体、精炼的身份头衔（基于其官职/爵位/名分自拟，如「兵部尚书」「东阁大学士」「黔国公」「永历帝」「镇南大将军」，2-8 字），严禁写成说明性职能词（主角/配角/反派/女主/盟友/导师/忠臣/武将等），严禁整句描述或占位。title 只写身份头衔，不写诨名外号/别名，与 aliases/identity/rolePosition 各自独立、互不推导。
+⑤ title 字段（真实身份头衔·徽章文案·键必须保留）：取值规则——凡以上设定以「姓名（身份/头衔）」括号形式明确了该人物身份的（🔥 #174：示例格式仅示范结构，实际以本作朝代/设定为准，如「张承业（骠骑将军）」「沈徽（中书令）」），title【必须原样】写括号内身份；其余角色也【必须】输出一个真实、具体、精炼的身份头衔（基于其官职/爵位/名分自拟且必须符合本作设定朝代，如「大将军」「丞相」「司礼监掌印」等，2-8 字），严禁写成说明性职能词（主角/配角/反派/女主/盟友/导师/忠臣/武将等），严禁整句描述或占位。title 只写身份头衔，不写诨名外号/别名，与 aliases/identity/rolePosition 各自独立、互不推导。
 
 输出JSON only！格式：{"characters": [{"name":"","title":"","rolePosition":"","age":20,"gender":"男","personality":"","personalityOrigin":"","growthBackground":"","speechHabit":"","catchphrase":"","mentor":"","psychologicalTrauma":"","moralBottomLine":"","decisionPattern":"","signatureItem":"","themeColor":"","values":"","identity":"","appearance":"","background":"","faction":"","quirks":"","relationToProtagonist":"","hiddenTraits":"","weaknesses":"","growthArc":"","motivation":"","goal":"","skills":["技能1","技能2"],"stats":{"武力值":50,"智力值":50,"统帅值":50,"政治值":50,"魅力值":50},"aliases":"","birthplace":"","realmLevel":"","weapons":"","techniques":"","experience":"","socialNetwork":""}]}
 
@@ -25988,7 +27170,14 @@ ${charConfigStr}
 - weapons：角色标志性装备/道具（基于本作设定生成：玄幻填武器法宝、科幻填科技装备、体育填运动器材、都市填座驾名表等）
 - techniques：角色专业技能/技法（基于本作设定生成：玄幻填功法秘术、都市填职业技能、电竞填操作技巧、体育填运动技术等）
 - experience：角色经历/重大事件（基于本作大纲设定生成，包含转折点、关键节点、成长历程）
-- socialNetwork：角色人际网络（基于本作设定填写：师门传承/好友盟友/仇敌对手/家族成员/所属势力等）`
+- socialNetwork：角色人际网络（基于本作设定填写：师门传承/好友盟友/仇敌对手/家族成员/所属势力等）
+🔥【字段质量铁律·2026-09-07 QA】以上字段与 motivation/goal/identity 必须逐字检查：
+- 【历史正史锚定】真实历史人物（含用户钦定的正史人物）的 birthplace/aliases/experience 必须严格符合正史记载，禁止虚构错地错事；birthplace 用「生于X，籍贯Y」双格式（出生地与祖籍分列），皇帝亲贵可加注藩府/封地迁居地
+- 【层级分隔符】realmLevel 中的层级/品级/称号之间必须用「·」分隔（如「皇帝·九五之尊」「正一品·内阁首辅」「筑基后期·剑修」），禁止把两个层级连写成一个词（如「正一品九五之尊」错、「正一品·九五之尊」对）
+- 【动机完整性】motivation/goal 必须是语义完整的长句（动机+手段+目标三要素齐备），以句号收尾，禁止半截截断、禁止错别字（如「亡国之劫」不得写成「亡国之种」）
+- 【括号闭合铁律·最高优先级】aliases/birthplace/realmLevel/socialNetwork/experience 等字段中使用的括号注释（如「蜀王（追封）」「蕴生（字）」「陶庵（号）」）必须左右括号成对闭合；多个别名用「；」分隔时每个别名段各自的括号都要闭合。输出前逐字段数一遍「（」和「）」数量，不相等即重写。禁止「蜀王（追封」式缺尾括号
+- 【模板句禁令·2026-09-09 QA】以下万金油套话曾实锤污染人物卡，绝对禁止出现在任何字段中（含变体）：「世人多直呼其名」「外表温文尔雅」「血缘关联，这份血脉既是天赋也是诅咒」「命运交织、恩怨纠缠」「数易其主、几经沉浮」「权倾一方到盛极而衰」「初露锋芒，实力仍在」「绝不平庸的一生」「在故事中成长蜕变」「一件与其身份经历紧密相连」「吾辈死生以之」「生于瘴气」「永生之门」「境界突破桎梏」「过度保护，敌人一旦以此要挟」「盾，为其惯用兵刃」「盾的操使」「废柴到巅峰」「星域海盗」「星域秩序」「宁家大小姐」。aliases 必须写具体的字/号/封号/绰号/职务尊称（历史人物以正史为准），禁止写「世人如何称呼」式空话；catchphrase 必须是角色独有的个性化台词，禁止性格描述句伪装成台词
+- 【逐字段自检】输出前逐字段通读一遍：凡出现语义破碎、层级连写、半截句、明显错字的，必须重写该字段后再输出`
 
       messagesChar.push({ role: 'user', content: injectRegenPrompt(charPrompt) })
 
@@ -25996,411 +27185,409 @@ ${charConfigStr}
       var charResult: any = null
       var charsFromAI: any[] = []
 
-      // ⚡ 2026-09-01 第16轮：并行单角色生成（真正把首批压到 30s 的唯一路径）
-      //   触发条件：previousData.charBatch.parallel === true。每个 need 克隆 messagesChar（逐对象深拷贝，
-      //   因 callLLMWithFallback 会改写 messages[0].content 注入防仿写约束，必须隔离避免并发串扰），
-      //   追加「只生成 1 个角色 rolePosition=X、含全部字段」指令，并发 callLLMWithFallback，Promise.all 合并。
-      //   每路 ~700 token → 墙钟 ≈ max(单路) ≈ 15s，远低于 30s。原单调用 for 循环被 if(charsFromAI.length===0)
-      //   包裹作为兜底（并行未启用或失败/部分失败时回落单调用）。默认不启用，前端发 parallel:true 才触发。
-      var _charParallel = !!(_charBatch && (_charBatch as any).parallel === true)
-      // 🔥 TS2454 修复：_userRosterR20 在并行分支 try 内声明赋值，但主流程 identity 兜底路径
-      //   （L26036）在并行分支之外也会读取 —— var 声明提升后 TS 无法证明该路径已赋值。
-      //   预声明保证两条路径都安全（并行分支内重新赋值覆盖）。
+      // 🔥 2026-11-07 推倒重做：用户钦定人物（名册必含）。原并行分支内的赋值提至此处。
       var _userRosterR20: Array<{ name: string; desc: string; group: string; role?: string; score?: number }> = []
-      if (_charParallel && _charBatch && _charBatch.needs.length > 0) {
-        console.log('[characters] ⚡ 并行单角色模式：' + _charBatch.needs.length + ' 路并发，每路 maxTokens=2600 timeoutMs=45000')
-        // 统计每个 rolePosition 出现次数，对重名角色（如 反派×2）下发差异化指令，避免同批生成同名被下游按名去重合并
-        var _needCountMap: Record<string, number> = {}
-        for (var _nci = 0; _nci < _charBatch.needs.length; _nci++) { var _nk3 = _charBatch.needs[_nci]; _needCountMap[_nk3] = (_needCountMap[_nk3] || 0) + 1 }
+      try { _userRosterR20 = parseUserCharacterList(String(_charUserDesignRaw || '')) } catch (_urE) { }
+
+      // ============================================================
+      // 🔥🔥🔥 2026-11-07 推倒重做：三段式人物生成（S1 名册蓝图 → S2 整卡展开 → S3 确定性终检）
+      //   替代旧「前端分批 + 并行单角色 + maxTokens 截断 + 硬编码身份池」机制（垃圾输出源头）。
+      //   铁律：校验失败只重试对应阶段或显式报错，绝不回退硬编码角色池。
+      // ============================================================
+
+      // —— 主角四字段（用户钦定，逐字锁定）——
+      var _lockProtoName = forcedProtagonistName || ''
+      var _lockProtoGender = String(((previousData as any)?.protagonistSettings?.gender) || '').trim()
+      var _lockProtoAge = Number((previousData as any)?.protagonistSettings?.age) || 0
+      var _lockProtoIdentity = String(((previousData as any)?.protagonistSettings?.identity) || '').trim()
+
+      // —— 作品类型多选：逐标签翻译为阵容结构要求（不再只拼成组合串走 if 分支）——
+      var _genreTagMap: Record<string, string> = {
+        '历史': '背景必须基于真实史实，主要人物优先采用真实历史人物',
+        '架空历史': '分歧点之前必须遵循真实历史，人物身份与声望必须符合所处时代史实',
+        '重生': '主线必须由「重生/时光回溯」人物驱动，名册须含该人物',
+        '系统流': '主角金手指实体化为「系统」，名册须含可与系统互动的人物（执掌者、知密心腹）',
+        '签到流': '金手指为签到机制，名册须覆盖可触发签到事件的场景人物（朝堂/军务/民生）',
+        '双女主': '名册必须恰含 2 名 rolePosition="女主"，且两人性格、身份必须差异化',
+        '扮猪吃虎': '名册须含一名低估主角的反派，以及至少一名见证主角逆袭的盟友',
+        '废材逆袭': '名册须含一名曾蔑视/打压主角出身的人物',
+        '国运': '名册必须覆盖朝堂、军事、民生三线（帝王、文臣、武将、士绅/百姓）',
+        '争霸': '名册须含对峙的军阀/霸主型反派与谋略班底（首席谋士、钱粮官、大将）',
+        '种田': '名册须含农桑/水利/匠作/地方官吏类民生线人物',
+        '经商': '名册须含商贾/行会/税吏类商业线人物',
+        '大明': '时代背景为晚明（南明/永历朝堂），职官、制度、党争必须符合南明史实',
+      }
+      var _genreTagList = String(genre || '').split(/[,，、;；\s]+/).filter(Boolean)
+      var _genreStructLines: string[] = []
+      for (var _gti = 0; _gti < _genreTagList.length; _gti++) {
+        var _gt = _genreTagList[_gti]
+        _genreStructLines.push('- 「' + _gt + '」→ ' + (_genreTagMap[_gt] || '全部人物身份与剧情功能须符合该类型标签'))
+      }
+
+      // —— 关键词/主题：每条必须由至少一名角色的叙事功能承接 ——
+      var _kwList: string[] = []
+      try {
+        var _kwSrcR = (previousData as any)?.idea?.keywords
+        var _kwArr = Array.isArray(_kwSrcR) && _kwSrcR.length > 0 ? _kwSrcR : String(keywordsStr || '').split(/[,，、;；]+/)
+        for (var _kwi = 0; _kwi < _kwArr.length; _kwi++) {
+          var _kwOne = String(_kwArr[_kwi] || '').trim()
+          if (_kwOne && _kwList.indexOf(_kwOne) === -1) _kwList.push(_kwOne)
+        }
+      } catch (_kwe) { }
+      var _kwLines: string[] = []
+      for (var _kli = 0; _kli < _kwList.length; _kli++) _kwLines.push(String(_kli + 1) + '. 「' + _kwList[_kli] + '」')
+
+      var _flQuota = isHaremTheme ? 4 : (isDualHeroine ? 2 : 1)
+      var _flModeName = isHaremTheme ? '后宫多女主' : (isDualHeroine ? '双女主' : '单女主')
+      var _mascNameCharsR = /[德本厚辅宗刚强伟军涛龙虎彪雄章勋业基堂承启懋桢栋]/
+
+      var _s1Prompt =
+        '你是网文书信级群像架构师。任务：为本书设计【主要人物名册蓝图】——只出名册（18名角色），不出角色卡。\n\n' +
+        (_genreStructLines.length > 0 ? '【作品类型标签·逐条翻译为阵容结构要求·每条必须落地】\n' + _genreStructLines.join('\n') + '\n\n' : '') +
+        (_kwLines.length > 0 ? '【关键词/主题·叙事功能分配·每条必须由至少一名角色的 narrativeFunction 承接，禁止遗漏】\n' + _kwLines.join('\n') + '\n\n' : '') +
+        (_lockProtoName ? '【主角·用户钦定·四字段逐字锁定】名册必须含一条 rolePosition="主角"，姓名=' + _lockProtoName + (_lockProtoGender ? '，性别=' + _lockProtoGender : '') + (_lockProtoAge ? '，年龄=' + _lockProtoAge : '') + (_lockProtoIdentity ? '，一句话身份=' + _lockProtoIdentity : '') + '。以上字段禁止改动一字。\n\n' : '') +
+        '【女主配额】本书为「' + _flModeName + '」模式：名册必须恰含 ' + _flQuota + ' 条 rolePosition="女主"，每条 gender="女"。\n' +
+        '【女性命名铁律】所有「女主」「女配」姓名必须使用明显女性化用字（推荐：婉/昭/清/芷/瑶/琬/韵/岚/漪/月/霜/蕙/淑/娴/嫦/芙/萱/宁/怡），严禁在女性姓名中出现男性化用字（德/本/厚/辅/宗/刚/强/伟/军/涛/龙/虎/彪/雄/章/勋/业/基/堂/承/启/懋/桢/栋）；真实历史女性（后妃/宗室女/时代名人女）姓名依史实。\n\n' +
+        _charHistRule +
+        (_userRosterR20.length > 0 ? '【用户已设计人物·名册必须收录】以下人物由用户详细设定钦定，名册必须逐字收录其姓名（定位/身份遵循用户设计，不得改写）：' + _userRosterR20.slice(0, 40).map(function (u) { return u.name + (u.desc ? '（' + u.desc + '）' : '') }).join('；') + '\n\n' : '') +
+        '【名册硬性要求】\n' +
+        '1. 总数必须达到 18 名（宁多勿少，严禁只给15名）：主角1 + 女主' + _flQuota + ' + 反派5 + 朋友3 + 配角8以上（按上方类型标签覆盖朝堂/军事/民生/商业各线）。\n' +
+        '2. 每个角色必须通过「耦合测试」：该角色只在本作成立；若换进别的故事也成立，说明耦合太弱，必须重新设计。\n' +
+        '3. title 是真实身份头衔徽章（2-8字，职官/爵位/称号/名号，如「兵部尚书」「满清睿亲王」「皇太后」），禁止使用描述性功能词（主角/反派/谋士/武将）。\n' +
+        '4. 真实历史人物（isHistorical=true）的姓名、title、faction 必须符合史实；虚构人物（isHistorical=false）姓名与身份必须符合时代，不得冒用真实历史人物。\n' +
+        '5. tier 为角色权重：S（主角/女主/头号反派）、A（核心反派/重臣/大将）、B（重要配角）、C（功能配角）。\n\n' +
+        '输出纯JSON（不要markdown、不要解释）：{"roster":[{"name":"","gender":"男/女","age":20,"rolePosition":"主角/女主/反派/朋友/配角/女配","title":"","faction":"","tier":"S/A/B/C","identityOneLine":"","narrativeFunction":"该角色承接哪条关键词/剧情线","isHistorical":true}]}'
+
+      // 🔥 2026-11-07 修复：名册姓名净化。实测模型把「李自成」写成「李自成为」（尾部残留谓语虚词），
+      //   该假名会被 S2 逐字照抄、S3 按名册覆写，最终整条链路落库都是 5 字假名 + 模板 identity。
+      //   此处只剥离「为/是/在/的/与」这类绝不可能是人名尾字的虚词，且剥离后仍需 ≥2 字才生效，
+      //   以免误伤「宇文成都」（尾字「都」）等真实复姓名。
+      var _sanCharName = function (_raw: string): string {
+        var _n = String(_raw || '').replace(/[\s\u3000]/g, '').trim()
+        var _tailBad = '为是在的与'
+        for (var _tk = 0; _tk < 2; _tk++) {
+          if (_n.length < 4) break
+          if (_tailBad.indexOf(_n.charAt(_n.length - 1)) === -1) break
+          var _try = _n.slice(0, -1)
+          if (_try.length < 2) break
+          _n = _try
+        }
+        return _n
+      }
+
+      // —— S1：名册蓝图调用 + 确定性校验 + 重试（最多3轮，失败带反馈）——
+      var _roster: any[] = []
+      var _s1Feedback = ''
+      for (var _s1Try = 0; _s1Try < 3; _s1Try++) {
         try {
-          var _pStart = Date.now()
-          // 🔥 2026-09-01 第19轮修复：补充批次大量角色与已有角色重名，被前端按名去重丢弃
-          //   （复测实锤：single 批次2 返回7个仅3个新增）。三层保障：
-          //   ① 每路指令内联「已有角色名单·禁止重名」；② 失败/重名槽位自动补生成（最多2轮）；
-          //   ③ 仍重名的兜底加后缀，保证每批名额一个不少。
-          var _cbR19: { size: number; needs: string[]; existing: string[]; phase: string; parallel?: boolean } = _charBatch
-          // 🔥 2026-09-01 第20轮：用户已设计人物 → 逐槽绑定。解析【人物设定】结构化名单，按 needs 顺序
-          //   为每个槽位预分配用户人物（主角→主角队列；女主/女配→女主队列→朋友/配角兜底；反派→反派队列；
-          //   朋友→朋友队列→配角兜底；配角→配角队列→朋友兜底），先到先得。补充批次扣除 existing 中
-          //   已生成姓名，避免同一用户人物跨批重复绑定后被按名去重丢弃。绑定槽位强制沿用用户姓名
-          //   （禁止改名/后缀/自创替代），未绑定槽位注入完整名单提示，全部强制「阵营+职能」具体定位。
-          // 🔥 第21轮：类型扩展 role（阵营+职能定位，由第21轮多信号融合解析器产出）/ score（重要性分）
-          try { _userRosterR20 = parseUserCharacterList(_charUserDesignRaw || '') } catch (_urE) { }
-          var _slotBindR20: Record<number, { name: string; desc: string; group: string; role?: string; score?: number } | null> = {}
-          var _rosterHintR20 = ''
-          if (_userRosterR20.length > 0) {
-            var _exSetR20: Record<string, boolean> = {}
-            for (var _exiR20 = 0; _exiR20 < _cbR19.existing.length; _exiR20++) { _exSetR20[_cbR19.existing[_exiR20]] = true }
-            var _poolR20: Record<string, Array<{ name: string; desc: string; group: string; role?: string; score?: number }>> = { '主角': [], '女主': [], '反派': [], '朋友': [], '配角': [] }
-            for (var _uriR20 = 0; _uriR20 < _userRosterR20.length; _uriR20++) {
-              var _ucR20 = _userRosterR20[_uriR20]
-              if (_exSetR20[_ucR20.name]) continue
-              ;(_poolR20[_ucR20.group] || _poolR20['配角']).push(_ucR20)
-            }
-            // 🔥 第21轮：池内按重要性分降序 —— 保证瞿式耜/李定国/多尔衮/吴三桂等核心人物优先占槽，
-            //   而非被「七位亲随」这类次要人物按文本顺序占满前排（实测旧逻辑会挤掉全部重臣）。
-            for (var _pkR21 in _poolR20) {
-              if (!Object.prototype.hasOwnProperty.call(_poolR20, _pkR21)) continue
-              _poolR20[_pkR21].sort(function (a, b) { return (Number(b.score) || 0) - (Number(a.score) || 0) })
-            }
-            var _needChainR20: Record<string, string[]> = {
-              '主角': ['主角'],
-              // 🔥 女主/女配为性别敏感槽位：绝不从朋友/配角池兜底（防止亲随武侍被绑成女主）
-              '女主': ['女主'],
-              '女配': ['女配', '女主'],
-              '反派': ['反派'],
-              '朋友': ['朋友', '配角'],
-              '配角': ['配角', '朋友'],
-            }
-            var _rosterLinesR20: string[] = []
-            for (var _uri2R20 = 0; _uri2R20 < _userRosterR20.length; _uri2R20++) {
-              var _uc2R20 = _userRosterR20[_uri2R20]
-              _rosterLinesR20.push(_uc2R20.name + (_uc2R20.desc ? '（' + _uc2R20.desc + '）' : ''))
-            }
-            _rosterHintR20 = _rosterLinesR20.slice(0, 40).join('；')
-            for (var _biR20 = 0; _biR20 < _cbR19.needs.length; _biR20++) {
-              var _bnR20 = _cbR19.needs[_biR20]
-              var _chainR20 = _needChainR20[_bnR20] || ['配角', '朋友']
-              var _boundR20: { name: string; desc: string; group: string; role?: string; score?: number } | null = null
-              for (var _ciR20 = 0; _ciR20 < _chainR20.length && !_boundR20; _ciR20++) {
-                var _qR20 = _poolR20[_chainR20[_ciR20]]
-                if (_qR20 && _qR20.length > 0) _boundR20 = _qR20.shift() || null
+          var _s1Resp = await callLLMWithFallback(llmConfig, [
+            { role: 'system', content: libPrompt + stylePrompt },
+            { role: 'user', content: charContextParts.join('\n') },
+            { role: 'user', content: _s1Prompt + (_s1Feedback ? '\n\n【⚠️ 上一轮名册未通过校验·必须逐条修复】' + _s1Feedback : '') },
+          ], undefined, { temperature: temperature, maxTokens: 4000, timeoutMs: 120000 })
+          var _s1Parsed: any = parseJSON(_s1Resp.content)
+          var _rArr: any = Array.isArray(_s1Parsed) ? _s1Parsed : (_s1Parsed && Array.isArray(_s1Parsed.roster) ? _s1Parsed.roster : (_s1Parsed && Array.isArray(_s1Parsed.characters) ? _s1Parsed.characters : null))
+          if (_rArr && _rArr.length > 0) {
+            var _rnSeen: Record<string, boolean> = {}
+            _roster = _rArr.filter(function (r: any) { return r && typeof r === 'object' && String(r.name || '').trim() }).map(function (r: any) {
+              var o: any = {
+                name: _sanCharName(String(r.name || '')),
+                gender: String(r.gender || '').trim(),
+                age: Number(r.age) || 0,
+                rolePosition: String(r.rolePosition || '配角').trim(),
+                title: String(r.title || '').trim(),
+                faction: String(r.faction || '').trim(),
+                tier: String(r.tier || 'B').trim(),
+                identityOneLine: String(r.identityOneLine || r.identity || '').trim(),
+                narrativeFunction: String(r.narrativeFunction || '').trim(),
+                isHistorical: r.isHistorical === true,
               }
-              _slotBindR20[_biR20] = _boundR20
-            }
-            // 🔥 第21轮：女主/女配槽若无真实女性角色可绑 → 降级为「配角」槽并用用户名单填充，
-            //   杜绝凭空自创女主（历史题材《永历中兴》用户未设计女主，旧逻辑会自创「苏清霜」造成设定污染）。
-            for (var _biR21 = 0; _biR21 < _cbR19.needs.length; _biR21++) {
-              if ((_cbR19.needs[_biR21] === '女主' || _cbR19.needs[_biR21] === '女配') && !_slotBindR20[_biR21]) {
-                _cbR19.needs[_biR21] = '配角'
-                var _chainR21 = ['配角', '朋友']
-                for (var _ciR21 = 0; _ciR21 < _chainR21.length && !_slotBindR20[_biR21]; _ciR21++) {
-                  var _qR21 = _poolR20[_chainR21[_ciR21]]
-                  if (_qR21 && _qR21.length > 0) _slotBindR20[_biR21] = _qR21.shift() || null
-                }
+              if (_lockProtoName && (o.rolePosition === '主角' || o.name === _lockProtoName)) {
+                o.name = _lockProtoName; o.rolePosition = '主角'
+                if (_lockProtoGender) o.gender = _lockProtoGender
+                if (_lockProtoAge > 0) o.age = _lockProtoAge
+                if (_lockProtoIdentity) o.identityOneLine = _lockProtoIdentity
               }
+              return o
+            }).filter(function (o: any) { if (_rnSeen[o.name]) return false; _rnSeen[o.name] = true; return true })
+            var _s1Problems: string[] = []
+            if (_roster.length < 15) _s1Problems.push('总数 ' + _roster.length + ' 名不足 15，必须补足到 15 名以上')
+            var _s1Proto: any = null
+            for (var _s1pi = 0; _s1pi < _roster.length; _s1pi++) { if (_roster[_s1pi].rolePosition === '主角') { _s1Proto = _roster[_s1pi]; break } }
+            if (_lockProtoName && !_s1Proto) _s1Problems.push('名册缺少 rolePosition="主角" 条目（姓名必须为 ' + _lockProtoName + '）')
+            var _s1Fls = _roster.filter(function (r: any) { return r.rolePosition === '女主' })
+            if (_s1Fls.length !== _flQuota) _s1Problems.push('女主数量为 ' + _s1Fls.length + '，「' + _flModeName + '」模式必须恰为 ' + _flQuota + ' 名')
+            for (var _s1fi = 0; _s1fi < _s1Fls.length; _s1fi++) {
+              if (_s1Fls[_s1fi].gender !== '女') _s1Problems.push('女主「' + _s1Fls[_s1fi].name + '」性别不是「女」')
+              else if (_mascNameCharsR.test(_s1Fls[_s1fi].name)) _s1Problems.push('女主「' + _s1Fls[_s1fi].name + '」姓名含男性化用字，必须改用明显女性化姓名（或依史实取真实历史女性）')
             }
-            // needs 可能因降级而改变 → 重算各槽位计数，保证「本批共需 N 个」差异化提示文案准确
-            for (var _nk4 in _needCountMap) { if (Object.prototype.hasOwnProperty.call(_needCountMap, _nk4)) delete _needCountMap[_nk4] }
-            for (var _nciR21 = 0; _nciR21 < _cbR19.needs.length; _nciR21++) { var _nk5 = _cbR19.needs[_nciR21]; _needCountMap[_nk5] = (_needCountMap[_nk5] || 0) + 1 }
-            var _boundCntR20 = 0
-            for (var _bkR20 in _slotBindR20) { if (Object.prototype.hasOwnProperty.call(_slotBindR20, _bkR20) && _slotBindR20[_bkR20]) _boundCntR20++ }
-            console.log('[characters] 用户人物逐槽绑定：名单 ' + _userRosterR20.length + ' 人，本轮绑定 ' + _boundCntR20 + '/' + _cbR19.needs.length + ' 槽（扣除已有 ' + Object.keys(_exSetR20).length + ' 名），绑定=[' + Object.keys(_slotBindR20).map(function (k) { var _b = _slotBindR20[Number(k)]; return _b ? _b.name : '-' }).join('、') + ']')
-          }
-          var _genOne = function (_need: string, _idx: number, _extraHint: string): Promise<any> {
-            var _occ = 0
-            for (var _oi = 0; _oi <= _idx; _oi++) { if (_cbR19.needs[_oi] === _need) _occ++ }
-            var _total = _needCountMap[_need]
-            var _dupHint = (_total > 1)
-              ? ('本批共需 ' + _total + ' 个「' + _need + '」，你是第 ' + _occ + ' 个。你必须与其他「' + _need + '」【姓名、身份、动机、外貌完全不同】，严禁使用相同姓名。')
-              : ''
-            var _existHint2 = (_cbR19.existing.length > 0)
-              ? ('【已有角色·禁止重名】以下 ' + _cbR19.existing.length + ' 个姓名已存在，新角色姓名必须与之完全不同（也禁止仅改一字）：' + _cbR19.existing.slice(0, 60).join('、') + '。')
-              : ''
-            // 🔥 第20轮：本槽位用户人物绑定提示（绑定=指定人物；未绑定=名单提示；无名单=定位要求）
-            var _bindR20b = _slotBindR20 ? (_slotBindR20[_idx] || null) : null
-            var _bindHintR20 = ''
-            if (_bindR20b) {
-              // 🔥 第21轮：把多信号融合解析器算出的 role（阵营+具体职能）作为【强制措辞】下发，
-              //   不再让模型自由发挥「所属阵营+职能」，避免同阵营角色定位雷同或漂移（如把瞿式耜写成"某谋士"）。
-              _bindHintR20 = ('【🔥🔥 用户已设计人物·本槽位指定·最高优先级】本路 rolePosition「' + _need + '」必须使用用户已设计的人物：姓名「' + _bindR20b.name + '」' +
-                (_bindR20b.role ? '【剧情定位】' + _bindR20b.role : '') +
-                (_bindR20b.desc ? '（用户设定：' + _bindR20b.desc + '）' : '') +
-                '。必须原样沿用该姓名，禁止改名、禁止加后缀、禁止用自创角色替代；以其身份/阵营/性格为根基展开完整角色卡，其他字段按本步规范补全。' +
-                'identity 首句必须写明「所属阵营 + 具体职能」的具体剧情定位' +
-                (_bindR20b.role
-                  ? '，【必须原样采用「' + _bindR20b.role + '」这一措辞作为开头】，不得改写、不得笼统化为"某势力人物"'
-                  : '（如「永历阵营（主角阵营）·忠臣文官」「清军阵营（敌对）·统兵大将」）') + '。' +
-                '该姓名豁免上文第7/8条命名铁律，用户设定中已命名的人物使用真实姓名不视为违规。')
-            } else if (_rosterHintR20) {
-              _bindHintR20 = ('【用户已设计人物名单·优先采用】' + _rosterHintR20 + '。若名单中存在身份符合「' + _need + '」定位且尚未被本批其他槽位采用的人物，必须优先采用并沿用其姓名与设定；仅当无合适人选时才可自创。' +
-                'identity 首句必须按「所属阵营 + 具体职能」格式写明具体剧情定位，禁止笼统定位。')
-            } else {
-              _bindHintR20 = ('identity 首句必须按「所属阵营 + 具体职能」格式写明该角色的具体剧情定位（如「主角阵营·忠臣文官」「敌方阵营·统兵大将」「主角阵营·御前侍卫亲随」），禁止笼统定位，同阵营内职能互不雷同。')
-            }
-            var _msgs = messagesChar.map(function (m: any) { return { role: m.role, content: m.content } })
-            _msgs.push({
-              role: 'user',
-              content:
-                '【🔥 并行单角色·最高优先级指令】你本轮【只需生成恰好 1 个】角色，其 rolePosition 必须严格为「' + _need + '」' +
-                '（role 字段也写「' + _need + '」）。必须包含上文要求的所有字段（identity/personality/personalityOrigin/appearance/background/' +
-                'motivation/goal/hiddenTraits/weaknesses/growthArc/skills/stats/title/aliases/birthplace/realmLevel/weapons/techniques/experience/' +
-                'socialNetwork 等全部，不得缺项），每个文字字段详实具体（40-60 字），严禁占位符/模板句/雷同。其中 title 为真实身份头衔（≤12字短词，不受 40-60 字约束）：凡本槽位人物在用户设定中以「姓名（身份/头衔）」括号钦定身份的，title 必【原样】写括号内身份（如"满清睿亲王"）；其余角色也必须输出精炼的真实身份头衔（基于其官职/爵位/名分自拟，如「兵部尚书」）。严禁写说明性职能词（主角/配角/反派/女主/盟友/导师/忠臣/武将等）、严禁整句/占位，title 只写身份头衔，不写诨名外号或别名，与 aliases/identity/rolePosition 各自独立、互不推导。' +
-                '⚠️ 输出前自查：JSON 必须完整闭合（所有字段写完、以 }} 收尾），宁可字段精简也绝不允许中途截断——identity/background/growthArc 三个字段在 JSON 中段，最易被截断丢失，务必保证完整。' +
-                '⚠️ 所有字符串值内绝对禁止出现英文双引号 "（含缩写/引用/称号），需要引用时一律改用中文引号「」或『』，否则 JSON 将解析失败。' +
-                _existHint2 +
-                _bindHintR20 +
-                (_dupHint ? _dupHint : '') +
-                (_extraHint ? _extraHint : '') +
-                '输出严格 JSON：{"characters":[{...仅 1 个元素，即该角色...}]}，不要生成其他角色。',
-            })
-            // 🔥 第20轮：maxTokens 1100→2600——角色卡 30+ 字段，identity 排在第 17 位，1100 预算下 JSON 中段截断，
-            //   identity 缺失触发模板兜底（身份全部变成"权臣或敌国君主"通用句）、女主整卡解析失败被丢（14/15 根因）
-            // 🔥 2026-09-03：并行单角色超时 45s→90s——30+ 字段完整角色卡在 glm/deepseek 上 45s 常被截断，
-            //   女主槽最易失败（导致单女主小说 femaleLead 为空的后端根因之一）
-            return callLLMWithFallback(llmConfig, _msgs, undefined, { temperature: temperature, maxTokens: 4200, timeoutMs: 90000 })
-              .then(function (_resp) {
-                var _r = parseJSON(_resp.content)
-                var _arr: any = Array.isArray(_r) ? _r : (Array.isArray(_r && _r.characters) ? _r.characters : null)
-                if (_arr && _arr.length > 0) {
-                  var _c = _arr[0]
-                  if (_c && typeof _c === 'object') {
-                    // 🔥 第20轮·续：乱键清洗兜底——引号错乱被下游修复链修出"合法但键错乱"的 JSON 时，
-                    //   丢弃所有非合法标识符键，防止脏键随角色卡入库污染设定
-                    for (var _kR20 in _c) {
-                      if (Object.prototype.hasOwnProperty.call(_c, _kR20) && !/^[A-Za-z_][A-Za-z0-9_]*$/.test(_kR20)) {
-                        console.log('[characters] 并行单角色乱键清洗：丢弃非法键「' + _kR20.slice(0, 40) + '」')
-                        delete _c[_kR20]
-                      }
-                    }
-                    _c.rolePosition = _need; _c.role = _need
-                    // 🔥 第20轮：绑定槽位强制回写用户姓名——模型哪怕微改姓名（漂移）也一并纠正，保证零漂移
-                    if (_bindR20b) { _c.name = _bindR20b.name; (_c as any).__userBoundR20 = _bindR20b.name }
-                    return _c
-                  }
-                }
-                return null
-              })
-              .catch(function (_e) { console.log('[characters] 并行单角色「' + _need + '」失败:', _e && _e.message); return null })
-          }
-          var _pResolved: any[] = new Array(_cbR19.needs.length)
-          await Promise.all(_cbR19.needs.map(function (_need, _idx) {
-            return _genOne(_need, _idx, '').then(function (_c) { _pResolved[_idx] = _c })
-          }))
-          // ② 补生成轮：空槽 + 与已有角色/同批重名的槽位，最多 2 轮
-          var _takenNames: Record<string, boolean> = {}
-          for (var _eiR19 = 0; _eiR19 < _cbR19.existing.length; _eiR19++) { var _en2R19 = String(_cbR19.existing[_eiR19]).trim(); if (_en2R19) _takenNames[_en2R19] = true }
-          for (var _roundR19 = 0; _roundR19 < 2; _roundR19++) {
-            var _retrySlots: number[] = []
-            for (var _piR19 = 0; _piR19 < _pResolved.length; _piR19++) {
-              var _rcR19 = _pResolved[_piR19]
-              var _rnR19 = _rcR19 ? String(_rcR19.name || '').trim() : ''
-              if (!_rcR19 || !_rnR19 || _takenNames[_rnR19]) _retrySlots.push(_piR19)
-              else _takenNames[_rnR19] = true
-            }
-            if (_retrySlots.length === 0) break
-            console.log('[characters] 并行补生成第' + (_roundR19 + 1) + '轮：' + _retrySlots.length + ' 个槽位（' + _retrySlots.map(function (_si) { return '第' + (_si + 1) + '路「' + _cbR19.needs[_si] + '」' }).join('、') + '）')
-            await Promise.all(_retrySlots.map(function (_slotIdx) {
-              var _oldName = _pResolved[_slotIdx] ? String(_pResolved[_slotIdx].name || '').trim() : ''
-              var _slotBindR = _slotBindR20 ? (_slotBindR20[_slotIdx] || null) : null
-              var _hint = ''
-              if (_slotBindR) {
-                // 🔥 第20轮：绑定槽位重做时禁止「另起新姓名」——必须原样输出绑定用户人物
-                _hint = ('【⚠️ 作废重做】你此前对该槽位的输出已作废。请严格按【用户已设计人物·本槽位指定】重新输出姓名「' + _slotBindR.name + '」的完整角色卡，姓名必须一字不差。')
-              } else if (_oldName) {
-                _hint = ('【⚠️ 作废重做】你此前生成的姓名「' + _oldName + '」与已有角色重名，已作废。必须另起一个完全不同的全新中文姓名，rolePosition 仍为「' + _cbR19.needs[_slotIdx] + '」。')
-              } else {
-                // 🔥 第20轮·续：空槽（上次整路解析失败）针对性重做提示——多数因值内未转义引号/截断导致 JSON 解析失败
-                _hint = ('【⚠️ 作废重做】你此前对该槽位的输出无法解析为合法 JSON（已作废）。请重新输出完整角色卡：①所有字符串值内禁止出现英文双引号，引用一律用中文引号「」；②JSON 必须完整闭合，identity/background/growthArc 不得截断。rolePosition 仍为「' + _cbR19.needs[_slotIdx] + '」。')
-              }
-              return _genOne(_cbR19.needs[_slotIdx], _slotIdx, _hint).then(function (_c) { _pResolved[_slotIdx] = _c })
-            }))
-          }
-          // ③ 兜底：仍重名的强制加后缀，保证名额不丢
-          var _pCollected = _pResolved.filter(function (_c) { return _c && typeof _c === 'object' })
-          // 同批姓名去重保护：若两个并行结果同名（模型偶发），强制加序号后缀，避免下游按名去重把同批两个角色并成一个
-          if (_pCollected.length > 1) {
-            var _seenN: Record<string, boolean> = {}
-            for (var _pciR19 = 0; _pciR19 < _pCollected.length; _pciR19++) {
-              var _rc2R19 = _pCollected[_pciR19]
-              var _rn2R19 = String(_rc2R19.name || '').trim()
-              if (_rn2R19 && (_seenN[_rn2R19] || _takenNames[_rn2R19])) {
-                // 🔥 第20轮：用户绑定人物禁止加后缀改名（保零漂移）；理论上不会撞名（绑定池已扣除 existing）
-                if ((_rc2R19 as any).__userBoundR20) {
-                  console.log('[characters] 用户绑定人物撞名保护：' + _rn2R19 + ' 不加后缀（保持原姓名）')
-                } else {
-                  var _sxR19 = 2
-                  while (_seenN[_rn2R19 + '·' + _sxR19] || _takenNames[_rn2R19 + '·' + _sxR19]) _sxR19++
-                  _rc2R19.name = _rn2R19 + '·' + _sxR19
-                  _seenN[_rc2R19.name] = true
-                  console.log('[characters] 并行重名兜底改名: ' + _rn2R19 + ' → ' + _rc2R19.name)
-                }
-              } else if (_rn2R19) {
-                _seenN[_rn2R19] = true
-              }
-            }
-          }
-          if (_pCollected.length > 0) {
-            charsFromAI = _pCollected.filter(function (_cP: any) { return _cP && typeof _cP === 'object' })
-            console.log('[characters] 并行完成：' + _pCollected.length + '/' + _cbR19.needs.length + ' 成功，耗时 ' + (Date.now() - _pStart) + 'ms')
+            var _s1NoTitle = _roster.filter(function (r: any) { return !r.title })
+            if (_s1NoTitle.length > 0) _s1Problems.push('以下角色缺少 title 头衔徽章：' + _s1NoTitle.slice(0, 8).map(function (r: any) { return r.name }).join('、'))
+            if (_s1Problems.length === 0) { console.log('[characters] S1 名册校验通过：' + _roster.length + ' 人'); break }
+            _s1Feedback = _s1Problems.join('；')
+            console.log('[characters] S1 名册校验第' + (_s1Try + 1) + '轮未过：' + _s1Feedback)
+            if (_s1Try === 2 && _roster.length >= 15) { console.log('[characters] S1 三轮后仍有问题，采用 ' + _roster.length + ' 人名册（优于硬编码兜底）'); break }
           } else {
-            console.log('[characters] 并行全部失败，回落单调用')
+            _s1Feedback = '上一轮未返回有效名册数组'
+            console.log('[characters] S1 名册解析失败，第' + (_s1Try + 1) + '轮')
           }
-        } catch (_pe) {
-          console.log('[characters] 并行异常，回落单调用', _pe)
+        } catch (_s1e) {
+          _s1Feedback = '上一轮调用/解析异常'
+          console.log('[characters] S1 异常，第' + (_s1Try + 1) + '轮:', _s1e && (_s1e as any).message)
         }
       }
 
-      // 🔥 2026-08-02修复：角色生成优先用新路由体系（outline→Qwen3.6-35B 35B大模型+16000maxTokens），
-      //    失败再回退callLLMWithFallback。超时从45秒调整为120秒，35B大模型需要更多时间生成20+角色。
-      //    2次重试×120秒超时，阈值20人，不足时继续重试（限流已由全局闸门快速失败切 provider 兜底，不再螺旋）
-      // 🔥 2026-08-29 提速：原 2次重试×120s + 硬阈值20 导致角色步在"差几个就重试"时螺旋到 5-10 分钟。
-      //   改为单次调用、阈值降到 14（核心阵容足够驱动后续大纲/正文，更多角色写章节时按需补），
-      //   maxTokens 16000→8000（DeepSeek 生成更快），timeoutMs 120s→90s。配合前端超时放宽，单步约 40-80s。
-      if (charsFromAI.length === 0) { for (var charRetry = 0; charRetry < 1; charRetry++) {
-        try {
-          var charResp: { content: string; usedModel?: string }
-          // 🔥 2026-09-01 第15轮：分批模式按配额分配 maxTokens / 超时，**字段完整优先**
-          //   · 5 人小批次：~1100 token/角色 × 5 ≈ 5500 token，每字段 40-60 字不会截断
-          // 🔥 2026-09-01 第15轮：用户硬性要求「首批 5 人 30 秒内」。实测结论（已验证）：
-          //   glm-4-flash 为当前最稳模型（~68 tok/s），5 个满 schema 角色需 ~3300-3600 token → 下限 ~50s；
-          //   Qwen3.5-4B/DeepSeek-V4-Flash/glm-4.7-flash 在硅基流动均超时(90s)/500，不可用。
-          //   故单调用路径下 30s 物理不可达，锁定 3600 token / 75s 兜底，保证 5 人「字段全·质量稳」一次返回（~53s）。
-          //   ⚡ 真正压到 30s 需改为「5 路并行单角色生成」（每路 ~700 token → 墙钟 ~15s），见交付说明，待用户确认后实施。
-          var _charMaxTokens = _charBatch ? Math.max(4000, (_charBatch.size || 5) * 1400) : 8000
-          var _charTimeoutMs = _charBatch ? 120000 : 90000
-          console.log('[characters] 调用参数：' + (_charBatch ? ('分批 size=' + _charBatch.size + ' phase=' + _charBatch.phase) : '整批') + ', maxTokens=' + _charMaxTokens + ', timeoutMs=' + _charTimeoutMs)
-          charResp = await callLLMWithFallback(llmConfig, messagesChar, undefined, { temperature: temperature, maxTokens: _charMaxTokens, timeoutMs: _charTimeoutMs })
-          console.log('[characters] 调用模型=' + (charResp.usedModel || llmConfig?.model || '') + ' 生成角色')
-          charContent = charResp.content
-          charResult = parseJSON(charContent)
-          if (charResult && typeof charResult === 'object') {
-            // 🔥 修复：兼容多种返回格式 {characters:[...]} 或直接返回数组
-            var extracted = null
-            if (Array.isArray(charResult)) {
-              extracted = charResult
-            } else if (Array.isArray(charResult.characters)) {
-              extracted = charResult.characters
-            } else if (Array.isArray(charResult.data)) {
-              extracted = charResult.data
-            } else if (charResult.data && Array.isArray(charResult.data.characters)) {
-              extracted = charResult.data.characters
-            } else if (charResult.protagonist || charResult.femaleLead || charResult.antagonist || Array.isArray(charResult.supportingChars) || Array.isArray(charResult.supporting)) {
-              // 兼容结构化格式 {protagonist:..., femaleLead:..., antagonist:..., supportingChars: [...]}
-              var _flatChars: any[] = []
-              if (charResult.protagonist) _flatChars.push(charResult.protagonist)
-              if (charResult.femaleLead) _flatChars.push(charResult.femaleLead)
-              if (Array.isArray(charResult.femaleLeads)) _flatChars = _flatChars.concat(charResult.femaleLeads)
-              if (charResult.antagonist) _flatChars.push(charResult.antagonist)
-              if (Array.isArray(charResult.antagonists)) _flatChars = _flatChars.concat(charResult.antagonists)
-              if (Array.isArray(charResult.supportingChars)) _flatChars = _flatChars.concat(charResult.supportingChars)
-              if (Array.isArray(charResult.supporting)) _flatChars = _flatChars.concat(charResult.supporting)
-              if (_flatChars.length > 0) {
-                extracted = _flatChars
-                console.log('[characters] AI返回了结构化格式(protagonist/femaleLead等)，已转换为扁平数组(' + _flatChars.length + '个角色)')
-              }
-            }
-            if (Array.isArray(extracted) && extracted.length > 0) {
-              // 🔥 修复问题3：角色数量必须≥15名，提高接受阈值
-              // 检查是否存在主角
-              var hasProto = false
-              for (var _ci = 0; _ci < extracted.length; _ci++) {
-                var _rp = String(extracted[_ci].rolePosition || extracted[_ci].role || '')
-                if (/主角|protagonist/i.test(_rp)) { hasProto = true; break }
-                if (forcedProtagonistName && extracted[_ci].name && String(extracted[_ci].name).indexOf(forcedProtagonistName) !== -1) { hasProto = true; break }
-              }
-              // 🔥 2026-08-29 提速：阈值 20→14，核心阵容足够驱动大纲/正文，避免因差几个反复重试拖垮耗时
-              // 🔥 2026-09-01 第13轮：分批模式按本轮配额放宽阈值（5 人批次达 3 人即接受），
-              //   否则小批次永远被判"数量不足"而白白重试，直接击穿 30 秒预算
-              var _minAcceptCount = _charBatch ? Math.max(1, Math.floor(_charBatch.size * 0.6)) : 14
-              if ((hasProto && extracted.length >= _minAcceptCount) || extracted.length >= _minAcceptCount) {
-                charsFromAI = extracted.filter(function (_cF: any) { return _cF && typeof _cF === 'object' })
-                // 🔥 2026-09-01 第13轮：分批模式下去重（剔除与已有角色重名者）并严格截断到本轮配额
-                if (_charBatch) {
-                  var _seenNames: Record<string, boolean> = {}
-                  for (var _en = 0; _en < _charBatch.existing.length; _en++) _seenNames[_charBatch.existing[_en]] = true
-                  var _deduped: any[] = []
-                  for (var _dn = 0; _dn < charsFromAI.length; _dn++) {
-                    var _cn = String((charsFromAI[_dn] && charsFromAI[_dn].name) || '').trim()
-                    if (_cn && _seenNames[_cn]) { console.log('[characters] 分批去重：剔除重复角色 ' + _cn); continue }
-                    if (_cn) _seenNames[_cn] = true
-                    _deduped.push(charsFromAI[_dn])
-                  }
-                  charsFromAI = _deduped
-                  if (charsFromAI.length > _charBatch.size) {
-                    console.log('[characters] 分批截断：' + charsFromAI.length + ' → ' + _charBatch.size)
-                    charsFromAI = charsFromAI.slice(0, _charBatch.size)
-                  }
-                }
-                console.log('[characters] AI返回了 ' + charsFromAI.length + ' 个角色(有主角=' + hasProto + ', 阈值=' + _minAcceptCount + ')，接受结果')
-                break
-              } else {
-                console.log('[characters] 角色数量不足(' + extracted.length + '<' + _minAcceptCount + ')，第' + (charRetry + 1) + '次重试')
-                charsFromAI = extracted.filter(function (_cF: any) { return _cF && typeof _cF === 'object' })
-                if (charRetry < 2) {
-                  continue
-                } else {
-                  console.log('[characters] 已重试3次仍不足20人，使用当前结果(' + extracted.length + '人)')
-                  break
-                }
-              }
-            } else {
-              console.log('[characters] JSON解析成功但无有效characters数组，第' + (charRetry + 1) + '次重试')
-              if (charRetry < 2) {
-                continue
-              } else {
-                charsFromAI = []
-                break
-              }
-            }
-          } else {
-            console.log('[characters] JSON解析失败，第' + (charRetry + 1) + '次重试')
-            if (charRetry < 2) {
+      // —— S2：整卡展开（按名册分块 · 3 并发展开）——
+      // 🔥 2026-11-07 修复：单次调用要求模型一口气输出 15 张整卡 ≈ 2.5–4 万 tokens，
+      //   远超 maxTokens(16000) 与免费模型 4096 的输出上限，必然 JSON 截断 → 解析失败 → 502。
+      //   改为按名册 2 张一块 + 3 并发，并对单卡字段限长（免费模型输出上限约 4096 tokens，
+      //   此前 2 卡块的实测 rawLen 达 9339–10364 字符被 finish_reason=length 截断在字符串中间）。
+      if (_roster.length >= 15) {
+        var _s2BuildExtra = function (_items: any[], _doneNames: string[]): string {
+          var _s2TargetNames = _items.map(function (r: any) { return String(r.name || '').trim() }).join('、')
+          return '\n\n【🔥🔥🔥 主要人物名册蓝图·唯一权威·最高优先级】\n' + JSON.stringify({ roster: _items }) +
+            (_doneNames.length > 0 ? '\n【已完成角色·禁止重复生成】' + _doneNames.join('、') : '') +
+            '\n【🔥 本次唯一输出目标】本次只需生成 ' + _items.length + ' 张卡：' + _s2TargetNames + '。\n' +
+            '【数量铁律·覆盖上方「必须一次性输出全部角色≥15名」】本条优先于上文任何数量要求：本次只输出上述 ' + _items.length + ' 张，一张不多、一张不少。\n' +
+            '严禁输出本次名册之外的任何角色（尤其禁止输出主角卡或已完成的角色，除非本次目标就是他们）；一旦输出其他角色，本次调用判定为失败。\n' +
+            '\n【展开铁律】\n' +
+            '1. 必须输出恰好 ' + _items.length + ' 张完整角色卡，与本次给定名册逐条对应，不多不少；name/rolePosition/title/gender/age/faction 必须逐字照抄名册，禁止改名、增删角色。\n' +
+            '2. 其余全部字段（identity/background/personality/appearance/motivation/goal/growthArc/skills/aliases/birthplace/realmLevel/stats 等）基于名册 identityOneLine 与 narrativeFunction 展开，遵守上方字段规范与质量铁律。\n' +
+            '3. 【强制限长·防截断】每个文本字段最多 30 个汉字；单张卡的 JSON 总长控制在 900 字以内；禁止堆砌排比、禁止重复修饰、禁止同义反复。宁可精炼，绝不允许 JSON 被截断。\n' +
+            '3.1 【字段非空铁律】title（头衔徽章）、weaknesses（弱点软肋）绝不可为空、不可写"无/待定/暂无"：title 取名册 title，若名册为空则取身份中最具辨识度的官职/封号/称谓（≤6 字）；weaknesses 必须是该角色独有的具体短板。\n' +
+            '3.2 【身份自洽铁律】identity 必须体现名册的 rolePosition 与 faction：反派阵营（清/后金/大西/农民军）不得写成"忠臣/主角盟友"；忠臣阵营不得出现"与主角对立/故事冲突核心来源/内部反对派"等反派模板句。\n' +
+            '4. 按名册顺序输出，全文必须以 }]} 完整闭合。\n' +
+            (_lockProtoName ? '5. 主角卡四字段锁定：姓名=' + _lockProtoName + (_lockProtoGender ? '、性别=' + _lockProtoGender : '') + (_lockProtoAge ? '、年龄=' + _lockProtoAge : '') + (_lockProtoIdentity ? '、identity=' + _lockProtoIdentity : '') + '，不得偏离一字。\n' : '') +
+            '输出JSON：{"characters":[...全部卡...]}'
+        }
+        var _s2Done: any[] = []
+        var _s2DoneNames: string[] = []
+        // 🔥 实测：智谱免费档在 llm.ts 里被锁死「1 并发 + 4s 最小间隔」，我方并发数对总耗时无效。
+        //   单卡/次实测约 24s（19 张要 8 分钟，必然撞 540s 截止），改为 2 卡/次 + 严格限长（单卡 ≤900 字），
+        //   调用数直接减半；仍保留 4 并发（对其他 provider 有效），并按名册顺序优先保证前 15 张。
+        var _s2Deadline = Date.now() + 540000
+        var _s2Target = Math.min(15, _roster.length)
+        var _s2Queue: any[][] = []
+        for (var _s2qi = 0; _s2qi < _roster.length; _s2qi += 2) _s2Queue.push(_roster.slice(_s2qi, _s2qi + 2))
+        // 🔥 免费模型（4096 输出上限）常在 JSON 中间截断：整块 parse 失败会连已经写完整的卡一起丢掉。
+        //   这里按括号配对逐卡抢救，凡是已闭合的对象都保留，剩余角色再走单卡重试。
+        var _s2Salvage = function (_text: string): any[] {
+          var _out: any[] = []
+          if (!_text) return _out
+          var _cIdx = _text.indexOf('"characters"')
+          var _aIdx = _cIdx >= 0 ? _text.indexOf('[', _cIdx) : -1
+          if (_aIdx < 0) return _out
+          var _depth = 0, _objStart = -1, _inStr = false, _esc = false
+          for (var _si = _aIdx + 1; _si < _text.length; _si++) {
+            var _ch = _text.charAt(_si)
+            if (_inStr) {
+              if (_esc) _esc = false
+              else if (_ch === '\\') _esc = true
+              else if (_ch === '"') _inStr = false
               continue
-            } else {
-              charsFromAI = []
-              break
+            }
+            if (_ch === '"') { _inStr = true; continue }
+            if (_ch === '{') { if (_depth === 0) _objStart = _si; _depth++ }
+            else if (_ch === '}') {
+              _depth--
+              if (_depth === 0 && _objStart >= 0) {
+                try { _out.push(JSON.parse(_text.slice(_objStart, _si + 1))) } catch (_s2pe) { }
+                _objStart = -1
+              }
+              if (_depth < 0) break
             }
           }
-        } catch (err) {
-          console.log('[characters] 生成异常:', err, '，第' + (charRetry + 1) + '次重试')
-          if (charRetry < 2) {
-            continue
-          } else {
-            charsFromAI = []
-            break
+          return _out
+        }
+        var _s2Calls = 0
+        // 1 卡/次时每次调用只推进 1 张，18 人 × 最多 3 次尝试 = 54，留 6 次余量
+        var _s2MaxCalls = 60
+        var _s2RetryBudget = 20
+        var _s2Attempts: Record<string, number> = {}
+        // 失败块（含单卡）统一重新入队：单卡也是「拆为单卡」的最终形态，若直接丢弃就会永远差 1 张而触发 502
+        var _s2Requeue = function (_pending: any[]): void {
+          for (var _s2rqi = 0; _s2rqi < _pending.length; _s2rqi++) {
+            var _s2rnm = String(_pending[_s2rqi].name || '').trim()
+            if (_s2DoneNames.indexOf(_s2rnm) !== -1) continue
+            var _s2att = _s2Attempts[_s2rnm] || 0
+            if (_s2att >= 3) { console.log('[characters] S2 放弃角色（' + _s2rnm + ' 已尝试 ' + _s2att + ' 次）'); continue }
+            if (_s2RetryBudget <= 0) { console.log('[characters] S2 放弃角色（' + _s2rnm + ' 重试预算耗尽）'); continue }
+            _s2RetryBudget--
+            _s2Queue.push([_pending[_s2rqi]])
           }
         }
-      }
+        var _s2RunBatch = async function (_batchItems: any[]): Promise<void> {
+          if (_s2Calls >= _s2MaxCalls || Date.now() >= _s2Deadline) return
+          var _pending = _batchItems.filter(function (r: any) { return _s2DoneNames.indexOf(String(r.name || '').trim()) === -1 })
+          if (_pending.length === 0) return
+          _s2Calls++
+          var _batchNames = _pending.map(function (r: any) { return String(r.name || '').trim() })
+          for (var _s2aci = 0; _s2aci < _batchNames.length; _s2aci++) _s2Attempts[_batchNames[_s2aci]] = (_s2Attempts[_batchNames[_s2aci]] || 0) + 1
+          try {
+            var _s2Resp = await callLLMWithFallback(llmConfig, messagesChar.concat([{ role: 'user', content: _s2BuildExtra(_pending, _s2DoneNames.slice(-8)) }]), undefined, { temperature: temperature, maxTokens: 8192, timeoutMs: 180000 })
+            var _s2Parsed = parseJSON(_s2Resp.content)
+            var _s2Arr: any = _s2Parsed && Array.isArray(_s2Parsed.characters) ? _s2Parsed.characters : (Array.isArray(_s2Parsed) ? _s2Parsed : null)
+            if (!_s2Arr || _s2Arr.length === 0) {
+              var _s2Sv = _s2Salvage(String(_s2Resp.content || ''))
+              if (_s2Sv.length > 0) { _s2Arr = _s2Sv; console.log('[characters] S2 JSON 被截断，逐卡抢救出 ' + _s2Sv.length + ' 张（' + _batchNames.join('、') + '）') }
+            }
+            var _s2Got: any[] = []
+            var _s2UsedCardIdx: Record<number, boolean> = {}
+            if (_s2Arr && _s2Arr.length > 0) {
+              // 第一轮：严格姓名匹配（名册逐字照抄的卡）
+              for (var _s2ai = 0; _s2ai < _s2Arr.length; _s2ai++) {
+                var _s2c: any = _s2Arr[_s2ai]
+                if (!_s2c || typeof _s2c !== 'object') continue
+                var _s2n = String(_s2c.name || '').trim()
+                if (!_s2n || _s2DoneNames.indexOf(_s2n) !== -1) continue
+                if (_batchNames.indexOf(_s2n) === -1) continue
+                _s2UsedCardIdx[_s2ai] = true
+                _s2DoneNames.push(_s2n)
+                _s2Got.push(_s2c)
+              }
+              // 🔥 2026-11-07 修复：位置兜底绑定。旧逻辑对「模型改名/写别名/漏写 name」的卡直接丢弃 →
+              //   一块 2 张只回 1 张或 0 张，实测 S2 仅产出 6/15。名册卡是本块唯一权威来源，
+              //   模型按名册顺序输出时可按位置把剩余卡绑到未完成角色（姓名取回名册值，S3 还会强制覆写 title/rolePosition/gender）。
+              if (_s2Got.length < _pending.length) {
+                var _s2LeftNames: string[] = []
+                for (var _s2li = 0; _s2li < _pending.length; _s2li++) {
+                  var _s2ln = String(_pending[_s2li].name || '').trim()
+                  if (_s2DoneNames.indexOf(_s2ln) === -1) _s2LeftNames.push(_s2ln)
+                }
+                var _s2LeftCards: any[] = []
+                for (var _s2ci = 0; _s2ci < _s2Arr.length; _s2ci++) {
+                  if (_s2UsedCardIdx[_s2ci]) continue
+                  var _s2cc: any = _s2Arr[_s2ci]
+                  if (!_s2cc || typeof _s2cc !== 'object') continue
+                  // 已属于其他角色的卡不参与兜底（避免把已完成的卡重复绑定）
+                  var _s2ccName = String(_s2cc.name || '').trim()
+                  if (_s2ccName && _s2DoneNames.indexOf(_s2ccName) !== -1) continue
+                  // 🔥 2026-11-07 修复：若卡上的姓名是名册里的其他真实角色（例如要求写「瞿式耜」却回了主角「朱由榔」），
+                  //   绝不能按位置绑到本次目标名下 —— 否则会把主角/别人的卡面内容套到其他人身上，制造「姓名与身份对不上」。
+                  //   只有姓名缺失、或姓名不是名册中任何角色（模型写了别名/漏写 name）时才允许按位置兜底。
+                  var _s2ccIsOtherRoster = false
+                  if (_s2ccName) {
+                    for (var _s2rri = 0; _s2rri < _roster.length; _s2rri++) {
+                      if (String(_roster[_s2rri].name || '').trim() === _s2ccName) { _s2ccIsOtherRoster = true; break }
+                    }
+                  }
+                  if (_s2ccIsOtherRoster) continue
+                  _s2LeftCards.push(_s2cc)
+                }
+                var _s2BindN = Math.min(_s2LeftNames.length, _s2LeftCards.length)
+                for (var _s2bi = 0; _s2bi < _s2BindN; _s2bi++) {
+                  var _s2BindCard: any = _s2LeftCards[_s2bi]
+                  _s2BindCard.name = _s2LeftNames[_s2bi]
+                  _s2DoneNames.push(_s2LeftNames[_s2bi])
+                  _s2Got.push(_s2BindCard)
+                  console.log('[characters] S2 位置兜底绑定：' + _s2LeftNames[_s2bi] + '（模型原名 ' + String(_s2LeftCards[_s2bi].name || '') + '）')
+                }
+              }
+            }
+            if (_s2Got.length === 0) {
+              console.log('[characters] S2 本块解析为空（' + _batchNames.join('、') + '），重新入队重试')
+              _s2Requeue(_pending)
+              return
+            }
+            _s2Done = _s2Done.concat(_s2Got)
+            console.log('[characters] S2 整卡展开：+' + _s2Got.length + '（' + _s2Done.length + '/' + _roster.length + '，调用 ' + _s2Calls + ' 次）')
+            // 🔥 2026-11-07 修复：部分成功必须回队。旧逻辑只在「全空」时重排，
+            //   2 张块只回 1 张时另一张永久丢失 —— 这是 15 人名册只得 6 张卡的另一半原因。
+            if (_s2Got.length < _pending.length) {
+              var _s2Miss: any[] = []
+              for (var _s2mi = 0; _s2mi < _pending.length; _s2mi++) {
+                var _s2mn = String(_pending[_s2mi].name || '').trim()
+                if (_s2DoneNames.indexOf(_s2mn) === -1) _s2Miss.push(_pending[_s2mi])
+              }
+              if (_s2Miss.length > 0) {
+                console.log('[characters] S2 本块缺卡 ' + _s2Miss.map(function (r: any) { return r.name }).join('、') + '，重新入队')
+                _s2Requeue(_s2Miss)
+              }
+            }
+          } catch (_s2e) {
+            console.log('[characters] S2 展开调用异常（' + _batchNames.join('、') + '）:', _s2e && (_s2e as any).message)
+            _s2Requeue(_pending)
+          }
+        }
+        var _s2Worker = async function (): Promise<void> {
+          while (Date.now() < _s2Deadline && _s2Calls < _s2MaxCalls && _s2Done.length < _s2Target) {
+            var _s2Batch = _s2Queue.shift()
+            if (!_s2Batch) break
+            await _s2RunBatch(_s2Batch)
+          }
+        }
+        while (_s2Queue.length > 0 && Date.now() < _s2Deadline && _s2Calls < _s2MaxCalls && _s2Done.length < _s2Target) {
+          await Promise.all([_s2Worker(), _s2Worker(), _s2Worker(), _s2Worker()])
+        }
+        // 按名册顺序重排，保证前端展示顺序与蓝图一致
+        var _s2Order: Record<string, number> = {}
+        for (var _s2oi = 0; _s2oi < _roster.length; _s2oi++) _s2Order[_roster[_s2oi].name] = _s2oi
+        _s2Done.sort(function (a: any, b: any) { return (_s2Order[String(a.name).trim()] || 0) - (_s2Order[String(b.name).trim()] || 0) })
+        // 🔥 2026-11-07 修复：收尾补卡。并发阶段受「每卡 3 次上限 / 重试预算」约束，常停在 14/15 直接报错。
+        //   此处对名册剩余角色串行单卡补采（不再受 attempts 上限拦截，仍受同一 deadline 与调用预算约束），
+        //   把「差 1 张」的失败面消掉。
+        if (_s2Done.length < 15 && Date.now() < _s2Deadline && _s2Calls < _s2MaxCalls) {
+          var _s2Rescued = 0
+          for (var _s2rsi = 0; _s2rsi < _roster.length; _s2rsi++) {
+            if (_s2Done.length >= 15) break
+            if (Date.now() >= _s2Deadline || _s2Calls >= _s2MaxCalls) break
+            var _s2rsName = String(_roster[_s2rsi].name || '').trim()
+            if (!_s2rsName || _s2DoneNames.indexOf(_s2rsName) !== -1) continue
+            var _s2BeforeLen = _s2Done.length
+            await _s2RunBatch([_roster[_s2rsi]])
+            if (_s2Done.length > _s2BeforeLen) _s2Rescued++
+          }
+          if (_s2Rescued > 0) console.log('[characters] S2 收尾补卡：+' + _s2Rescued + '（' + _s2Done.length + '/' + _roster.length + '）')
+        }
+        charsFromAI = _s2Done
+        console.log('[characters] S2 完成：' + charsFromAI.length + '/' + _roster.length + ' 卡')
+      } else if (_roster.length > 0) {
+        console.error('[characters] S1 名册仅 ' + _roster.length + ' 人（<15），放弃展开，显式报错')
       }
 
-      // 🔥 关键修复：仅在AI完全失败（0人）时启用兜底基础角色，不足20人不再补全
-      if (!charsFromAI || charsFromAI.length === 0) {
-        console.warn('[characters] AI生成完全失败，启用兜底基础角色生成')
-        // 生成最小可用的基础角色集
-        charsFromAI = []
-        // 主角兜底
-        var _protoFallback: any = {
-          name: forcedProtagonistName || '主角',
-          rolePosition: '主角',
-          role: '主角',
-          age: 18,
-          gender: '男',
-          personality: '坚韧不拔，重情重义',
-          personalityOrigin: '出身卑微却心怀大志，历经磨难',
-          growthBackground: '平凡少年意外获得金手指，踏上崛起之路',
-          speechHabit: '语气坚定，言出必行',
-          catchphrase: '我命由我不由天！',
-          mentor: '神秘老者',
-          psychologicalTrauma: '家族被灭的伤痛',
-          moralBottomLine: '绝不伤害无辜',
-          decisionPattern: '冷静分析后果断行动',
-          signatureItem: '随身玉佩',
-          themeColor: '金色',
-          values: '守护亲友，追求巅峰',
-          identity: '废柴少年',
-          appearance: '面容清秀，眼神坚毅',
-          background: '小家族子弟，被认为是修炼废柴',
-          faction: '无门无派',
-          quirks: '喜欢仰望星空',
-          relationToProtagonist: '本人',
-          hiddenTraits: '体内封印着神秘力量',
-          weaknesses: '过于重感情',
-          growthArc: (forcedProtagonistName || '主角') + '从一个被人轻视的废柴少年，在金手指的帮助下历经无数生死考验，逐渐成长为威震寰宇的至高强者，最终守护了身边所有亲友，站在了世界之巅。',
-          motivation: '变强守护身边人，揭开身世之谜',
-          goal: '成为最强者，保护亲友',
-          skills: ['基础拳法', '身法'],
-          stats: { 武力值: 60, 智力值: 70, 统帅值: 50, 政治值: 30, 魅力值: 80 },
-          // 🔥 优化问题4：参考百度百科人物介绍，增加7个结构化字段
-          aliases: '',
-          birthplace: '',
-          realmLevel: '',
-          weapons: '',
-          techniques: '',
-          experience: '',
-          socialNetwork: ''
+      // —— S3：确定性终检（徽章/定位/性别/主角字段按名册强制覆写，不依赖模型自觉）——
+      if (charsFromAI.length > 0 && _roster.length > 0) {
+        var _s3TitleMap: Record<string, string> = {}
+        var _s3PosMap: Record<string, string> = {}
+        var _s3GenMap: Record<string, string> = {}
+        for (var _s3ri = 0; _s3ri < _roster.length; _s3ri++) {
+          var _rr = _roster[_s3ri]
+          _s3TitleMap[_rr.name] = _rr.title || ''
+          _s3PosMap[_rr.name] = _rr.rolePosition || '配角'
+          _s3GenMap[_rr.name] = _rr.gender || ''
         }
-        charsFromAI.push(_protoFallback)
+        for (var _s3i = 0; _s3i < charsFromAI.length; _s3i++) {
+          var _s3c = charsFromAI[_s3i]
+          var _s3raw = String(_s3c.name || '').trim()
+          var _s3n = _sanCharName(_s3raw)
+          if (_s3n && _s3n !== _s3raw) {
+            // 🔥 2026-11-07：卡名残留虚词（李自成为）→ 净化，并同步改写正文里对旧名的引用
+            _s3c.name = _s3n
+            ;['identity', 'background', 'personality', 'description'].forEach(function (_fk3: string) {
+              if (typeof _s3c[_fk3] === 'string' && _s3c[_fk3].indexOf(_s3raw) >= 0) _s3c[_fk3] = _s3c[_fk3].split(_s3raw).join(_s3n)
+            })
+          }
+          if (_s3TitleMap[_s3n]) _s3c.title = _s3TitleMap[_s3n]
+          if (_s3PosMap[_s3n]) { _s3c.rolePosition = _s3PosMap[_s3n]; _s3c.role = _s3PosMap[_s3n] }
+          if (_s3GenMap[_s3n]) _s3c.gender = _s3GenMap[_s3n]
+          if (_lockProtoName && _s3n === _lockProtoName) {
+            if (_lockProtoAge > 0) _s3c.age = _lockProtoAge
+            if (_lockProtoGender) _s3c.gender = _lockProtoGender
+          }
+        }
+        console.log('[characters] S3 终检锁定：' + charsFromAI.length + ' 卡 / 名册 ' + _roster.length + ' 人')
+      }
+
+      // —— 生成失败：显式报错，绝不回退硬编码模板 ——
+      // 🔥 2026-11-07 修复：闸门阈值 8 → 15，与 S1 名册下限、前端 `_realCharCount >= 15`、spec W4 统一。
+      //   旧阈值 8 会让 8–14 卡的半成品直接返回，前端因不足 15 反复触发 pending 重生成。
+      // 🔥 2026-11-07 再修：绝不能在此 `return NextResponse.json(...)` —— generateWithLLM 的返回值会被
+      //   planRetry 当作普通 result 继续走，最终被序列化成 `{success:true, data:{}}` + HTTP 200，
+      //   前端既拿不到错误也不会停止重试（线上实测 651s 后空对象）。改为抛错，由 POST 出口映射为 502。
+      if (!charsFromAI || charsFromAI.length < 15) {
+        var _charShortMsg = '主要人物设定生成失败：模型多次重试仅返回 ' + (charsFromAI ? charsFromAI.length : 0) + ' 张角色卡（要求 ≥15）。请重新生成，或在模型设置中切换更强模型。'
+        console.error('[characters] S1/S2 多轮重试失败（卡数=' + (charsFromAI ? charsFromAI.length : 0) + '），显式报错（用户要求禁止硬编码兜底）')
+        throw new Error('CHARACTERS_ROSTER_INCOMPLETE: ' + _charShortMsg)
       }
 
       // 🔥🔥🔥 修复问题3：用户明确要求"不要用兜底补全"，删除自动补全角色逻辑
@@ -26901,219 +28088,11 @@ ${charConfigStr}
 
         // 根据题材和角色定位生成符合世界观的identity
         // 🔥 关键修复：传入idea数据，使身份背景与灵感创作和世界观深度绑定
+        // 🔥 2026-11-07 推倒重做：废弃硬编码身份池（「元素精灵/图书馆管理员/星宫转世」等串味垃圾源头）。
+        //   字段缺失由 S2 定向补全调用负责；补全仍失败则留空并告警，绝不再用模板填充。
         var _buildContextualIdentity = function(role: string, name: string, charIndex: number): string {
-          var _nameHash = 0
-          for (var _hi = 0; _hi < name.length; _hi++) {
-            _nameHash = (_nameHash * 31 + name.charCodeAt(_hi)) & 0xFFFF
-          }
-          // 🔥 Bug1彻底修复：使用(charIndex + nameHash)组合确保每个角色获得唯一身份
-          // 之前只用_nameHash % 10导致10个池子中碰撞概率极高，现在扩展到20+池子并用索引差异化
-          var _poolSize = 20
-          var _roleIndex = (charIndex * 7 + _nameHash) % _poolSize
-          
-          // 🔥 关键修复：从tagline中提取世界观关键词（如"玉兰大陆"、"盘龙戒指"等）
-          var _worldKeywords = ''
-          if (_ideaTagline) {
-            // 提取书名号内的内容作为世界观参考
-            var _bracketMatch = _ideaTagline.match(/《([^》]+)》/)
-            if (_bracketMatch) _worldKeywords += '《' + _bracketMatch[1] + '》'
-            // 提取关键名词（2-4字词）作为世界观参考
-            var _nounMatches = _ideaTagline.match(/[\u4e00-\u9fff]{2,4}(?:大陆|世界|星球|帝国|王国|宗门|家族|学院|神殿|魔域|妖域|仙界|魔界|神界|天界|冥界|深渊|秘境|遗迹|戒指|系统|血脉|天赋)/g)
-            if (_nounMatches && _nounMatches.length > 0) {
-              _worldKeywords += (_worldKeywords ? '，' : '') + _nounMatches.slice(0, 3).join('、')
-            }
-          }
-          var _worldRef = _worldKeywords || (_wbEra ? _wbEra : '') || (_wbGeo ? _wbGeo.slice(0, 30) : '')
-          
-          var baseIdentity = ''
-          if (_genre === '玄幻' || _genre === '仙侠' || _genre === '奇幻') {
-            if (_wbEra.indexOf('洪荒') >= 0 || _wbEra.indexOf('上古洪荒') >= 0 || _wbEra.indexOf('上古神话') >= 0 || _wbEra.indexOf('封神之战') >= 0 || _wbEra.indexOf('封神榜') >= 0 || _wbEra.indexOf('封神时期') >= 0 || _wbEra.indexOf('封神量劫') >= 0) {
-              // 洪荒封神题材
-              if (role === '主角') baseIdentity = '穿越至洪荒上古时期，身负巫族血脉与混沌至宝，在巫妖两族争霸中崛起，逐步成为改变洪荒格局的关键人物'
-              else if (role === '女主') baseIdentity = '洪荒大族出身的天之骄女，身怀异宝或特殊血脉，在巫妖大战中与主角命运交织，共同对抗强敌'
-              else if (role === '反派') baseIdentity = '洪荒大能转世或妖族巨头，掌控一方势力，野心勃勃欲统一洪荒，与主角阵营针锋相对'
-              else {
-                // 配角：根据哈希生成不同身份，确保内容丰富（60字以上）
-                var _supportRoles = [
-                  '截教精英弟子，因师门之令潜入主角阵营，却在相处中逐渐被主角人格魅力折服，成为双面卧底中的关键人物，多次在危急时刻为通风报信',
-                  '上古龙族后裔，镇守某处秘境千年，因主角闯入而觉醒，成为主角的守护兽兼坐骑，与主角一同闯荡洪荒，共同面对各种凶险',
-                  '巫族十二祖巫后裔，继承先祖血脉，在巫妖大战中寻找自身存在的意义，后被主角的理念打动，成为主角在巫族中的重要盟友',
-                  '天庭星宿转世，因触犯天条被贬下凡间，与主角相遇后开启新的命运篇章，是主角早期修炼路上的引路人与守护者',
-                  '上古神树化身，见证洪荒变迁，暗中引导主角走向正确的道路，在关键时刻给予主角提示和帮助，是主角最大的幕后助力',
-                  '妖族太子，厌倦妖族内部争斗，向往自由，与主角结为莫逆之交，在巫妖大战中坚定地站在主角一边，成为妖族内部的变革者',
-                  '人族部落大祭司，拥有预言能力，是主角早期的引路人和精神导师，多次在关键时刻预言危险，帮助主角化险为夷',
-                  '魔界先锋将领，奉命入侵洪荒，却对主角产生敬佩，最终倒戈相向，成为主角对抗魔界的重要力量，为洪荒和平立下汗马功劳',
-                  '仙门弃徒，因看透修仙界虚伪而出走，成为主角的忘年交和情报来源，掌握着许多不为人知的秘密，对主角帮助极大',
-                  '混沌魔神残魂寄宿者，在关键时刻觉醒，给予主角关键帮助，帮助主角渡过难关，是主角成长路上的重要转折点',
-                  '凤凰族圣女，涅槃重生后失去记忆，被主角所救后以全新身份踏上旅途，身怀凤凰真火，是主角对抗强敌的隐藏王牌',
-                  '麒麟族幼子，因族群覆灭被主角收留抚养，视主角为至亲，在成长中觉醒麒麟血脉，成为主角最忠诚的战斗伙伴',
-                  '九天玄女转世，奉命下凡辅佐天命之人，以神秘身份接近主角，暗中传授主角天界秘术，最终与主角并肩作战',
-                  '冥河老祖座下弟子，因不满师尊暴虐而叛逃，投靠主角阵营，为主角提供冥界情报和资源，是主角在冥界的重要内应',
-                  '上古剑修残魂，寄宿于古剑之中，在被主角唤醒后成为主角的剑道导师，传授失传的上古剑诀，助主角剑道大成',
-                  '药王谷传人，世代以炼丹制药为业，因谷中遭劫而流落在外，被主角救下后以身相许，为主角炼制各种珍稀丹药',
-                  '天机阁主，知晓天下大势却从不轻易泄露天机，因与主角有宿世因缘而破例相助，是主角最重要的战略顾问',
-                  '雷部正神转世，性格豪爽嫉恶如仇，与主角不打不相识，后被主角的胸襟折服，成为主角最信任的战友和兄弟',
-                  '山河社稷图器灵，沉睡万年后被主角唤醒，拥有操控山河之力的能力，是主角在关键时刻扭转战局的终极底牌',
-                  '万妖谷谷主，统御一方妖族势力，因主角助其平定内乱而结为盟友，在巫妖大战中为主角提供妖族大军支援'
-                ]
-                baseIdentity = _supportRoles[_roleIndex]
-              }
-            } else if (_wbEra.indexOf('修真') >= 0 || _wbEra.indexOf('仙界') >= 0) {
-              if (role === '主角') baseIdentity = '出身低微却机缘不断，在修真世界中凭借至宝和悟性一路逆袭，最终踏上仙途巅峰'
-              else if (role === '女主') baseIdentity = '仙门世家之女，天赋异禀，与主角在修真路上相遇相知，共渡重重劫难'
-              else if (role === '反派') baseIdentity = '魔道巨擘或仙门叛徒，觊觎主角至宝，处处与主角为敌'
-              else {
-                var _xiuzhenRoles = [
-                  '隐世散修，修为高深却淡泊名利，在主角危难时出手相助，成为亦师亦友的存在，传授主角许多珍贵的修炼心得',
-                  '仙门天才弟子，因嫉妒主角天赋而处处刁难，后在共同对敌中放下成见，与主角结为好友，成为主角在仙门中的内应',
-                  '妖兽化形强者，因主角救过其性命而誓死追随，是主角最忠诚的战斗伙伴，多次在战斗中为主角挡下致命一击',
-                  '丹道宗师，看中主角潜力收为弟子，传授毕生炼丹心得，帮助主角提升修为，炼制各种珍贵丹药',
-                  '魔门圣女，奉命刺杀主角却失手被俘，在相处中逐渐改变立场，成为主角的红颜知己和重要助力',
-                  '剑仙遗孤，继承先祖剑道传承，与主角一同探寻剑道真谛，在多次生死大战中磨砺成长，成为一代剑仙',
-                  '器宗长老，因主角展现炼器天赋而破例收徒，助主角打造神兵利器，提升主角的战斗力，是主角的专属锻造师',
-                  '冥界使者，与主角有旧缘，多次在生死关头给予指引和帮助，帮助主角渡过轮回劫难，是主角的生死之交',
-                  '妖族公主，因族群危机而求助主角，与主角结下深厚羁绊，成为主角在妖族中的代言人，共同维护两族和平',
-                  '上古仙人残魂，被困于遗迹中千年，主角的到来使其重见天日，传授主角上古仙术，助主角突破境界瓶颈',
-                  '符箓宗师，精通各种符箓阵法，因主角助其破解困局而倾囊相授，为主角提供强大的符箓支援和阵法保护',
-                  '天机阁弟子，精于推演天机，预测到主角是改变修真界格局的关键人物，主动投靠成为主角的军师和智囊',
-                  '魔道散修，因修炼魔功被正道追杀，被主角所救后改邪归正，成为主角在魔道中的暗线，提供魔道内部情报',
-                  '灵兽仙鹤化形，修行千年终成人形，感念主角救命之恩誓死追随，是主角的飞行坐骑兼战斗伙伴',
-                  '佛门高僧，佛法高深慈悲为怀，在主角心魔缠身时以佛法点化，助主角渡过心魔劫，是主角的精神导师',
-                  '海外散仙，长居海外不问世事，因主角带来的天地异变而重出江湖，与主角结为忘年交，传授海外仙术秘法',
-                  '古族遗民，体内流淌着上古神族血脉，与主角血脉共鸣，在血脉觉醒后成为主角最强战力之一',
-                  '星宫圣女，掌控星辰之力，奉命下凡寻找天命之人，与主角相遇后认定主角就是天选之人，全力辅佐',
-                  '阵道大师，痴迷阵法研究，因主角提供上古阵图而欣喜若狂，为主角布置各种防御大阵和攻击阵法',
-                  '灵界商人，穿梭于各界之间倒卖珍稀资源，因主角救过其性命而成为主角的专属商人，提供各种稀有材料'
-                ]
-                baseIdentity = _xiuzhenRoles[_roleIndex]
-              }
-            } else {
-              // 🔥 Bug2修复：使用具体世界观变量生成更自然的身份背景（题材中性，非玄幻不套修仙词）
-              var _worldDesc = (_wbEra ? _wbEra.slice(0, 28) : (_wbGeo ? _wbGeo.slice(0, 28) : '')) || '乱世之中'
-              var _sysTail = _ideaSystemName ? ('，身负「' + _ideaSystemName + '」之能') : ''
-              if (role === '主角') baseIdentity = _chName + '，' + _worldDesc + _sysTail + '，身负家国与身世之重，于变局中奋起，凭过人智谋与坚韧一步步成长为扭转时局的关键人物'
-              else if (role === '女主') baseIdentity = _chName + '，' + _worldDesc + '，才识胆略过人，身世不凡，与主角命运交织、并肩同行'
-              else if (role === '反派') baseIdentity = _chName + '，' + _worldDesc + '，与主角立场对立、各为其主，是主角道路上最棘手的对手'
-              else {
-                var _xuanhuanRoles = [
-                  '资深谋士，洞悉时局、算无遗策，是主角决策圈的核心智囊，多次在关键时刻为主角定下破局之策',
-                  '心腹宿将，跟随主角出生入死，治军严谨、作战勇猛，是主角麾下最能征惯战的一员大将',
-                  '地方商贾，家资殷实、人脉广布，看重主角的抱负而倾力资助，为阵营提供粮饷与物资保障',
-                  '机要密探，消息灵通、行事缜密，潜伏各方势力为主角刺探情报，是暗线上最可靠的眼线',
-                  '寒门门生，受主角提携而崭露头角，精通文牍政务，成为主角治理地方、推行政令的得力干才',
-                  '一方族老，德高望重、宗族根基深厚，在关键时刻率族归附，为主角带来民心与人力',
-                  '能工巧匠，技艺超群，为主角打造军械器物、改良火器农具，是后勤与军备的关键人物',
-                  '旧部故交，与主角有同乡或袍泽之谊，在主角起势时率先响应，成为凝聚人心的骨干',
-                  '江湖豪客，快意恩仇、广结善缘，被主角气度折服而仗义相助，为主角打通民间与绿林的路子',
-                  '医道名家，医术精湛、悬壶济世，在疫病与战伤中救治军民，也为主角暗中疗愈旧伤',
-                  '粮秣能吏，长于钱粮调度与屯田积谷，在战乱中保障后勤，是稳固根据地的关键人物',
-                  '谏诤之臣，刚正不阿、敢于直谏，虽与主角政见时有冲突，却是整肃纲纪不可多得的人才',
-                  '边关降将，原为敌方宿将，因敬服主角而归降，带来敌方军情与一支能战之兵',
-                  '世家千金，通晓诗书与经营，在联姻或合作中与主角结盟，为阵营带来世家资源与人脉',
-                  '义军首领，聚众抗敌的地方豪强，与主角由摩擦到结盟，共同对抗外敌、稳固一方'
-                ]
-                baseIdentity = _xuanhuanRoles[_roleIndex % _xuanhuanRoles.length]
-              }
-            }
-          } else if (_genre === '都市') {
-            if (role === '主角') baseIdentity = '都市中隐藏着不凡身份的青年，在商场与江湖间游走，逐步建立自己的势力'
-            else if (role === '女主') baseIdentity = '都市精英女性，独立自信，与主角在事业与情感中相互扶持'
-            else if (role === '反派') baseIdentity = '商界巨鳄或地下势力头目，与主角在都市中展开激烈博弈'
-            else {
-              var _dushiRoles = [
-                '退伍特种兵，因战友之死而消沉，后被主角唤醒，成为主角最可靠的保镖，多次在危险中保护主角安全',
-                '神秘黑客，被主角的人格魅力吸引，成为主角在网络世界的最强助力，帮助主角获取各种机密信息',
-                '金融巨鳄的千金，因家族恩怨而与主角相遇，逐渐成为主角的红颜知己，为其提供金融支持和人脉资源',
-                '老中医传人，医术高超深藏不露，在主角受伤时给予关键救治，是主角的私人医生和信任的朋友',
-                '地下世界的情报贩子，消息灵通无所不知，是主角重要的情报来源，掌握着许多不为人知的秘密',
-                '警界精英，因案件与主角产生交集，从最初的怀疑到最终的信任，成为主角在警方的内应',
-                '商业巨头的智囊，被主角的商业天赋折服，成为主角的战略顾问，为其制定商业策略',
-                '顶尖律师，因一起案件与主角结缘，多次为主角保驾护航，是主角的法律顾问',
-                '退役特工，隐姓埋名过着普通人生活，在主角遭遇危机时挺身而出，成为主角的战斗伙伴',
-                '文化界泰斗，看中主角潜力，给予主角人脉和资源上的支持，是主角的人生导师',
-                '国际刑警，追查跨国犯罪组织时与主角不期而遇，从对手变为合作者，共同打击黑暗势力',
-                '古董鉴定师，在古玩市场与主角结识，因一件神秘文物而卷入主角的故事，成为主角的文物顾问',
-                '地下拳王，曾在黑市拳赛中叱咤风云，退役后经营一家小武馆，被主角的斗志打动，传授主角格斗技巧',
-                '天才程序员，因破解某机密系统被追杀，被主角救下后成为主角的技术后盾，为主角提供网络安全支持',
-                '神秘占卜师，拥有预知未来的能力，在主角迷茫时给予指引，是主角在都市中的精神导师',
-                '豪门管家，服侍某大家族数十年，掌握无数豪门秘辛，因欣赏主角为人而暗中相助',
-                '战地记者，在全球各地报道战争真相，因一次危险采访被主角所救，从此成为主角的忠实支持者',
-                '心理学教授，在学术上颇有建树，因一桩离奇案件与主角合作，帮助主角分析对手心理',
-                '赛车手，在地下赛车界赫赫有名，因一次赌局与主角结识，成为主角的专职司机和飙车伙伴',
-                '私家侦探，侦探社社长，帮助主角调查各种复杂案件，是主角在都市中的情报合作伙伴'
-              ]
-              baseIdentity = _dushiRoles[_roleIndex]
-            }
-          } else if (_genre === '历史' || _genre === '架空历史') {
-            if (role === '主角') baseIdentity = '穿越至乱世的历史人物，凭借现代知识与谋略，在朝堂与战场间崛起'
-            else if (role === '女主') baseIdentity = '名门闺秀或江湖侠女，才貌双全，与主角共谋天下'
-            else if (role === '反派') baseIdentity = '权臣或敌国君主，与主角争夺天下，是主角最大的政治对手'
-            else {
-              var _lishiRoles = [
-                '落魄书生，因怀才不遇而郁郁不得志，后被主角发掘成为首席谋士，为其出谋划策，制定战略',
-                '江湖侠客，行侠仗义名震天下，因主角的大义而追随左右，成为主角的贴身护卫和战斗先锋',
-                '将门虎子，因家族蒙冤而流落江湖，与主角相遇后共同洗刷冤屈，成为主角的得力将领',
-                '富商巨贾，富可敌国却心系天下，为主角提供财力支持，是主角的金主和经济后盾',
-                '隐世高人，武功高强淡泊名利，在主角危难时出手相助，成为主角的武学师父',
-                '少数民族部落公主，因族群危机而与主角结盟，共同对抗强敌，成为主角的盟友和红颜知己',
-                '朝廷御史，刚正不阿不畏权贵，多次为主角仗义执言，是主角在朝堂中的支持者',
-                '军营老兵，经验丰富洞察人心，是主角在军队中的精神支柱，帮助主角训练军队',
-                '名医圣手，悬壶济世医德高尚，多次救治主角及其部下，是主角的军医',
-                '说书艺人，游历四方见多识广，是主角重要的情报收集者，帮助主角了解各地情况',
-                '前朝遗孤，隐姓埋名躲避追杀，与主角因共同敌人而联手，掌握着前朝宝藏的秘密',
-                '江湖帮主，绿林好汉之首，因主角救其帮众而结为异姓兄弟，为主角提供江湖势力',
-                '宫中太监总管，在深宫中如履薄冰，因主角帮助其摆脱困境而成为主角在宫中的眼线',
-                '外邦使节，奉命出使中原，被主角的才华和胸襟折服，成为主角外交上的重要盟友',
-                '道家真人，隐居深山修炼多年，因主角误入其隐居之地而结缘，传授主角道家养生秘术',
-                '兵部侍郎，精通兵法韬略，因不满朝政腐败而被贬，与主角相遇后成为其军事智囊',
-                '盐商巨贾，掌控一方盐业命脉，因主角帮助其解决盐政危机而全力支持，提供源源不断的军饷',
-                '江湖术士，精通奇门遁甲之术，因主角搭救而免于被官府追杀，为主角占卜吉凶、布置风水',
-                '镖局总镖头，走南闯北经验丰富，与主角结为生死之交，为主角押运物资、护送重要人物',
-                '落第秀才，屡试不第却才华横溢，被主角发掘后成为其文胆，负责起草文书、撰写檄文'
-              ]
-              baseIdentity = _lishiRoles[_roleIndex]
-            }
-          } else {
-            if (role === '主角') baseIdentity = '身负异禀的关键人物，在故事世界中逐步成长，最终改变命运'
-            else if (role === '女主') baseIdentity = '与主角命运交织的女性角色，有着独立的背景与故事线'
-            else if (role === '反派') baseIdentity = '与主角立场对立的强者，是故事冲突的核心来源'
-            else {
-              var _otherRoles = [
-                '神秘组织成员，奉命监视主角，却在相处中逐渐产生动摇，最终背叛组织投靠主角',
-                '传奇人物后裔，继承先祖遗志，与主角一同追寻真相，成为主角的重要伙伴',
-                '流浪艺人，看似平凡却身怀绝技，在关键时刻成为主角的助力，帮助主角渡过难关',
-                '图书馆管理员，看似普通却知识渊博，是主角的知识顾问，帮助主角查找各种资料',
-                '赏金猎人，只为金钱而战，却在一次任务中与主角产生羁绊，成为主角的雇佣帮手',
-                '科学家/学者，研究领域与主角的目标息息相关，成为重要帮手，为其提供技术支持',
-                '家族守护者，忠心耿耿守护主角家族，是主角最信任的长辈，为其提供家族资源',
-                '竞争对手，实力与主角相当，既是对手也是朋友，在竞争中共同成长',
-                '医者，救死扶伤是其天职，多次在危急时刻救治主角，是主角的救命恩人',
-                '预言者，能预知未来却背负着沉重的命运，指引主角前进方向，帮助主角做出正确选择',
-                '异界来客，从另一个世界意外穿越而来，与主角命运交织，共同面对来自两个世界的威胁',
-                '时间旅行者，来自未来时空，知道主角的命运走向，却因某种规则限制无法直接透露',
-                '梦境行者，能在梦境中穿梭于不同次元，在梦境中与主角相遇，传授主角梦境修炼之法',
-                '元素精灵，自然元素的化身，被主角的纯净心灵吸引，与主角签订契约成为其元素伙伴',
-                '机械生命体，来自已经毁灭的高科技文明，在废墟中被主角激活，成为主角的科技顾问',
-                '灵魂歌者，用歌声治愈心灵创伤，在主角最绝望时用歌声唤回其斗志，是主角的精神支柱',
-                '影子刺客，暗杀技艺举世无双，因一次刺杀失败被主角所擒，后被主角感化成为其暗刃',
-                '占星术士，通过星象推演未来，在主角面临重大抉择时给予指引，为主角解读星象预言',
-                '流浪军师，游历诸国献策无数，却从未遇到真正值得效忠的主公，直到遇见主角',
-                '守墓人，世代守护一座上古墓穴，因主角的到来而揭开尘封的秘密，引导主角进入墓穴探险'
-              ]
-              baseIdentity = _otherRoles[_roleIndex]
-            }
-          }
-          // 🔥 将世界观关键词融入身份背景，确保与灵感创作和世界观绑定
-          if (_worldRef && baseIdentity.length > 10) {
-            // 如果baseIdentity已经包含了_worldRef中的关键词，则不再追加
-            var _alreadyHasWorld = false
-            if (_wbGeo && _wbGeo.length >= 4 && baseIdentity.indexOf(_wbGeo.slice(0, 4)) >= 0) _alreadyHasWorld = true
-            if (_wbEra && _wbEra.length >= 4 && baseIdentity.indexOf(_wbEra.slice(0, 4)) >= 0) _alreadyHasWorld = true
-            if (!_alreadyHasWorld) {
-              baseIdentity += '。活跃于' + _worldRef + '的世界中'
-            }
-          }
-          return baseIdentity
+          console.warn('[characters] 身份池已废弃：「' + name + '」(' + role + ') 缺 identity，留空')
+          return ''
         }
 
         // 填充空字段
@@ -27163,7 +28142,7 @@ ${charConfigStr}
         // 之前的问题是强制替换所有identity，导致所有角色身份背景都一样
         var _aiIdentity = _ch.identity || ''
         var _isIdentityValid = false
-        if (_aiIdentity && _aiIdentity.length >= 10) {
+        if (_aiIdentity && _aiIdentity.length >= 6) {
           // 检查是否包含具体信息，不是通用占位符
           var _genericIdentities = ['主角', '女主', '反派', '配角', '中立', '盟友', '导师', '支持角色', '神秘人物', '关键角色', '重要角色', '路人', 'NPC', '朋友', '同学', '同事', '普通配角']
           var _isGeneric = false
@@ -27578,18 +28557,46 @@ ${charConfigStr}
           }
         } catch (_tfE) { /* 文本清理失败不影响主流程 */ }
         // 🔥 Bug2-二：合成「角色弧光节点列表」arcNodes——从已生成的 growthArc 真实文本切分为 5 个阶段节点，杜绝空值
+        // 🔥 2026-09-07 QA-2：用户实测五个节点事件雷同（旧逻辑 ①跳句取 _gaSents[2*ai] 句少时全部落入兜底
+        //   ②兜底事件拼接超长 identity（含阵营括号+穿越背景整段）导致五段看起来一模一样 ③心路同一模板换阶段名）。
+        //   改为：①顺序取句不跳句 ②兜底事件按阶段差异化+取角色真实字段首短句（背景/动机/弱点/目标）③心路按阶段分化。
         try {
           var _gaSrc = String(_ch.growthArc || _ch.motivation || _ch.identity || _ch.role || _chName || '')
           if (!Array.isArray(_ch.arcNodes) || _ch.arcNodes.length === 0) {
             var _gaSents = _gaSrc.split(/[。！？；;]/).map(function (s: string) { return s.trim() }).filter(function (s: string) { return s.length >= 4 })
             var _stageNames = ['起步·初心', '觉醒·转折', '成长·磨砺', '巅峰·高光', '超脱·归宿']
-            var _stageFallback = ['初登场时的处境与本心', '命运转折、观念被打破的关键一役', '在挫折与抉择中磨砺成长', '达成所愿的高光时刻', '最终的归宿与信念升华']
+            // 角色真实字段首短句（去阵营括号，截 24 字），供各阶段兜底事件差异化取材
+            var _qaClause = function (src: string) {
+              var _c2 = String(src || '').replace(/[（(][^）)]*[)）]/g, '').split(/[。！？；;]/)[0].replace(/^[，、\s]+/, '').trim()
+              return _c2.length > 24 ? _c2.slice(0, 24) : _c2
+            }
+            var _qaId = _qaClause(_ch.identity) || (String(_ch.role || '') === '主角' ? '乱世中的承命者' : '卷入时局的当事人')
+            var _qaBg = _qaClause(_ch.background || _ch.growthBackground)
+            var _qaMo = _qaClause(_ch.motivation)
+            var _qaWk = _qaClause(_ch.weaknesses)
+            var _qaGl = _qaClause(_ch.goal)
+            var _stageEvT = [
+              _chName + '以' + _qaId + '之身初登场' + (_qaBg ? '：' + _qaBg : '') + '，初心未改',
+              _chName + '遭遇命运转折' + (_qaMo ? '：' + _qaMo : '，旧有秩序崩塌，被迫直面抉择'),
+              _chName + '在挫折与抉择中磨砺' + (_qaWk ? '，补足「' + _qaWk + '」的短板' : '') + '，格局渐开',
+              _chName + '迎来高光时刻' + (_qaGl ? '：' + _qaGl + '初步达成' : '') + '，声望达于顶点',
+              _chName + '走向最终归宿，信念完成升华，为自身命运画上落点'
+            ]
+            var _stageCgT = [
+              '从被动承受到主动求生，' + _chName + '第一次真正把命运握在自己手中',
+              '旧观念被现实击碎，' + _chName + '完成从稚嫩到成熟的第一次蜕变',
+              '历经磨砺后' + _chName + '处事愈发沉稳，从独善其身转向统御全局',
+              '站上巅峰后' + _chName + '的格局由取胜转向治世，心态归于从容笃定',
+              '回望来路，' + _chName + '的信念完成最终升华，个人命运汇入时代洪流'
+            ]
             var _arcNodes: any[] = []
             for (var _ai = 0; _ai < _stageNames.length; _ai++) {
-              var _ev = (2 * _ai) < _gaSents.length ? _gaSents[2 * _ai] : ''
-              if (!_ev) _ev = String(_chName || '角色') + '·' + _stageNames[_ai] + '：' + _stageFallback[_ai] + '（' + String(_ch.identity || _ch.role || '本心') + '）'
-              var _cg = (2 * _ai + 1) < _gaSents.length ? _gaSents[2 * _ai + 1] : ''
-              if (!_cg || _cg === _ev) _cg = '心路：历经「' + _stageNames[_ai] + '」阶段后，' + String(_chName || '角色') + '的心态与处世方式发生明显转变'
+              // 顺序取句：事件用前 5 句，心路用后 5 句（旧逻辑 2*ai 跳句导致句少时全落兜底）
+              var _ev = _ai < _gaSents.length ? _gaSents[_ai] : ''
+              if (!_ev || _ev.indexOf(_chName) === 0 && _ev.indexOf('·') > -1 && _ev.length < 18) _ev = _stageEvT[_ai]
+              if (!_ev) _ev = _stageEvT[_ai]
+              var _cg = (_gaSents.length >= 10 && (_ai + 5) < _gaSents.length) ? _gaSents[_ai + 5] : ''
+              if (!_cg || _cg === _ev) _cg = _stageCgT[_ai]
               _arcNodes.push({
                 stage: _stageNames[_ai],
                 event: _ev,
@@ -28246,6 +29253,26 @@ ${charConfigStr}
         protagonist.age = parseInt(_charUserProtoAge, 10)
         console.log('[characters] 强制主角年龄=用户指定: ' + protagonist.age)
       }
+      // 🔥 2026-09-10：主角外貌与年龄一致性清洗（修复“20岁但外貌须发皆白、持法杖/古剑”的修仙模板错位）。
+      //   历史/现实向题材里年轻主角（≤30）被模型写成白发苍苍、手执法杖的老者时，替换为年龄相符的年轻外貌；
+      //   同时剥离修仙模板遗留的“法杖/拂尘/仙风道骨”等器物与气质词。
+      if (protagonist) {
+        var _pAgeNum = parseInt(String(protagonist.age || 0), 10)
+        var _pAppr = String(protagonist.appearance || '').trim()
+        var _OLD_MARK = /须发皆白|白发苍苍|鹤发|白须|银发苍苍|古稀|花甲|满脸皱纹|皱纹纵横|拄|法杖|拂尘|仙风道骨|道骨仙风|鹤发童颜|慈眉善目|年迈|老者|老朽|苍老/
+        if (_pAgeNum > 0 && _pAgeNum <= 30 && _pAppr && _OLD_MARK.test(_pAppr)) {
+          protagonist.appearance = '身形清瘦挺拔，年方' + _pAgeNum + '岁，面容清俊、肤色微带风霜，束发于顶。虽经国变流亡、朝堂倾轧之苦，眉宇间却不失这个年纪的英气与坚毅，目光沉静，气度稳重，全然不似同年浮华少年。'
+          console.log('[characters] 🔥 主角外貌与年龄冲突(' + _pAgeNum + '岁 vs 原文)已被修正为年轻外貌')
+        } else if (_pAppr && (_OLD_MARK.test(_pAppr))) {
+          // 30岁以上但出现“法杖/拂尘/仙风道骨”等修仙器物——仅剥离修仙器物词，保留年龄合理描述
+          protagonist.appearance = _pAppr
+            .replace(/手[持执]?(古朴)?法杖/g, '手扶佩剑')
+            .replace(/手持长剑/g, '腰悬长剑')
+            .replace(/拂尘/g, '折扇')
+            .replace(/仙风道骨/g, '气度威严')
+            .replace(/道骨仙风/g, '气度威严')
+        }
+      }
 
       // 🔥 安全兜底3：女主要求已写入下方「女主智能兜底」（先提拔已有女性候选、再动态生成），此处不再静默留空。
       // 🔥 P2修复（2026-08-02）：恢复智能兜底机制——基于题材动态生成配角/反派
@@ -28321,7 +29348,7 @@ ${charConfigStr}
       // === 反派智能兜底：至少2个反派 ===
       // 🔥 2026-09-01 第13轮：分批模式下禁用一切补齐式 LLM 兜底调用——每个补齐都要多花 10-20s，
       //    会让"30 秒出首批"彻底失效。名额由前端 charBatch.needs 显式规划，此处不再越俎代庖。
-      if (!_charBatch && antagonists.length < 2) {
+      if (!_charBatch && _roster.length === 0 && antagonists.length < 2) {
         console.warn('[characters] 反派数量不足(' + antagonists.length + ')，启动题材感知智能兜底')
         var _antagTemplates: Record<string, Array<{name:string, identity:string, motivation:string}>> = {
           history: [
@@ -28378,15 +29405,17 @@ ${charConfigStr}
       }
 
       // === 配角智能兜底：至少3个配角 ===
-      if (!_charBatch && supporting.length < 3) {
+      if (!_charBatch && _roster.length === 0 && supporting.length < 3) {
         console.warn('[characters] 配角数量不足(' + supporting.length + ')，启动题材感知智能兜底')
         var _suppTemplates: Record<string, Array<{name:string, rolePosition:string, identity:string}>> = {
+          // 🔥 2026-09-08 #167 去串线化：旧 history 模板写死《永历中兴》人物（李定国/郑成功/沐天波/焦琏/王太后），
+          //   任何「历史」题材缺配角时都会把南明人物灌进小说（实测《上古巫神》夏商题材串线）。改为题材中性虚构人物。
           history: [
-            { name: '李定国', rolePosition: '配角/盟友', identity: '晋王，南明最强战将，忠肝义胆' },
-            { name: '郑成功', rolePosition: '配角/盟友', identity: '延平郡王，掌控东南海防的年轻统帅' },
-            { name: '沐天波', rolePosition: '配角/导师', identity: '黔国公，世代镇守云南的勋贵老臣' },
-            { name: '焦琏', rolePosition: '配角/挚友', identity: '主角的心腹亲将，出生入死的兄弟' },
-            { name: '王太后', rolePosition: '配角/长辈', identity: '太皇太后，主角的祖母，慈祥而有政治智慧' },
+            { name: '岳峥', rolePosition: '配角/盟友', identity: '军中宿将，忠勇沉稳，是主角倚重的臂膀' },
+            { name: '沈知白', rolePosition: '配角/谋士', identity: '落第书生出身的谋士，算无遗策' },
+            { name: '柳莺莺', rolePosition: '配角/女配', identity: '医术精湛的游方医女，多次救治主角' },
+            { name: '铁岩', rolePosition: '配角/挚友', identity: '主角的心腹亲将，出生入死的兄弟' },
+            { name: '周老夫人', rolePosition: '配角/长辈', identity: '德高望重的族中长辈，慈祥而有政治智慧' },
           ],
           fantasy: [
             { name: '凌霄子', rolePosition: '配角/导师', identity: '主角的师父，隐世强者' },
@@ -28445,7 +29474,7 @@ ${charConfigStr}
       // 🔥 2026-09-02 修复图四：分批(charBatch)模式下，若本批名额包含"女主"但 LLM 未产出，
       //    必须同样触发兜底，避免"女主空值"（原逻辑 !_charBatch 把分批模式整体跳过 → 女主槽永久丢失）。
       var _batchNeedsFemale = !!(_charBatch && _charBatch.needs && _charBatch.needs.indexOf('女主') !== -1)
-      if ((!_charBatch || _batchNeedsFemale) && femaleLeads.length === 0) {
+      if ((!_charBatch || _batchNeedsFemale) && _roster.length === 0 && femaleLeads.length === 0) {
         console.warn('[characters] 无女主数据，启动智能兜底')
         var _flTemplates: Record<string, {name:string, identity:string}> = {
           history: { name: '苏缪', identity: '江南世家之女，才貌双全，琴棋书画无一不精' },
@@ -28486,8 +29515,13 @@ ${charConfigStr}
       // 🔥🔥🔥 历史题材角色名确定性清洗（杜绝仙侠风名字：洛清寒/幽冥子/凌霄子等）
       //    9B/35B 模型常无视系统提示注入仙侠名，必须以确定性后处理兜底。
       if (isHistoryChar) {
+        // 🔥 2026-09-08 #170 去串线化：旧名单写死南明历史人物（李定国/郑成功/沐天波/陈圆圆/吴三桂…，
+        //   为《永历中兴》定制），任何「历史」题材小说的仙侠风角色名都会被改名为南明人物（实测《上古巫神》
+        //   夏商题材被灌入李定国/郑成功等）。改为跨朝代通用的中性虚构人名，保持汉风且不绑定任何真实朝代/IP。
         const _HIST_NAME_POOL = [
-          '李定国','郑成功','孙可望','李成栋','吴三桂','瞿式耜','陈邦彦','王夫之','张煌言','何腾蛟','尚可喜','孔有德','马吉翔','陈子壮','张家玉','李来亨','刘文秀','白文选','郭之奇','李元胤','陈奇策','沐天波','杨畏知','堵胤锡','章旷','傅作霖','高必正','李赤心','马进忠','王进才','张同敞','杨展','樊一蘅','王祥','吴炳','皮熊','洪承畴','祖大寿','范文程','多铎','豪格','鳌拜','钱谦益','马士英','史可法','黄道周','郑芝龙','施琅','王皇后','陈圆圆','柳如是','董小宛','李香君','卞玉京','顾横波','马湘兰','寇白门','方维仪','曾氏','胡氏','苏氏','周氏',
+          '岳峥','沈知白','柳莺莺','铁岩','周老夫人','秦昭','陆行舟','顾清梧','许惊弦','程映雪',
+          '孟远舟','姜叔平','燕赤霞','魏无涯','韩子川','楚菱歌','杜衡','苏合浦','关山月','白守拙',
+          '贺兰征','温伯言','方正卿','石敬亭','涂明远','姚静姝','柯梦得','阮青萍','庄不周','聂长空',
         ]
         const _XIANXIA_CHARS = /[清寒幽冥霄逸雪烟玄萧婉若沐煞灵岚尘璃霜瑶瑾萱魅魇魑魍]|天君|老人|道人|真人|仙君|神君|魔尊|剑仙|玄机|血煞|幽冥|太虚|星河|苍穹|云逸|洛清|子$/
         const _isXianxia = (n: string) => !!n && n.length >= 2 && n.length <= 5 && _HIST_NAME_POOL.indexOf(n) === -1 && _XIANXIA_CHARS.test(n)
@@ -28506,7 +29540,18 @@ ${charConfigStr}
         }
         const _fixName = (c: any) => {
           if (c && c.name && c.name !== forcedProtagonistName && _isXianxia(c.name)) {
-            c.name = _takeName()
+            const _oldName = String(c.name)
+            const _newName = _takeName()
+            c.name = _newName
+            // 🔥 2026-09-08 #172 改名同步身份：只换 name 会导致"名字=铁岩但身份=李若曦"型割裂，
+            //   必须把所有描述字段中的旧名同步替换为新名
+            const _nameSyncKeys = ['identity','background','description','motivation','growthArc','goal','personality','relationToProtagonist','arcSummary']
+            for (const _k of _nameSyncKeys) {
+              if (typeof c[_k] === 'string' && c[_k].indexOf(_oldName) !== -1) c[_k] = c[_k].split(_oldName).join(_newName)
+            }
+            if (Array.isArray(c.aliases)) {
+              c.aliases = c.aliases.map((a: any) => (typeof a === 'string' && a.indexOf(_oldName) !== -1) ? a.split(_oldName).join(_newName) : a)
+            }
           }
           return c
         }
@@ -28546,7 +29591,7 @@ ${charConfigStr}
         if (femaleLeads.length < _beforeFL) {
           console.log('[characters] 女主性别守卫：剔除男性历史人物 ' + (_beforeFL - femaleLeads.length) + ' 位，剩余女主 ' + femaleLeads.length + ' 位')
         }
-        if ((!_charBatch || _batchNeedsFemale) && femaleLeads.length === 0) {
+        if ((!_charBatch || _batchNeedsFemale) && _roster.length === 0 && femaleLeads.length === 0) {
           var _genFL = await _llmGenerateCast('女主角', 1, { genre: _genreKeyForFill, protagonistName: _protagNameForFill, era: _wbEraForFill, title: _ideaTitleForFill, userDesign: (previousData && previousData.detailedDesignInput) || '' }, llmConfig)
           if (_genFL.length > 0 && _genFL[0].name && !_isMaleFigure(_genFL[0])) {
             femaleLeads = [{ name: _genFL[0].name, gender: '女', rolePosition: '女主', role: '女主', identity: _genFL[0].identity || _genFL[0].motivation || '', description: _genFL[0].identity || '' }]
@@ -28721,9 +29766,19 @@ ${charConfigStr}
               camp: _r.group || '',
               gender: _isFem ? '女' : '男',
               catchphrase: (String(_r.role || _r.group || '本心')).slice(0, 6) + '之道，吾辈死生以之',
+              // 🔥 2026-09-08 #165 弧光去重：旧逻辑 event/change 写同一值（_fe），用户实测「关键事件/心理变化」两栏一模一样。
+              //   名单补齐角色无 growthArc，change 按阶段确定性分化，与 event 明确区分。
               arcNodes: ['起步·初心', '觉醒·转折', '成长·磨砺', '巅峰·高光', '超脱·归宿'].map(function (st: string, si: number) {
                 var _fe = _r.desc ? (_r.desc + '（' + st + '）') : (String(_r.name) + '·' + st)
-                return { stage: st, event: _fe, change: _fe, powerLevel: '' }
+                var _nmF = String(_r.name).trim()
+                var _cgF = [
+                  _nmF + '初立其志，在时局洪流中找准自身位置，迈出第一步',
+                  _nmF + '遭遇变局，旧有观念被现实击碎，完成第一次蜕变',
+                  _nmF + '历经挫折磨砺，处事愈发沉稳，从独善其身转向统御全局',
+                  _nmF + '迎来高光时刻，声望与影响力达于顶点，心态归于从容',
+                  _nmF + '回望来路信念升华，个人命运汇入时代洪流'
+                ]
+                return { stage: st, event: _fe, change: _cgF[si], powerLevel: '' }
               }),
             }
             if (_isVil) structuredResult.antagonists.push(_fillChar)
@@ -28782,6 +29837,24 @@ ${charConfigStr}
                 if (!c.background || String(c.background).length < _rrDesc.length) c.background = _rrDesc
                 console.log('[characters] 🔥 用户名单覆盖通用模板身份: ' + nm + ' → ' + _rrDesc.slice(0, 30))
               }
+              // 🔥 2026-09-08 #166 角色污染修复：角色定位被名单权威覆盖（如 反派→忠臣）后，
+              //   身份背景/性格若仍是旧角色的兜底模板（尤其反派模板「与主角立场对立…」），会与新政职互相矛盾。
+              //   检测模板特征串并按新政职重建：优先用名单原文 desc，其次按「名+职能」拼接。
+              var _idAfter = String(c.identity || '')
+              var _POL_MARKS = ['与主角立场对立', '故事冲突的核心来源', '最棘手的对手', '争夺天下', '最大的政治对手', '阴狠毒辣智计深沉']
+              var _polHit = false
+              for (var _pm = 0; _pm < _POL_MARKS.length; _pm++) { if (_idAfter.indexOf(_POL_MARKS[_pm]) >= 0) { _polHit = true; break } }
+              var _newRoleIsVil = String(_func || '').indexOf('反派') >= 0
+              if (_polHit && !_newRoleIsVil) {
+                var _rrDesc2 = String(rr.desc || '').replace(/^[）)：:\s]+/, '').trim()
+                if (_rrDesc2.length < 10) _rrDesc2 = nm + '，' + _func + '，在故事世界中立场鲜明、恪尽职守，与主角命运交织'
+                c.identity = _rrDesc2
+                if (!c.background || _POL_MARKS.some(function (mk: string) { return String(c.background || '').indexOf(mk) >= 0 }) || String(c.background) === _idAfter) c.background = _rrDesc2
+                if (String(c.personality || '').indexOf('阴狠毒辣') >= 0) {
+                  c.personality = '恪尽职守原则性强，处事老练持重，对认可之人忠贞不贰，在立场与情义之间自有权衡'
+                }
+                console.log('[characters] 🔥 #166 角色污染修复: ' + nm + ' 新定位「' + _func + '」与旧模板身份矛盾 → 重建为「' + _rrDesc2.slice(0, 30) + '」')
+              }
             }
             var _t = _titleOf(nm)
             if (_t && (!c.title || String(c.title).trim().length < 2)) c.title = _t
@@ -28806,6 +29879,97 @@ ${charConfigStr}
         if (structuredResult.antagonist && _isBadCharName(structuredResult.antagonist.name)) structuredResult.antagonist = (structuredResult.antagonists && structuredResult.antagonists[0]) || null
         if (structuredResult.femaleLead && _isBadCharName(structuredResult.femaleLead.name)) structuredResult.femaleLead = (structuredResult.femaleLeads && structuredResult.femaleLeads[0]) || null
       } catch (_evE) { /* 伪角色名清理失败不影响主流程 */ }
+
+      // 🔥🔥🔥 2026-09-08 #161：角色 title 合法性清洗 + femaleLeads 空数组扶正
+      //   实测《废土机甲》（科幻）全自动流程：主角/女主/反派 title 全部为同一个脏值「事发生在公」
+      //   （LLM 从世界观 era 长句「…故事发生在公元2147年…」里截出的片段），此值会直接显示为角色卡徽章；
+      //   同时 femaleLeads 数组为空、只有 femaleLead 单值 → 关系图谱/后续环节取不到女主。
+      try {
+        var _validCharTitle161 = function (_tIn: any): string {
+          var _s = String(_tIn == null ? '' : _tIn).trim()
+          if (!_s) return ''
+          _s = _s.split(/[，,、;；|。！？!?\n]/)[0].trim()
+          _s = _s.replace(/^["'“「『《（(【\s]+/, '').replace(/["'”」』》）)】\s]+$/, '').trim()
+          if (_s.length < 2 || _s.length > 12) return ''
+          if (!/^[\u4e00-\u9fa5A-Za-z0-9·\-]+$/.test(_s)) return ''
+          // 角色定位词/称呼词/说明词 → 不是头衔
+          if (/主角|女主|男主|女配|男配|反派|配角|别名|称号|身份|称呼|本名|原名|诨名|自称|人称|又名|外号|绰号|名号|人物|角色|本作|该角|小说|原型|模板/.test(_s)) return ''
+          // 含虚词/动词 → 多为句子片段（脏值「事发生在公」即由此命中）
+          if (/[的为是乃与及和或但之其这那即曾所就把被让使于在从对给还也都很太最不无有能会将要可却而则且以]/.test(_s)) return ''
+          return _s
+        }
+        var _firstSeg161 = function (_v: any): string {
+          var _s = String(_v == null ? '' : _v).trim()
+          if (!_s) return ''
+          _s = _s.split(/[，,。；;！!？?\n]/)[0].trim()
+          return (_s.length >= 2 && _s.length <= 12) ? _s : ''
+        }
+        var _fixTitle161 = function (_c: any): void {
+          if (!_c || typeof _c !== 'object') return
+          var _t = _validCharTitle161(_c.title)
+          if (!_t) {
+            // 回退链：aliases 首项 → identity 首段 → 空串（绝不留下脏值）
+            var _al161: any[] = Array.isArray(_c.aliases) ? _c.aliases : (typeof _c.aliases === 'string' ? String(_c.aliases).split(/[、,，\/|]/) : [])
+            for (var _i161 = 0; _i161 < _al161.length; _i161++) {
+              var _cand161 = _validCharTitle161(_al161[_i161])
+              if (_cand161) { _t = _cand161; break }
+            }
+          }
+          if (!_t) _t = _validCharTitle161(_firstSeg161(_c.identity)) || _validCharTitle161(_firstSeg161(_c.rolePosition)) || ''
+          if (String(_c.title || '') !== _t) {
+            console.log('[characters] #161 title 清洗: "' + String(_c.title || '') + '" → "' + _t + '"')
+            _c.title = _t
+          }
+        }
+        var _cl161: any[] = []
+        if (structuredResult.protagonist) _cl161.push(structuredResult.protagonist)
+        if (structuredResult.femaleLead) _cl161.push(structuredResult.femaleLead)
+        ;['femaleLeads', 'antagonists', 'supporting'].forEach(function (_k161: string) {
+          if (Array.isArray(structuredResult[_k161])) structuredResult[_k161].forEach(function (_c161: any) { if (_c161) _cl161.push(_c161) })
+        })
+        if (structuredResult.antagonist) _cl161.push(structuredResult.antagonist)
+        _cl161.forEach(_fixTitle161)
+
+        // femaleLeads 扶正：单女主模式下后端只给出 femaleLead，数组为空会导致下游（关系图谱/势力/简介）丢失女主
+        if ((!Array.isArray(structuredResult.femaleLeads) || structuredResult.femaleLeads.length === 0) &&
+            structuredResult.femaleLead && structuredResult.femaleLead.name) {
+          structuredResult.femaleLeads = [structuredResult.femaleLead]
+          console.log('[characters] #161 femaleLeads 为空，已用 femaleLead 扶正: ' + String(structuredResult.femaleLead.name))
+        }
+
+        // 🔥 #161-B：跨角色「整段复制」清理 + 主角/反派外貌错配对调
+        //   实测《废土机甲》：主角与女主 appearance 完全相同（都是阴鸷反派模板），
+        //   女主与反派 motivation/goal 一字不差，反派却被写成"身材挺拔面容俊朗…沉稳坚定"的正面相。
+        try {
+          var _NEG_APPEAR161 = /阴鸷|阴冷|毒蛇|苍白如骨|狰狞|可怖|凶戾|邪异|枯槁|瘦骨|阴森|嗜血|戾气|诡异|幽绿|毫无血色/
+          var _POS_APPEAR161 = /俊朗|挺拔|清秀|温润|阳光|爽朗|英气|明眸|剑眉星目|沉稳|端正|俊美|斯文|和煦/
+          var _prot161: any = structuredResult.protagonist
+          var _ant161: any = (Array.isArray(structuredResult.antagonists) && structuredResult.antagonists[0]) || structuredResult.antagonist
+          if (_prot161 && _ant161 && _prot161 !== _ant161 &&
+              _NEG_APPEAR161.test(String(_prot161.appearance || '')) && _POS_APPEAR161.test(String(_ant161.appearance || ''))) {
+            var _tmpAp161 = _prot161.appearance
+            _prot161.appearance = _ant161.appearance
+            _ant161.appearance = _tmpAp161
+            console.log('[characters] #161 主角/反派外貌错配，已对调')
+          }
+          // 整段复制清理：同一字段在多个角色间一字不差 → 只保留首个，其余清空并告警
+          var _DUP_FIELDS161 = ['appearance', 'personality', 'motivation', 'goal', 'psychologicalTrauma', 'hiddenTraits', 'growthArc', 'background', 'catchphrase', 'speechHabit', 'decisionPattern', 'quirks', 'values', 'moralBottomLine']
+          var _seenVal161: Record<string, string> = {}
+          _DUP_FIELDS161.forEach(function (_f161: string) {
+            _seenVal161[_f161] = ''
+            _cl161.forEach(function (_c161: any) {
+              if (!_c161 || typeof _c161 !== 'object') return
+              var _v161 = String(_c161[_f161] == null ? '' : _c161[_f161]).trim()
+              if (_v161.length < 8) return
+              if (!_seenVal161[_f161]) { _seenVal161[_f161] = _v161; return }
+              if (_seenVal161[_f161] === _v161) {
+                console.log('[characters] #161 字段跨角色重复已清空: ' + _f161 + ' @' + String(_c161.name || '?'))
+                _c161[_f161] = ''
+              }
+            })
+          })
+        } catch (_dup161E) { console.warn('[characters] #161-B 重复清理异常:', _dup161E) }
+      } catch (_t161E) { console.warn('[characters] #161 title 清洗异常:', _t161E) }
 
       // 🔥 通用角色定位规整：凡 role/rolePosition 为「XX阵营（…）·职能」冗长串，一律拆成 职能（role）+ 阵营（camp）
       try {
@@ -28855,7 +30019,8 @@ ${charConfigStr}
               camp: _rr.group || '',
               gender: _fem ? '女' : '男',
               catchphrase: (String(_rr.role || _rr.group || '本心')).slice(0, 6) + '之道，吾辈死生以之',
-              arcNodes: ['起步·初心', '觉醒·转折', '成长·磨砺', '巅峰·高光', '超脱·归宿'].map(function (st: string) { var fe = _rr.desc ? (_rr.desc + '（' + st + '）') : (String(_rr.name) + '·' + st); return { stage: st, event: fe, change: fe, powerLevel: '' } }),
+              // 🔥 2026-09-08 #165 弧光去重：旧逻辑 event/change 同值（_fe），改为 change 按阶段分化
+              arcNodes: ['起步·初心', '觉醒·转折', '成长·磨砺', '巅峰·高光', '超脱·归宿'].map(function (st: string, si: number) { var fe = _rr.desc ? (_rr.desc + '（' + st + '）') : (String(_rr.name) + '·' + st); var _nmG = String(_rr.name).trim(); var _cgG = [_nmG + '初立其志，在时局洪流中找准自身位置，迈出第一步', _nmG + '遭遇变局，旧有观念被现实击碎，完成第一次蜕变', _nmG + '历经挫折磨砺，处事愈发沉稳，从独善其身转向统御全局', _nmG + '迎来高光时刻，声望与影响力达于顶点，心态归于从容', _nmG + '回望来路信念升华，个人命运汇入时代洪流']; return { stage: st, event: fe, change: _cgG[si], powerLevel: '' } }),
             }
             if (_vil) structuredResult.antagonists.push(_tc)
             else structuredResult.supporting.push(_tc)
@@ -28916,6 +30081,58 @@ ${charConfigStr}
           console.log('[characters] 🔥 正史职衔表覆盖徽章 ' + _histFixed.length + ' 处: ' + _histFixed.slice(0, 8).map(function (h: any) { return h.name + ' ' + (h.from || '空') + '→' + h.to }).join('，'))
         }
       } catch (_trE) { /* 徽章/定位规范化失败不影响主流程 */ }
+
+      // 🔥 2026-11-07 修复：定位↔分桶一致性 + 阵营→定位确定性纠正（不依赖模型自觉）
+      //   实测第 7 轮：S1 名册把瞿式耜/堵胤锡/何腾蛟/张煌言（历史上南明忠臣）划进「反派」池，
+      //   normalizeCharactersTitlesAndRoles 依据 identity 已把 role 改回「忠臣文官」，但所在数组仍是 antagonists，
+      //   前端表现为「反派列表里挂着一排忠臣」；多尔衮（清朝摄政王）camp=清 却因 identity 未命中反派词留在「忠臣」。
+      //   ① 以最终 role 为唯一依据重分桶，保证「定位」与「所在桶」永不矛盾；
+      //   ② 敌方阵营（清/后金/满清/伪清/大西/农民军/流寇）且非主角/女主 → 强制「反派」。
+      try {
+        var _recon168 = function () {
+          var _protoName168 = String((structuredResult.protagonist && structuredResult.protagonist.name) || '').trim()
+          var _flNames168: Record<string, boolean> = {}
+          ;(structuredResult.femaleLeads || []).forEach(function (c: any) { if (c && c.name) _flNames168[String(c.name).trim()] = true })
+          var _seen168: Record<string, boolean> = {}
+          var _all168: any[] = []
+          var _push168 = function (c: any) {
+            if (!c || typeof c !== 'object' || !c.name) return
+            var _nm168 = String(c.name).trim()
+            if (_seen168[_nm168]) return
+            _seen168[_nm168] = true
+            _all168.push(c)
+          }
+          _push168(structuredResult.protagonist)
+          ;(structuredResult.femaleLeads || []).forEach(_push168)
+          ;(structuredResult.antagonists || []).forEach(_push168)
+          ;(structuredResult.supporting || []).forEach(_push168)
+          var _p168: any = null, _fl168: any[] = [], _ant168: any[] = [], _sup168: any[] = []
+          _all168.forEach(function (c: any) {
+            var _nm168 = String(c.name).trim()
+            if (_nm168 === _protoName168) { c.role = '主角'; c.rolePosition = '主角'; _p168 = c; return }
+            var _rl168 = String(c.role || c.rolePosition || '').trim()
+            if (!/主角/.test(_rl168) && !/女主/.test(_rl168)) {
+              var _camp168 = String(c.camp || c.faction || '').trim()
+              var _idHead168 = String(c.identity || '').split(/[，,。；;]/)[0]
+              var _enemyCamp = /清朝|清军|清廷|后金|满清|伪清|摄政王|大西|农民军|流寇/.test(_camp168) || /^(清朝|清军|后金|满清|大西皇帝|农民军|流寇)/.test(_idHead168)
+              var _ownSide168 = /南明|永历|明廷|归明|抗清|反正|大明/.test(_idHead168 + ' ' + _camp168)
+              if (_enemyCamp && !_ownSide168) { _rl168 = '反派'; c.role = '反派'; c.rolePosition = '反派' }
+            }
+            if (_flNames168[_nm168] || _rl168 === '女主') { _fl168.push(c); return }
+            if (/反派|宿敌|竞争对手|敌对/.test(_rl168)) _ant168.push(c)
+            else _sup168.push(c)
+          })
+          if (!_p168 && structuredResult.protagonist) _p168 = structuredResult.protagonist
+          structuredResult.protagonist = _p168
+          structuredResult.femaleLeads = _fl168
+          structuredResult.femaleLead = _fl168.length > 0 ? _fl168[0] : null
+          structuredResult.antagonists = _ant168
+          structuredResult.antagonist = _ant168.length > 0 ? _ant168[0] : null
+          structuredResult.supporting = _sup168
+        }
+        _recon168()
+        console.log('[characters] 🔥 定位↔分桶一致性重排：主角1 / 女主' + ((structuredResult.femaleLeads || []).length) + ' / 反派' + ((structuredResult.antagonists || []).length) + ' / 其余' + ((structuredResult.supporting || []).length))
+      } catch (_rcE) { /* 重排失败不影响主流程 */ }
 
       // 🔥🔥🔥 深度字段确保机制：基于LLM生成结果，确保每个角色都有立体化深度字段（多种字段名兼容透传）
       var _ensureDepthFields = function(charObj: any, roleType: string) {
@@ -29172,14 +30389,15 @@ ${charConfigStr}
         if (!charObj.job || !String(charObj.job).trim()) {
           var _jobId = String(charObj.identity || charObj.background || '')
           if (isHistoryChar) {
+            // 🔥 2026-09-08 #173 去南明化：job 兜底不得写死「永历朝/南明/清廷」——必须贴合本作设定朝代
             if (_charRole.indexOf('主角') >= 0) {
-              charObj.job = _jobId ? String(_jobId).replace(/[。，、].*$/, '') + '·（永历朝核心人物）' : '南明永历朝核心人物'
+              charObj.job = _jobId ? String(_jobId).replace(/[。，、].*$/, '') : '本作核心主角'
             } else if (_charRole.indexOf('女主') >= 0) {
               charObj.job = /妃|皇后|太后|公主/.test(_jobId) ? '后宫眷属' : '世家女眷'
             } else if (/总督|巡抚|尚书|大学士|总兵|参将|副将|都督|锦衣|知府|知县|参政|布政/.test(_jobId)) {
               charObj.job = String(_jobId).replace(/[。，、].*$/, '').slice(0, 20)
             } else if (_charRole.indexOf('反派') >= 0) {
-              charObj.job = '清廷权臣'
+              charObj.job = '对立阵营权臣'
             } else {
               charObj.job = '朝臣武弁'
             }
@@ -29242,10 +30460,23 @@ ${charConfigStr}
                 _powHint = '随剧情节奏触达本位面相应阶位'
               }
             }
+            // 🔥 2026-09-08 #165 弧光去重守卫（全局兜底）：change 空或与 event 同文（名单补齐/增量追加旧路径、LLM 偷懒输出）
+            //   → 按阶段确定性重建，杜绝「关键事件/心理变化」两栏一模一样。
+            var _evN = String(n.event || n.keyEvent || '').trim()
+            var _cgN = String(n.change || n.psychologicalChange || '').trim()
+            if (!_cgN || _cgN === _evN) {
+              var _cgNameA = String(charObj.name || '此角')
+              if (_nodeStage.indexOf('起步') >= 0 || _nodeStage.indexOf('初心') >= 0) _cgN = _cgNameA + '初立其志，在时局洪流中找准自身位置，迈出第一步'
+              else if (_nodeStage.indexOf('觉醒') >= 0 || _nodeStage.indexOf('转折') >= 0) _cgN = _cgNameA + '遭遇变局，旧有观念被现实击碎，完成第一次蜕变'
+              else if (_nodeStage.indexOf('成长') >= 0 || _nodeStage.indexOf('磨砺') >= 0) _cgN = _cgNameA + '历经挫折磨砺，处事愈发沉稳，从独善其身转向统御全局'
+              else if (_nodeStage.indexOf('巅峰') >= 0 || _nodeStage.indexOf('高光') >= 0) _cgN = _cgNameA + '站上巅峰后心态归于从容笃定，格局由取胜转向治世'
+              else if (_nodeStage.indexOf('超脱') >= 0 || _nodeStage.indexOf('归宿') >= 0) _cgN = _cgNameA + '回望来路信念升华，个人命运汇入时代洪流'
+              else _cgN = _cgNameA + '在此阶段完成从处境到心境的双重转变'
+            }
             return {
               stage: _nodeStage,
-              event: String(n.event || n.keyEvent || '').trim(),
-              change: String(n.change || n.psychologicalChange || '').trim(),
+              event: _evN,
+              change: _cgN,
               powerLevel: _powHint,
             }
           }).filter(function(n: any) { return n.stage || n.event || n.change || n.powerLevel })
@@ -30123,6 +31354,136 @@ ${charConfigStr}
         console.log('[characters] ✅ 阶段4双重校验通过：所有角色均与阶段3深度对齐')
       }
 
+      // 🔥🔥🔥 2026-09-08 #169 IP 人物黑名单过滤（#169c 移至所有兜底之后：兜底 LLM 调用本身可能再产出 IP 人物名，
+      //   实测《上古巫神》第3轮 反派兜底再次产出 张无忌）。统一在出口前剔除（主角除外）。
+      //   🔥 #169b 修复：原实现引用 _knownNovelCharNamesChar，但该变量在「无用户指定主角名」分支内赋值，
+      //   分批/带主角名场景下恒为 undefined → 黑名单静默失效。改为自包含名单。
+      try {
+        var _ipList169 = ['萧炎','萧薰儿','药老','药尘','萧战','海波东','加刑天','法犸','雅妃','凌影','纳兰桀','林动','牧尘','唐三','小舞','韩立','南宫婉','墨大夫','叶凡','狠人','无始','石昊','林雷','索恩','沃顿','霍格','迪莉娅','克莱恩','奥黛丽','徐凤年','王仙芝','秦牧','方源','苏铭','陆尘','林默','叶尘','秦风','萧尘','白小纯','楚风','楚阳','风清扬','令狐冲','任我行','岳不群','东方不败','乔峰','段誉','虚竹','郭靖','黄蓉','洪七公','杨过','小龙女','张无忌','韦小宝','林平之','黄药师','欧阳锋','段智兴','王语嫣','慕容复','阿朱','阿紫','周伯通','成吉思汗','谢逊','张三丰','宋远桥','俞莲舟','张翠山','殷素素','赵敏','周芷若','小昭','成昆','陈家洛','霍青桐','香香公主','袁承志','夏雪宜','温仪','金蛇郎君','胡斐','胡一刀','苗人凤','程灵素','袁紫衣','狄云','戚芳','水笙','石破天','白阿绣','石清','闵柔','谢烟客','白万剑','史小翠','苏晚照','林昊','林渊','云韵','美杜莎','紫妍','薰儿']
+        var _ipFiltered169: string[] = []
+        var _dropIp169 = function (arr: any): any {
+          if (!Array.isArray(arr)) return arr
+          return arr.filter(function (c: any) {
+            if (!c || !c.name) return true
+            if (_ipList169.indexOf(String(c.name).trim()) >= 0) { _ipFiltered169.push(String(c.name)); return false }
+            return true
+          })
+        }
+        structuredResult.antagonists = _dropIp169(structuredResult.antagonists)
+        structuredResult.supporting = _dropIp169(structuredResult.supporting)
+        structuredResult.femaleLeads = _dropIp169(structuredResult.femaleLeads)
+        if (structuredResult.antagonist && _ipList169.indexOf(String(structuredResult.antagonist.name || '').trim()) >= 0) structuredResult.antagonist = (structuredResult.antagonists && structuredResult.antagonists[0]) || null
+        if (_ipFiltered169.length) console.log('[characters] 🔥 #169 IP人物黑名单剔除 ' + _ipFiltered169.length + ' 例: ' + _ipFiltered169.join('、'))
+
+        // 🔥🔥🔥 2026-09-08 #174 南明真实人物防串线：无用户设计人物时，历史题材严禁出现《永历中兴》型真实历史人名
+        //   （实测《上古巫神》wusong5 反派被 12.3 示例带偏产出 丁魁楚/瞿式耜/李定国/郑成功）。
+        //   有用户设计（detailedDesignInput 非空）时跳过——用户有权使用真实历史人物。
+        var _hasUserDesign174 = !!(previousData && (previousData.detailedDesignInput || previousData.userCharacterList))
+        // 🔥 2026-11-07 修复：本书自身就是明末/南明题材时（如《大明：开局逃跑天子》主角朱由榔），
+        //   李定国/瞿式耜/何腾蛟等是本书正当阵容，绝不能当成「《永历中兴》串线」剔除；
+        //   否则名册会被砍到 <15 人 → 触发整段重新生成 → 每轮都被砍 → 死循环直至 502。
+        var _ownEra174 = (function () {
+          var _probe174 = [
+            String(((previousData as any)?.idea) || ''),
+            String(((previousData as any)?.protagonistSettings?.identity) || ''),
+            String(forcedProtagonistName || ''),
+            String(((previousData as any)?.protagonistName) || ''),
+            String(((previousData as any)?.title) || ''),
+          ].join(' ')
+          return /大明|明朝|明代|明末|南明|崇祯|万历|天启|永历|弘光|隆武|绍武|朱由|后金|建州|明清/.test(_probe174)
+        })()
+        if (!_hasUserDesign174 && !_ownEra174) {
+          var _nanmingList174 = ['丁魁楚','瞿式耜','李定国','郑成功','沐天波','焦琏','王太后','何腾蛟','堵胤锡','史可法','马士英','阮大铖','左良玉','高杰','刘泽清','黄得功','李成栋','孙可望','多铎','孔有德','吴三桂','洪承畴','张献忠','李自成','鳌拜','济尔哈朗','豪格','皇太极','努尔哈赤','朱由榔','陈圆圆','柳如是','多尔衮','张同敞']
+          var _nmFiltered174: string[] = []
+          var _dropNm174 = function (arr: any): any {
+            if (!Array.isArray(arr)) return arr
+            return arr.filter(function (c: any) {
+              if (!c || !c.name) return true
+              var _n174 = String(c.name).trim()
+              if (_nanmingList174.indexOf(_n174) >= 0 || /永历|弘光|隆武|绍武/.test(_n174)) { _nmFiltered174.push(_n174); return false }
+              return true
+            })
+          }
+          structuredResult.antagonists = _dropNm174(structuredResult.antagonists)
+          structuredResult.supporting = _dropNm174(structuredResult.supporting)
+          structuredResult.femaleLeads = _dropNm174(structuredResult.femaleLeads)
+          if (structuredResult.antagonist && (/永历|弘光|隆武|绍武/.test(String(structuredResult.antagonist.name || '')) || _nanmingList174.indexOf(String(structuredResult.antagonist.name || '').trim()) >= 0)) structuredResult.antagonist = (structuredResult.antagonists && structuredResult.antagonists[0]) || null
+          if (_nmFiltered174.length) console.log('[characters] 🔥 #174 南明真实人物防串线剔除 ' + _nmFiltered174.length + ' 例: ' + _nmFiltered174.join('、'))
+        }
+      } catch (_ip169E) { /* 黑名单过滤失败不影响主流程 */ }
+
+      // 🔥🔥🔥 2026-09-08 #168 角色污染终检（所有 normalize/兜底/名单覆盖之后执行，最终仲裁）：
+      //   实测《上古巫神》：反派身份模板串（权臣或敌国君主/与主角争夺天下…）与定位「忠臣武将」并存。
+      //   仲裁规则：① 反派模板身份 + 定位非反派 + 位于反派池 → 定位改回反派（保留反派身份）；
+      //             ② 反派模板身份 + 定位非反派 + 不在反派池 → 身份背景按定位重建（定位权威）。
+      try {
+        var _VIL_MARKS_168 = ['与主角立场对立', '故事冲突的核心来源', '最棘手的对手', '权臣或敌国君主', '争夺天下', '最大的政治对手', '与主角对立', '内部反对派', '反对派领袖', '南明朝廷的敌人', '与主角为敌', '故事中的重要配角']
+        var _isVilTpl168 = function (s: string): boolean {
+          var _s168 = String(s || '')
+          for (var _i168 = 0; _i168 < _VIL_MARKS_168.length; _i168++) { if (_s168.indexOf(_VIL_MARKS_168[_i168]) >= 0) return true }
+          return false
+        }
+        // 🔥 2026-11-07 修复：非反派池角色命中反派模板时，改为「外科式」剔除污染分句，
+        //   保留原有史实身份（旧逻辑整段重写成「XX，忠臣文官，恪尽职守…」这种空泛句，反而制造新的模板污染）。
+        var _scrubVil168 = function (s: string): string {
+          var _src168 = String(s || '')
+          if (!_isVilTpl168(_src168)) return _src168
+          var _keep168 = _src168.split(/[，,；;。]/).filter(function (p: string) { return String(p || '').trim() && !_isVilTpl168(p) })
+          return _keep168.join('，').replace(/^[，,]+|[，,]+$/g, '').trim()
+        }
+        var _fixed168: string[] = []
+        var _scan168 = function (c: any, inAntag: boolean) {
+          if (!c || !c.name) return
+          var _r168 = String(c.role || c.rolePosition || '')
+          if (_r168.indexOf('反派') >= 0) return
+          var _id168 = String(c.identity || '')
+          var _bg168 = String(c.background || '')
+          var _idBad = _isVilTpl168(_id168)
+          if (!_idBad && !_isVilTpl168(_bg168)) return
+          if (inAntag) {
+            c.role = '反派'
+            c.rolePosition = '反派'
+            _fixed168.push(String(c.name) + '→定位反派')
+          } else {
+            var _newId168 = String(c.name) + '，' + _r168 + '，恪尽职守、立场鲜明，与主角命运交织'
+            var _idScr168 = _scrubVil168(_id168)
+            var _idOk168 = _idScr168 && _idScr168.length >= 6 && !/^(在剧情中|与主角|故事冲突|承担关键)/.test(_idScr168)
+            if (_idBad) c.identity = _idOk168 ? _idScr168 : _newId168
+            var _bgScr168 = _scrubVil168(_bg168)
+            if (_isVilTpl168(_bg168) || _bg168 === _id168) c.background = (_bgScr168 && _bgScr168.length >= 6) ? _bgScr168 : _newId168
+            _fixed168.push(String(c.name) + '→身份剔除反派模板分句')
+          }
+        }
+        _scan168(structuredResult.protagonist, false)
+        _scan168(structuredResult.femaleLead, false)
+        if (Array.isArray(structuredResult.femaleLeads)) structuredResult.femaleLeads.forEach(function (c: any) { _scan168(c, false) })
+        if (Array.isArray(structuredResult.antagonists)) structuredResult.antagonists.forEach(function (c: any) { _scan168(c, true) })
+        if (Array.isArray(structuredResult.supporting)) structuredResult.supporting.forEach(function (c: any) { _scan168(c, false) })
+        if (_fixed168.length) console.log('[characters] 🔥 #168 角色污染终检 ' + _fixed168.length + ' 例: ' + _fixed168.join('，'))
+      } catch (_c168E) { /* 终检失败不影响主流程 */ }
+
+      // 🔥 2026-11-07 修复：必填字段确定性兜底（title / weaknesses）。
+      //   实测第 7 轮：朱由榔缺 weaknesses、陈圆圆/李自成缺 title —— 前端 13 项字段出现空值。
+      //   这里只补「确实为空」的项，已有值一律不动（绝不覆盖模型产出）。
+      try {
+        var _fillBasic168 = function (c: any) {
+          if (!c || typeof c !== 'object' || !c.name) return
+          if (!String(c.title || '').trim()) {
+            var _idH168 = String(c.identity || '').split(/[，,。；;]/)[0].trim()
+            var _ttl168 = _idH168.replace(/^.*?(封|任|官至|授|拜)/, '').trim().slice(0, 8)
+            c.title = (_ttl168 && _ttl168.length >= 2) ? _ttl168 : String(c.rolePosition || c.role || '关键人物')
+          }
+          if (!String(c.weaknesses || '').trim() && !(Array.isArray(c.weaknesses) && c.weaknesses.length)) {
+            var _mo168 = String(c.motivation || c.goal || c.personality || '').trim()
+            c.weaknesses = _mo168 ? ('执念于' + _mo168.slice(0, 16) + '，遇关键抉择时易被此牵制') : '性格与身份所限，权衡之际难免犹豫'
+          }
+        }
+        _fillBasic168(structuredResult.protagonist)
+        ;(structuredResult.femaleLeads || []).forEach(_fillBasic168)
+        ;(structuredResult.antagonists || []).forEach(_fillBasic168)
+        ;(structuredResult.supporting || []).forEach(_fillBasic168)
+      } catch (_fbE) { /* 字段兜底失败不影响主流程 */ }
+
       return structuredResult
     }
 
@@ -30209,8 +31570,8 @@ ${charConfigStr}
         facTypeRequirement = '【🔥 西幻题材·势力铁律】\n本作属于西幻/魔法斗气题材，势力类型只能是：王国/帝国、教廷/教会、魔法学院、冒险者公会、魔法师工会、骑士团、商会、精灵族/矮人族/兽人族等。绝对禁止出现东方修仙宗门、现代科技、重工业等元素。'
         facCountHint = '生成至少12个势力（必须包含：主角势力1个、敌对势力3个、中立势力4个、第三方势力2个、隐藏/神秘势力1个、商会/商业势力1个）'
       } else if (_facGenre.isHistory) {
-        facTypeRequirement = '【🔥 历史/权谋题材·势力铁律】\n本作属于历史/权谋/种田题材，势力类型只能是：朝廷/官府、世家大族、藩镇/节度使、义军/起义军、江湖门派、商会、游牧民族、藩国等。绝对禁止出现修仙、魔法、系统等超凡元素。'
-        facCountHint = '生成至少12个势力（必须包含：主角势力1个、敌对势力3个、中立势力4个、第三方势力2个、隐藏/神秘势力1个、商会/商业势力1个）'
+        facTypeRequirement = '【🔥 历史/权谋题材·势力铁律】\n本作属于历史/权谋/种田题材，势力类型只能是：朝廷/官府、世家大族、藩镇/节度使、义军/起义军、江湖门派、商会、游牧民族、藩国等。绝对禁止出现修仙、魔法、系统等超凡元素。\n- 【🔥 正史势力实体铁律·最高优先级·违反即为生成失败】历史题材势力必须按正史「政权/集团实体」划分，严禁把同一政权拆成多个势力：\n  ◆ 满清是一个势力（清廷/朝廷），八旗铁骑是其军队编制、三藩降将/汉军降臣是其麾下人群——绝对禁止拆成「清廷摄政」「八旗铁骑」「三藩降将」等多个势力；\n  ◆ 同理禁止把「大明/南明/永历朝廷」拆成并列的多个势力（一个政权=一个势力）；\n  ◆ 大西军、大顺军、郑氏海上集团等按正史实体各算一个势力；\n  ◆ 势力名称用正史通名（如：南明永历朝廷、满清、大西军、大顺军余部、郑氏海上集团、贵州沐氏、两广总督府衙）；军队编制、官职群体、降将人群一律并入所属政权势力，不得单列为势力。'
+        facCountHint = '生成至少12个势力（必须包含：主角势力1个、敌对势力3个、中立势力4个、第三方势力2个、隐藏/神秘势力1个、商会/商业势力1个；历史题材下敌对/第三方势力必须来自不同政权实体，禁止同源拆分）'
       } else if (_facGenre.isScifi) {
         // 🔥 BUG修复：添加科幻题材势力类型要求
         facTypeRequirement = '【🔥 科幻/星际题材·势力铁律·最高优先级】\n本作属于科幻/星际/宇宙题材，势力必须严格符合科幻世界观：\n- 势力类型只能是：星际联邦/帝国/共和国、星际舰队/军团、商业财团/公司、科研组织/实验室、佣兵组织、海盗团伙、外星种族/文明、反抗军/自由战士、基因改造组织、机械/AI势力、星际商会/贸易联盟、宇宙探险队等\n- 绝对禁止出现：修仙宗门、魔道教派、妖族部落、龙宫、天庭、地府、武林门派、江湖帮派、王朝/皇朝/帝国（古代封建制）、教廷/教会、魔法学院等玄幻/奇幻/古代势力类型\n- 势力名称必须有科幻/星际风格，如：银河联邦、星际舰队第七军团、黑曜石财团、深空科研站、天狼星佣兵团、暗物质海盗团、硅基文明联盟、自由星域反抗军、基因优化委员会、机械神教等\n- 实力描述必须用科幻术语，如：拥有多少艘星舰、控制多少颗行星、掌握什么级别的科技、拥有什么级别的基因战士/机甲/武器\n- 势力首领和成员必须是科幻角色，绝对禁止出现仙人、妖帝、魔尊、皇帝、王爷、掌门、方丈等古代/玄幻角色称谓'
@@ -31068,6 +32429,53 @@ ${charConfigStr}
                 })
                 console.log('[factions] 进阶字段动态补全完成')
 
+                // 🔥🔥🔥 2026-09-08 #161-C 势力关系自洽性清理
+                //   实测《废土机甲》：①「地球联邦军」allies 与 enemies 同时含「机械神教」（自相矛盾，前端会并列展示）；
+                //   ②「收集机械之心的基因图谱」等 hiddenAgenda/historyGrudges 在多个势力间一字不差地复制；
+                //   ③ members 里同一人物以不同职务重复出现（叶知秋×2）。
+                try {
+                  var _nameOf161 = function (_s: any): string { return String(_s == null ? '' : _s).split(/[（(]/)[0].trim() }
+                  var _arr161 = function (_v: any): string[] { return Array.isArray(_v) ? _v.map(function (x: any) { return String(x == null ? '' : x).trim() }).filter(Boolean) : [] }
+                  ;(normalizedFacs || []).forEach(function (fac: any, _fi: number) {
+                    if (!fac || typeof fac !== 'object') return
+                    var _self161 = String(fac.name || '').trim()
+                    var _al161 = _arr161(fac.allies)
+                    var _en161 = _arr161(fac.enemies)
+                    // ① allies / enemies 互斥：同名的敌对关系优先，且剔除自身
+                    var _enSet161: Record<string, boolean> = {}
+                    _en161.forEach(function (x: string) { _enSet161[x] = true })
+                    _al161 = _al161.filter(function (x: string) { return x !== _self161 && !_enSet161[x] })
+                    _en161 = _en161.filter(function (x: string) { return x !== _self161 })
+                    fac.allies = _al161
+                    fac.enemies = _en161
+                    // ③ members 同名去重（保留首个职务）
+                    var _memSeen161: Record<string, boolean> = {}
+                    fac.members = _arr161(fac.members).filter(function (m: string) {
+                      var _n161 = _nameOf161(m)
+                      if (!_n161) return false
+                      if (_memSeen161[_n161]) return false
+                      _memSeen161[_n161] = true
+                      return true
+                    })
+                  })
+                  // ② 跨势力整段复制的叙事字段：只保留首个，其余清空
+                  var _FAC_DUP161 = ['hiddenAgenda', 'historyGrudges', 'coreConflict', 'developmentTrajectory', 'fate', 'philosophy', 'trumpCard']
+                  _FAC_DUP161.forEach(function (_f161c: string) {
+                    var _seenF161: Record<string, boolean> = {}
+                    ;(normalizedFacs || []).forEach(function (fac: any) {
+                      if (!fac || typeof fac !== 'object') return
+                      var _v161c = String(fac[_f161c] == null ? '' : fac[_f161c]).trim()
+                      if (_v161c.length < 8) return
+                      if (_seenF161[_v161c]) {
+                        console.log('[factions] #161 跨势力重复已清空: ' + _f161c + ' @' + String(fac.name || '?'))
+                        fac[_f161c] = ''
+                      } else {
+                        _seenF161[_v161c] = true
+                      }
+                    })
+                  })
+                } catch (_fac161E) { console.warn('[factions] #161-C 关系自洽清理异常:', _fac161E) }
+
                 return { factions: normalizedFacs, _alignmentWarnings: _facValidationWarnings }
               }
               console.log('[factions] 有效势力不足(过滤待定后' + validFacArr.length + '个)，重试...')
@@ -31114,6 +32522,24 @@ ${charConfigStr}
         }, llmConfig)
         _facDynArr = _facDyn || []
         console.log('[factions] 动态兜底势力候选 ' + _facDynArr.length + ' 个（将用题材模板补齐到≥8）')
+        // 🔥🔥🔥 2026-09-08 #175 势力防串线：弱模型（实测 glm-z1-flash）会把「历史题材」先验成南明
+        //   （《上古巫神》夏商题材 12/12 势力全是 永历朝廷/清廷八旗/郑氏海上集团）。
+        //   无用户设计且本作时代/主题不含南明词时，剔除一切含南明真实人物名或南明朝代词的势力，由中性题材模板补齐。
+        var _facUserDesign175 = String(((previousData as any) && (previousData as any).detailedDesignInput) || '')
+        var _facEraHay175 = _facEraStr + ' ' + String(((previousData as any) && (previousData as any).idea && (previousData as any).idea.tagline) || '') + ' ' + String(genre || '')
+        var _isNanmingNovel175 = /南明|永历|隆武|弘光|绍武|明末|崇祯|朱由榔/.test(_facUserDesign175 + ' ' + _facEraHay175)
+        if (!_facUserDesign175 && !_isNanmingNovel175) {
+          var _nmMarks175 = ['丁魁楚','瞿式耜','李定国','郑成功','沐天波','朱由榔','孙可望','白文选','陈邦彦','张煌言','吴三桂','李成栋','陈子壮','多尔衮','孔有德','尚可喜','耿仲明','李自成','张献忠','史可法','黄得功','高杰','刘泽清','何腾蛟','堵胤锡','马士英','阮大铖','左良玉','鳌拜','皇太极','努尔哈赤','多铎','豪格','济尔哈朗','陈圆圆','柳如是','张同敞','焦琏']
+          var _before175 = _facDynArr.length
+          _facDynArr = _facDynArr.filter(function (f: any) {
+            if (!f) return false
+            var _h175 = String(f.name || '') + String(f.leader || '') + String(f.description || '') + String(f.goal || '')
+            for (var _mi175 = 0; _mi175 < _nmMarks175.length; _mi175++) { if (_h175.indexOf(_nmMarks175[_mi175]) >= 0) return false }
+            if (/南明|永历|弘光|隆武|清廷|八旗|后金|大西军|闯军/.test(_h175)) return false
+            return true
+          })
+          if (_facDynArr.length < _before175) console.log('[factions] 🔥 #175 南明串线势力剔除 ' + (_before175 - _facDynArr.length) + '/' + _before175 + '（本作时代非南明），将由中性题材模板补齐')
+        }
       } catch (_fde) {
         console.warn('[factions] 动态兜底异常，直接用题材感知模板:', _fde instanceof Error ? _fde.message : String(_fde))
       }
@@ -32004,6 +33430,48 @@ ${charConfigStr}
                 var _relGenreTypeForClean = _relGenreDetect.isScifi ? 'scifi' : _relGenreDetect.isWestern ? 'western' : _relGenreDetect.isCultivation ? 'xiuxian' : ''
                 _mappedRels = _mappedRels.map(function(r: any) { _cleanCrossGenreTermsDeep(r, 'relationships', new Set<string>(), _relGenreTypeForClean); return r })
 
+                // 🔥🔥🔥 2026-09-08 #161-D 关系字段清洗
+                //   实测《废土机甲》：8 组关系里 impactOnPlot 一字不差全是「…的关系在剧情推进中持续发酵，
+                //   影响关键抉择」，keyEvents / emotionChange 全部为空串——前端 StepRelationships 三个字段都展示，
+                //   会看到 8 条一模一样的说明 + 两列空白。
+                try {
+                  var _REL_TIP161: Record<string, { ev: string; emo: string }> = {
+                    '恋人': { ev: '初识时的误会与试探；生死关头的相互守护；立场冲突后的抉择与坚守', emo: '从戒备试探到托付生死，情感在共患难中层层加深' },
+                    '死敌': { ev: '初次交锋的试探；正面决战的生死相搏；终局的宿命对决', emo: '从轻视到忌惮，再到不得不承认对手的分量' },
+                    '宿敌': { ev: '命中注定的初次照面；反复较量中的此消彼长；终局一战', emo: '从针锋相对到相惜相杀，敌意中夹杂着敬意' },
+                    '同僚': { ev: '初入同一阵营的磨合；任务中的分工与救援；关键时刻的相互掩护', emo: '从陌生客套到默契配合，逐渐建立信任' },
+                    '战友': { ev: '并肩突围的初次合作；绝境中的互相掩护；战后的并肩重建', emo: '从点到为止到托付后背，战友情在血火中铸就' },
+                    '盟友': { ev: '利益交换下的结盟；共同行动中的相互试探；危机来临时的取舍', emo: '从各取所需的利用到有限度的信任，始终留着戒心' },
+                    '上下级': { ev: '领命与执行的初次磨合；意见相左时的冲突；关键时刻的背书或反噬', emo: '从公事公办到彼此认可，也可能因立场而生出嫌隙' },
+                    '师徒': { ev: '入门授业；理念分歧；超越与告别', emo: '从敬畏依赖到平等对视，最终各奔前程' },
+                    '父子': { ev: '年少时的疏离；立场分歧的对峙；危难时的和解或诀别', emo: '从不解到理解，血缘与立场反复拉扯' },
+                    '母子': { ev: '儿时庇护；成长中的分歧；危难时的守护与诀别', emo: '从依赖到独立，牵挂始终是彼此的软肋' },
+                    '兄弟': { ev: '少年相伴；利益或立场的分歧；生死关头的抉择', emo: '从形影不离到各有坚持，情义在考验中定型' },
+                    '知己': { ev: '偶然的共鸣；各自的抉择；远别或重逢', emo: '从相谈甚欢到灵魂相认，无需多言的默契' },
+                    '仇敌': { ev: '结仇的起因；反复的报复与反报复；终局的清算', emo: '恨意随岁月累积，最终化作不得不解的死结' },
+                  }
+                  var _seenIP161: Record<string, boolean> = {}
+                  _mappedRels.forEach(function (_r161: any) {
+                    if (!_r161 || typeof _r161 !== 'object') return
+                    var _t161 = String(_r161.type || '').trim()
+                    var _ip161 = String(_r161.impactOnPlot == null ? '' : _r161.impactOnPlot).trim()
+                    if (_ip161.length >= 8) {
+                      if (_seenIP161[_ip161]) { _r161.impactOnPlot = '' } else { _seenIP161[_ip161] = true }
+                    }
+                    if (String(_r161.impactOnPlot || '').trim().length < 8) {
+                      _r161.impactOnPlot = '这段' + (_t161 || '关系') + '贯穿主线：' + String(_r161.from || '双方') + '与' + String(_r161.to || '对方') + '的每一次交锋都把局势推向新的转折，也逼迫主角做出更艰难的取舍。'
+                    }
+                    var _tip161 = _REL_TIP161[_t161]
+                    if (String(_r161.keyEvents == null ? '' : _r161.keyEvents).trim().length < 6) {
+                      _r161.keyEvents = _tip161 ? _tip161.ev : '初识与试探；立场或利益的正面碰撞；危机中的彼此抉择；关系走向新的平衡'
+                    }
+                    if (String(_r161.emotionChange == null ? '' : _r161.emotionChange).trim().length < 6) {
+                      _r161.emotionChange = _tip161 ? _tip161.emo : '从陌生到熟悉，在合作与摩擦中逐步建立信任或嫌隙'
+                    }
+                  })
+                  console.log('[relationships] #161 关系深度字段清洗完成')
+                } catch (_rel161E) { console.warn('[relationships] #161-D 清洗异常:', _rel161E) }
+
                 console.log('[relationships] 生成成功: ' + _mappedRels.length + ' 组关系，关系类型数量: ' + _requiredCount + '，覆盖角色数: ' + _allCharNamesForRel.length)
                 return { relationships: _mappedRels }
               } else {
@@ -32523,10 +33991,20 @@ ${charConfigStr}
               _finalSellingPoints = _finalSellingPoints.concat(_spFill).slice(0, 5)
             }
 
+            // 🔥 2026-09-08 #161-E 修复：此前 longIntro 被硬编码为 fullIntro 的同一份字符串，
+            //   前端「完整简介」与「详细简介」两个编辑框内容一字不差（实测《废土机甲》完全重复）。
+            //   现优先取 LLM 输出的 longIntro，缺失或与 fullIntro 相同时，用卖点+金句扩展成更长的版本。
+            var _synLongIntro161 = String((synResult as any).longIntro || '').trim()
+            if (!_synLongIntro161 || _synLongIntro161 === _synFullIntro) {
+              var _extraParts161: string[] = []
+              if (_finalSellingPoints && _finalSellingPoints.length) _extraParts161.push('本书看点：' + _finalSellingPoints.slice(0, 3).join('；') + '。')
+              if (_coreGoldenSentence) _extraParts161.push('“' + String(_coreGoldenSentence).trim() + '”')
+              _synLongIntro161 = (_synFullIntro + (_extraParts161.length ? _extraParts161.join('') : '')).trim()
+            }
             return {
               shortIntro: _synShortIntro,
               fullIntro: _synFullIntro,
-              longIntro: _synFullIntro,
+              longIntro: _synLongIntro161,
               oneLineIntro: _synShortIntro,
               coreGoldenSentence: _coreGoldenSentence,
               tags: cleanedTags,
@@ -32661,6 +34139,10 @@ ${charConfigStr}
       if (previousData?.bookAnalysis) {
         kpContextParts.push(...buildBookAnalysisContextParts(previousData.bookAnalysis))
       }
+      // 🔥 章节级仿写骨架：仅结构与节奏参考，禁止复制原书专名/事件
+      var _kpBlueprintParts = buildChapterBlueprintParts(previousData)
+      console.log('[imitate] blueprint=' + (_kpBlueprintParts.length > 0 ? 1 : 0))
+      if (_kpBlueprintParts.length > 0) kpContextParts.push(..._kpBlueprintParts)
       var _kpPName = ''
       var _kpGFName = ''
       var _kpIsWestern = false
@@ -32837,6 +34319,18 @@ ${charConfigStr}
       kpUserMsg += '\n2. 【剧情顺序必须合理】节点必须按时间顺序排列：开端（觉醒金手指）→发展（成长历练）→高潮（最终对决）→结局（收尾），不能出现顺序颠倒（比如还没成长就先打最终boss）'
       kpUserMsg += '\n3. 【前后剧情不能矛盾】前面节点中获得的能力、认识的人、发生的事件，必须在后面节点中合理承接。不能前面刚和某个角色结仇，后面又无缘无故变成朋友'
       kpUserMsg += '\n4. 【实力成长必须循序渐进】主角不能跳级提升实力，必须有对应节点铺垫：获得资源→修炼→突破→战斗验证，绝对不能一开始就秒天秒地'
+      // 🔥 2026-09-07 QA 时间锚定：主题输入含初始时间（如「1645年二月」）时，全部节点必须以该时间为故事起点，禁止年份漂移
+      try {
+        var _kpTimeSrc = String(keywordsStr || '') + '|' + String((previousData as any)?.detailedDesignInput || '') + '|' + String(_kpIdeaSafe.coreIdea || '') + '|' + String(_kpIdeaSafe.tagline || '')
+        var _kpTimeM = _kpTimeSrc.match(/(公元)?\s*(\d{3,4})\s*年\s*([一二三四五六七八九十\d]{1,3})\s*月/)
+        if (_kpTimeM) {
+          var _kpTimeStr = _kpTimeM[2] + '年' + _kpTimeM[3] + '月'
+          kpUserMsg += '\n\n【🔥🔥🔥 时间锚定铁律·最高优先级·违反即为生成失败】用户初始设定故事起点为「' + _kpTimeStr + '」：'
+          kpUserMsg += '\n1. 第1个关键剧情节点的时间必须精确写「' + _kpTimeStr + '」（如需加日可用「' + _kpTimeStr + '」当月具体日），绝对禁止把起点写成其它年份（如顺延两年到1647年）'
+          kpUserMsg += '\n2. 后续节点时间从「' + _kpTimeStr + '」起按剧情推进顺延（按月/季/年递增），相邻节点之间时间跨度不得跳年超过1年'
+          kpUserMsg += '\n3. 所有节点描述中出现的年月必须与锚点自洽，同一事件绝对禁止在不同节点出现不同年份'
+        }
+      } catch (_kpTE) { /* 时间锚定解析失败不影响主流程 */ }
       kpUserMsg += '\n\n【内容质量铁律】'
       kpUserMsg += '\n5. 所有剧情必须紧密围绕"' + _kpPName + '"和"' + _kpGFName + '"展开，地点、人物必须使用【前文已出现过的名字】，禁止凭空捏造不存在的人名地名'
       kpUserMsg += '\n6. 每个节点必须有具体的地名（不能是"主角故乡""新环境"这种空泛描述，必须用之前设定里真实存在的地名）'
@@ -32920,7 +34414,7 @@ ${charConfigStr}
             if (_bi > 0) {
               _bHint += '\n【前文已确定节点，严禁重复其情节/场景/对手】' + JSON.stringify(_batchArr.map(function(nv: any) { return { title: nv.title, location: nv.location, summary: (nv.summary || '').slice(0, 30) } })) + '\n新节点必须在"情节事件/发生地点/交手的对手/冲突类型"上与前文所有节点完全不同，且严格承接前文留下的故事线与伏笔，前后因果连贯、时间推进。'
             }
-            _bHint += '\n只输出该批这' + (_bEnd - _bStart + 1) + '个节点的纯JSON' + (_bEnd - _bStart + 1 === 1 ? '对象' : '数组') + '（本次为单个节点，严禁输出数组/列表/多余文字），格式：' + (_bEnd - _bStart + 1 === 1 ? '{"title":"2-6字","chapterRange":"第X章","location":"必须为前文真实地名","mainCharacters":["前文已有角色名"],"summary":"40-120字因果完整","impact":"15-60字直接后果与伏笔","shuangDian":"10-40字具体爽点","volume":1-5,"importance":"high|medium|low","shuangPoints":[""]}' : '[{"title":"2-6字","chapterRange":"第X章","location":"必须为前文真实地名","mainCharacters":["前文已有角色名"],"summary":"40-120字因果完整","impact":"15-60字直接后果与伏笔","shuangDian":"10-40字具体爽点","volume":1-5,"importance":"high|medium|low","shuangPoints":[""]}]') + '。不要输出JSON对象以外的任何文字。'
+            _bHint += '\n只输出该批这' + (_bEnd - _bStart + 1) + '个节点的纯JSON' + (_bEnd - _bStart + 1 === 1 ? '对象' : '数组') + '（本次为单个节点，严禁输出数组/列表/多余文字），格式：' + (_bEnd - _bStart + 1 === 1 ? '{"title":"2-6字","chapterRange":"第X章","location":"必须为前文真实地名","mainCharacters":["前文已有角色名"],"summary":"40-120字因果完整","impact":"15-60字直接后果与伏笔","shuangDian":"10-40字具体爽点","volume":1-' + _kpVolN + ',"importance":"high|medium|low","shuangPoints":[""]}' : '[{"title":"2-6字","chapterRange":"第X章","location":"必须为前文真实地名","mainCharacters":["前文已有角色名"],"summary":"40-120字因果完整","impact":"15-60字直接后果与伏笔","shuangDian":"10-40字具体爽点","volume":1-' + _kpVolN + ',"importance":"high|medium|low","shuangPoints":[""]}]') + '。不要输出JSON对象以外的任何文字。'
             var _bMessages: LLMMessage[] = [
               { role: 'system', content: kpMessages && kpMessages[0] ? String(kpMessages[0].content) : (kpPrompt + stylePrompt) },
               { role: 'user', content: _kpBatchBase + _bHint }
@@ -33017,6 +34511,36 @@ ${charConfigStr}
                 }
               }
               console.log('[keyPlots] 生成成功: ' + kpArr.length + ' 个节点')
+              // 🔥 2026-09-07 QA 关键剧情节点去重：跨卷重复（实测「桂林守城战」×2 完全同文、「滇黔危机」×2 高相似）
+              //   标题相同 或 摘要 4-gram 相似 >0.5 即剔除后位节点（保留 ≥8 个才生效，防误删致节点不足）
+              try {
+                var _kpSim = function (a: string, b: string) {
+                  if (!a || !b) return 0
+                  var _minL = Math.min(a.length, b.length)
+                  if (_minL === 0) return 0
+                  var _cm2 = 0
+                  for (var _si3 = 0; _si3 < a.length - 3; _si3++) { if (b.indexOf(a.substring(_si3, _si3 + 4)) !== -1) _cm2 += 4 }
+                  return _cm2 / _minL
+                }
+                var _kpKept: any[] = []
+                var _kpKeptTitles: string[] = []
+                var _kpKeptSums: string[] = []
+                for (var _kdi = 0; _kdi < kpArr.length; _kdi++) {
+                  var _kdn = kpArr[_kdi]
+                  var _kt2 = String(_kdn.title || '').trim()
+                  var _ks2 = String(_kdn.summary || '').trim()
+                  var _dup2 = false
+                  for (var _kdj = 0; _kdj < _kpKept.length; _kdj++) {
+                    if ((_kt2 && _kt2 === _kpKeptTitles[_kdj]) || _kpSim(_ks2, _kpKeptSums[_kdj]) > 0.5) { _dup2 = true; break }
+                  }
+                  if (_dup2) { console.log('[keyPlots] 去重剔除重复节点: ' + _kt2); continue }
+                  _kpKept.push(_kdn); _kpKeptTitles.push(_kt2); _kpKeptSums.push(_ks2)
+                }
+                if (_kpKept.length >= 8) {
+                  if (_kpKept.length < kpArr.length) console.log('[keyPlots] 节点去重: ' + kpArr.length + ' → ' + _kpKept.length)
+                  kpArr = _kpKept
+                }
+              } catch (_kpDedupE) { /* 去重失败不影响主流程 */ }
               // 🔥 关键修复：从keyPlots中提取前端需要的字段，并补全空字段
               var _coreConflict = ''
               var _climax = ''
@@ -33109,6 +34633,59 @@ ${charConfigStr}
               })
 
               var _volNums = Object.keys(_volMap).sort(function(a, b) { return Number(a) - Number(b) })
+
+              // 🔥🔥🔥 2026-09-06 修复（#130）：分卷剧情结构必须由「已生成的关键剧情节点」驱动设计，
+              //   而不是本地硬编码模板拼装。历史实现中卷名/核心目标/开篇/高潮/钩子/摘要全部来自
+              //   makeVolumeName / makeVolumeObjective / makeVolumeHook 这三套模板，导致：
+              //     ① 卷数由 prompt 里写死的 "volume":1-5 暗示值决定（用户报的"卷数硬编码"）
+              //     ② 卷摘要是模板拼接的产品，与"分卷剧情结构"设计稿对不上
+              //   这里按 keyPlots 实际归属，让 LLM 一次性设计全部分卷剧情结构并回填。
+              var _llmVolDesign: { [key: number]: any } = {}
+              try {
+                var _vdBrief = _volNums.map(function (vn: string) {
+                  var _nodes = (_volMap[Number(vn)]._nodes || []).map(function (n: any) {
+                    return {
+                      title: n.title,
+                      location: n.location,
+                      chapterRange: n.chapterRange,
+                      summary: String(n.summary || '').slice(0, 90),
+                      shuangDian: n.shuangDian,
+                      impact: String(n.impact || '').slice(0, 60)
+                    }
+                  })
+                  return { volume: Number(vn), keyPlots: _nodes }
+                })
+                var _vdSys = '你是网文平台金牌编辑，擅长长篇爽文的分卷结构设计。只输出纯JSON，不要任何解释文字。'
+                var _vdUser = '本作：主角「' + _kpPName + '」，金手指「' + _kpGFName + '」，题材：' + String(genre || '') + ' ' + String(keywordsStr || '') + '。\n' +
+                  '下面已生成全部关键剧情节点，并已按剧情发展阶段归到各卷（共' + _volNums.length + '卷）。\n' +
+                  JSON.stringify(_vdBrief) + '\n\n' +
+                  '请为【每一卷】设计分卷剧情结构，严格依据上面给出的该卷真实节点内容推导，要求：\n' +
+                  '1. name：卷名，8字以内，必须提炼自本卷节点的真实内容（严禁"初入江湖""崭露头角"之类通用模板），各卷不得重复\n' +
+                  '2. coreObjective：本卷核心目标，60-150字，写出主角在本卷要达成的具体战略目的（不是"变强/打败敌人"这种空话）\n' +
+                  '3. openingNode：本卷开篇节点，40-100字，承接上卷悬念的具体新局（新战场／新朝局／新敌手）\n' +
+                  '4. climaxNode：本卷高潮节点，40-100字，本卷最具体的战略／权谋／战役高潮\n' +
+                  '5. endHook：本卷末钩子，30-80字，留下具体悬念（兵败／内变／强敌压境／身份将揭），与其他卷不同\n' +
+                  '6. summary：卷摘要，100-220字，必须按【本卷关键节点】整合去重：开篇→推进→高潮→钩子四段连贯成文，' +
+                  '   逐条体现上面该卷节点的具体剧情（人物、地点、事件），严禁套用"主角在本卷围绕…展开"之类空话，各卷摘要之间不得雷同\n' +
+                  '7. 严禁出现与本题材无关的其他题材词汇（如修仙／异能／魔法／系统等），必须与' + String(genre || '本作题材') + '完全一致\n\n' +
+                  '输出纯JSON：{"volumes":[{"volume":1,"name":"","coreObjective":"","openingNode":"","climaxNode":"","endHook":"","summary":""}]}'
+                var _vdResp = await callLLMWithFallback(llmConfig, [
+                  { role: 'system', content: _vdSys },
+                  { role: 'user', content: _vdUser }
+                ], undefined, { temperature: 0.6, maxTokens: 4000, timeoutMs: 300000 })
+                var _vdText = String((_vdResp && _vdResp.content) || '')
+                var _vdParsed = parseJSON(_vdText)
+                var _vdList = Array.isArray(_vdParsed) ? _vdParsed : (Array.isArray(_vdParsed && _vdParsed.volumes) ? _vdParsed.volumes : [])
+                _vdList.forEach(function (vd: any) {
+                  var _vno = Number(vd && vd.volume)
+                  if (_vno > 0 && vd && (vd.name || vd.summary)) _llmVolDesign[_vno] = vd
+                })
+                if (Object.keys(_llmVolDesign).length > 0) {
+                  console.log('[keyPlots] LLM 分卷剧情结构设计成功，覆盖 ' + Object.keys(_llmVolDesign).length + '/' + _volNums.length + ' 卷')
+                }
+              } catch (_vde) {
+                console.warn('[keyPlots] LLM 分卷剧情结构设计失败，回退模板：' + String(_vde))
+              }
 
               // 🔥 动态生成卷名工具函数：根据关键剧情节点生成4字+4字双段式标题，必须使用逗号分隔
               var makeVolumeName = function(nodes: any[], volIdx: number, isWestern: boolean, usedSecondParts?: string[]): string {
@@ -33759,6 +35336,31 @@ ${charConfigStr}
                 _vol.climaxNode.event = cleanCliches(ensureCompleteSentence(String(_vol.climaxNode?.event || climaxSummary), 120))
                 _vol.endHook.content = cleanCliches(ensureCompleteSentence(String(_vol.endHook?.content || _themeHook), 100))
 
+                // 🔥 2026-09-06 修复（#130）：用上面 LLM 设计的「分卷剧情结构」覆盖模板产物。
+                //   只要 LLM 设计成功，卷名/核心目标/开篇/高潮/钩子/摘要一律以设计稿为准，
+                //   模板值仅作兜底。这样卷摘要就是"按分卷剧情结构去重显示"，而非模板空话。
+                var _lvd = _llmVolDesign[_volNumVal]
+                if (_lvd) {
+                  if (_lvd.name && String(_lvd.name).trim()) {
+                    _vol.name = '第' + _vn + '卷·' + String(_lvd.name).trim().replace(/^第[一二三四五六七八九十百千\d]+卷[·:：\s]*/, '')
+                  }
+                  if (_lvd.coreObjective && String(_lvd.coreObjective).trim().length >= 20) {
+                    _vol.coreObjective = cleanCliches(String(_lvd.coreObjective).trim())
+                  }
+                  if (_lvd.openingNode && String(_lvd.openingNode).trim().length >= 15) {
+                    _vol.openingNode.event = cleanCliches(String(_lvd.openingNode).trim())
+                  }
+                  if (_lvd.climaxNode && String(_lvd.climaxNode).trim().length >= 15) {
+                    _vol.climaxNode.event = cleanCliches(String(_lvd.climaxNode).trim())
+                  }
+                  if (_lvd.endHook && String(_lvd.endHook).trim().length >= 10) {
+                    _vol.endHook.content = cleanCliches(String(_lvd.endHook).trim())
+                  }
+                  if (_lvd.summary && String(_lvd.summary).trim().length >= 40) {
+                    _vol.summary = cleanCliches(String(_lvd.summary).trim())
+                  }
+                }
+
                 // 🔥 卷名跨卷去重：确保每卷标题唯一，不与前面的卷重复
                 if (_volumes.length > 0 && _vol.name) {
                   var _seenVolNames = new Set(_volumes.map(function(v) {
@@ -33846,6 +35448,31 @@ ${charConfigStr}
 
       // 从 previousData 中提取章节上下文
       var _contentPrev = previousData as any
+      // 🔥 2026-10-19：previousData.characters 为空时，从服务端 settings.json 兜底读取该书的完整设定
+      //   （写页 AI生成 面板不传全量设定；人物档案/称谓/阵营红线的根基是这份人物卡，绝不能是空的）
+      var _novelSettingId = String((input as any)?.engineNovelKey || (_contentPrev as any)?.engineNovelKey || (_contentPrev as any)?.novelId || '').trim()
+      if (_novelSettingId && !(_contentPrev?.characters?.protagonist?.name)) {
+        try {
+          const _sf = join(LOCAL_DATA_DIR, 'settings.json')
+          if (existsSync(_sf)) {
+            const _nd = (JSON.parse(readFileSync(_sf, 'utf-8')) as any)[_novelSettingId]
+            if (_nd && typeof _nd === 'object') {
+              _contentPrev = {
+                ..._contentPrev,
+                idea: (Object.keys(_contentPrev?.idea || {}).length ? _contentPrev.idea : _nd.idea) || {},
+                synopsis: (Object.keys(_contentPrev?.synopsis || {}).length ? _contentPrev.synopsis : _nd.synopsis) || {},
+                worldbuilding: (Object.keys(_contentPrev?.worldbuilding || {}).length ? _contentPrev.worldbuilding : _nd.worldbuilding) || {},
+                powerSystem: (Object.keys(_contentPrev?.powerSystem || {}).length ? _contentPrev.powerSystem : _nd.powerSystem) || {},
+                characters: _nd.characters || {},
+                outline: _contentPrev?.outline || _nd.outline || '',
+                keyPlots: (Object.keys(_contentPrev?.keyPlots || {}).length ? _contentPrev.keyPlots : _nd.keyPlots) || {},
+                chapters: _contentPrev?.chapters || _nd.chapters || {},
+              }
+              console.log('[content] previousData.characters 为空 → 已从 settings.json 兜底加载《' + ((_nd.idea || {}).title || _novelSettingId) + '》完整人物/设定')
+            }
+          }
+        } catch (_e) { console.warn('[content] settings.json 兜底读取失败:', _e instanceof Error ? _e.message : _e) }
+      }
       var _chapterNumber = _contentPrev?.chapterNumber || 1
       var _chapterTitle = _contentPrev?.chapterTitle || (input as any)?.title || ''
       var _corePlot = _contentPrev?.corePlot || (input as any)?.summary || ''
@@ -33935,6 +35562,21 @@ ${charConfigStr}
             _contentContextParts.push(_flInfoStr)
           }
         }
+        // 🔥 #226M：女主名单(femaleLeads 数组)此前未注入正文上下文，导致「女主2/后宫」类角色（如戴贵人）只能靠 supporting 前3兜底，
+        //   且其「与主角关系」信号缺失 → LLM 据纯军事 identity 写成君臣/将佐语气。现显式注入每位女主（含关系），确保正文语气贴合人设。
+        if (_cChars.femaleLeads && Array.isArray(_cChars.femaleLeads)) {
+          for (var _fli = 0; _fli < _cChars.femaleLeads.length; _fli++) {
+            var _flx = _cChars.femaleLeads[_fli]
+            if (_flx && _flx.name) {
+              var _flxStr = '【女主' + (_fli + 1) + '】' + _flx.name
+              if (_flx.identity) _flxStr += '（' + _flx.identity + '）'
+              if (_flx.personality) _flxStr += '，性格：' + _flx.personality
+              if (_flx.relationToProtagonist) _flxStr += '，与主角关系：' + _flx.relationToProtagonist
+              if (_flx.goal) _flxStr += '，目标：' + _flx.goal
+              _contentContextParts.push(_flxStr)
+            }
+          }
+        }
       }
       if (_contentPrev?.synopsis) {
         var _cSyn = _contentPrev.synopsis as any
@@ -33967,6 +35609,118 @@ ${charConfigStr}
       // 🔥 历史题材：关键历史人物定位铁律（杜绝把真实忠臣名将写成反派/小丑）
       if (_contentPrev?.historicalCharacterLaw) {
         _chapterContext += '\n【🔥历史人物定位铁律·绝对不可违背】\n' + _contentPrev.historicalCharacterLaw + '\n'
+      }
+
+      // 🔥🔥🔥 2026-10-18 逐章精写引擎（多阶段流水线）：
+      //   节拍表 → 分场景写作 → 装配 → 质检（字数/爽点/套话/复读/跨章重复/AI率）→ 定点修复
+      //   质量由工程闸门保证（与具体大模型无关）；任何异常/产出不足都回退下方旧单次生成流程。
+      //   关闭方式：请求体 engineMode:'legacy' 或环境变量 CONTENT_ENGINE=legacy
+      try {
+        var _engModeRaw = String((input as any)?.engineMode || (_contentPrev as any)?.engineMode || '')
+        if (isChapterEngineEnabled(_engModeRaw)) {
+          var _engIdea = ((_contentPrev as any)?.idea || {}) as any
+          var _engChars = ((_contentPrev as any)?.characters || {}) as any
+          var _engCast: string[] = []
+          var _pushEngCast = function (n: any) { var _s = String(n || '').trim(); if (_s && _engCast.indexOf(_s) < 0 && _engCast.length < 24) _engCast.push(_s) }
+          _pushEngCast(_engChars?.protagonist?.name)
+          _pushEngCast(_engIdea?.protagonistName)
+          if (Array.isArray(_engChars?.femaleLeads)) _engChars.femaleLeads.forEach(function (c: any) { _pushEngCast(c?.name) })
+          _pushEngCast(_engChars?.femaleLead?.name)
+          if (Array.isArray(_engChars?.antagonists)) _engChars.antagonists.forEach(function (c: any) { _pushEngCast(c?.name) })
+          _pushEngCast(_engChars?.antagonist?.name)
+          if (Array.isArray(_engChars?.supporting)) _engChars.supporting.forEach(function (c: any) { _pushEngCast(c?.name) })
+          // 🔥 2026-10-19：人物档案（一行一人）→ 注入节拍表/正文提示词，杜绝人物关系乱贴（吴三桂被拉进肇庆大殿这类）
+          var _engCastBrief: string[] = []
+          var _engSeenNames: Record<string, boolean> = {}
+          var _pushCharBrief = function (c: any) {
+            if (!c || !c.name) return
+            var nm = String(c.name).trim()
+            if (!nm || _engSeenNames[nm] || _engCastBrief.length >= 24) return
+            _engSeenNames[nm] = true
+            var line = nm + '｜阵营：' + String(c.camp || '—') + '｜身份：' + String(c.job || c.title || '') + '｜' + String(c.identity || '').slice(0, 110)
+            if (c.relationToProtagonist) line += '｜与主角关系：' + String(c.relationToProtagonist).slice(0, 40)
+            var _tl = String(c.identity || c.background || '').match(/时序铁律[^。]{0,100}。?/)
+            if (_tl) line += '｜⚠️' + _tl[0].slice(0, 70)
+            _engCastBrief.push(line)
+          }
+          _pushCharBrief(_engChars?.protagonist)
+          _pushCharBrief(_engChars?.femaleLead)
+          if (Array.isArray(_engChars?.femaleLeads)) _engChars.femaleLeads.forEach(function (c: any) { _pushCharBrief(c) })
+          if (Array.isArray(_engChars?.antagonists)) _engChars.antagonists.forEach(function (c: any) { _pushCharBrief(c) })
+          _pushCharBrief(_engChars?.antagonist)
+          if (Array.isArray(_engChars?.supporting)) _engChars.supporting.forEach(function (c: any) { _pushCharBrief(c) })
+          console.log('[chapter-engine] 人物档案 ' + _engCastBrief.length + ' 条注入提示词')
+          var _engTargetWords = (typeof targetWordCount === 'number' && targetWordCount >= 800 && targetWordCount <= 8000)
+            ? Math.min(8000, Math.max(800, Math.round(targetWordCount)))
+            : DEFAULT_WORD_BAND.target
+          // 🔥 2026-10-18：作者在「个人设置→平台AI检测配置」启用的平台标准，随请求体上传，注入引擎提示词+闸门
+          var _platformStandards = Array.isArray(platformStandards)
+            ? (platformStandards as Array<any>)
+                .filter(function (s: any) { return s && typeof s === 'object' })
+                .slice(0, 8)
+                .map(function (s: any) {
+                  return {
+                    name: (typeof s.name === 'string' && s.name.trim()) || '',
+                    aiStandard: (typeof s.aiStandard === 'string' && s.aiStandard.trim()) || '',
+                    criteria: Array.isArray(s.criteria) ? s.criteria.filter(function (c: any) { return typeof c === 'string' }).slice(0, 6) : [],
+                  }
+                })
+            : []
+          var _engKeyHint = String((input as any)?.engineNovelKey || (_contentPrev as any)?.engineNovelKey || '')
+          // 🔥 2026-10-19：人工剧情施工蓝图（previousData.blueprint）——有则按蓝图执行，剧情可控
+          var _engBlueprint: any = undefined
+          try {
+            var _bpRaw = (_contentPrev as any)?.blueprint
+            if (typeof _bpRaw === 'string') _bpRaw = JSON.parse(_bpRaw)
+            if (_bpRaw && Array.isArray(_bpRaw.beats) && _bpRaw.beats.length >= 2) _engBlueprint = _bpRaw
+          } catch (_e) { console.warn('[chapter-engine] 蓝图解析失败，忽略：', _e instanceof Error ? _e.message : _e) }
+          console.log('[chapter-engine] 启用精写引擎 · 第' + _chapterNumber + '章 · 目标' + _engTargetWords + '汉字 · 出场人物' + _engCast.length + '人')
+          var _engOut = await runChapterEngineWithReport({
+            llmConfig: llmConfig,
+            userId: (routing && routing.userId) || null,
+            routing: routing || undefined,
+            novelKey: _engKeyHint,
+            novelTitle: String(_engIdea?.title || ''),
+            genre: String(genre || ''),
+            chapterNumber: Number(_chapterNumber) || 1,
+            chapterTitle: String(_chapterTitle || ''),
+            corePlot: String(_corePlot || ''),
+            shuangPoints: String(_shuangPoints || ''),
+            prevEnding: /新章开始|（无）|\(无\)/.test(String(_prevEnding || '')) ? '' : String(_prevEnding || ''),
+            prevChaptersSummary: /暂无|（无）|\(无\)/.test(String(_prevChaptersSummary || '')) ? '' : String(_prevChaptersSummary || ''),
+            // 🔥 2026-10-22 跨章重复黑名单：前文公式化句式 + 上一章全文
+            prevPhrases: Array.isArray((_contentPrev as any)?.prevPhrases) ? ((_contentPrev as any).prevPhrases as any[]).map((x: any) => String(x || '')).filter(Boolean).slice(0, 30) : [],
+            prevFullText: String((_contentPrev as any)?.prevFullText || '').slice(0, 4000),
+            contextParts: _contentContextParts,
+            targetWords: _engTargetWords,
+            style: String((typeof style === 'string' && style.trim()) ? style.trim() : ''),
+            newCharacters: String((typeof newCharacters === 'string' && newCharacters.trim()) ? newCharacters.trim() : ''),
+            protagonistName: String(_engChars?.protagonist?.name || _engIdea?.protagonistName || ''),
+            castNames: _engCast,
+            castBrief: _engCastBrief,
+            blueprint: _engBlueprint,
+            platformStandards: _platformStandards,
+            onProgress: function (stage: string, detail?: string) { console.log('[chapter-engine][progress] ' + stage + (detail ? ' · ' + detail : '')) },
+          })
+          // 🔥 2026-10-31：引擎产出必须先过「番茄官方出口闸门」才允许返回。
+          //   旧口径只看「≥1500 汉字」就放行 → 引擎自认合格、官方判不合格（双口径矛盾）。
+          //   现统一用 platinum-gate（已对齐番茄官方：字数2000-3000 / 单段≤60 / 对话≥25%）。
+          if (_engOut && _engOut.content && countZhChars(_engOut.content) >= 1500) {
+            var _engGateIssues: string[] = []
+            try {
+              var _engPg = evaluateChapterStd(_engOut.content)
+              if (!_engPg.passed) _engGateIssues = _engPg.issues
+            } catch (_engGateErr) { console.warn('[content] 引擎出口闸门异常(忽略):', _engGateErr) }
+            if (_engGateIssues.length === 0) {
+              console.log('[chapter-engine] ✅ 引擎产出可用 · 汉字=' + countZhChars(_engOut.content) + ' · 阶段=' + _engOut.report.stage + ' · 调用=' + _engOut.report.llmCalls + ' · 场景=' + _engOut.report.scenes)
+              return _engOut.content
+            }
+            console.warn('[chapter-engine] 引擎产出未过番茄官方出口闸门（' + _engGateIssues.slice(0, 4).join('；') + '），转入旧流程重生成')
+          }
+          console.warn('[chapter-engine] 引擎产出不足或未过官方闸门（汉字=' + countZhChars(((_engOut && _engOut.content) || '')) + '），回退旧单次生成流程')
+        }
+      } catch (_engErr: any) {
+        console.warn('[chapter-engine] 引擎异常，回退旧单次生成流程:', (_engErr && _engErr.message) ? _engErr.message : _engErr)
       }
 
       var { systemPrompt: _contentPrompt, temperature: _contentTemp, maxTokens: _contentMaxTokens } = buildSystemPrompt('content', {
@@ -34024,7 +35778,12 @@ ${charConfigStr}
 9. 🚫 禁止把「魂穿/穿越/附身后的处境」整段包装成剧情说明；必须通过人物动作/对话/处境直接展示。
 10. 🚫 禁止在结尾写出下一章标题或用「便是XXX·XXX的局」直接点题收尾；必须停在具体动作或一句话的硬钩子上。
 11. 🚫 绝对禁止输出任何带【】的段落标签、系统提示、字数检查、核心爽点、下一章预告、剧情获得新突破、金手指落地等元叙事/脚手架标记。只输出小说正文叙事文本。
-12. 🚫 禁止出现与【本作前序世界观】矛盾的中古/武侠/仙侠器物与意象：古籍/残卷/竹简/羊皮卷、蜡烛/油灯/火把/灯笼、马蹄/战马/骑兵/银甲骑兵、长枪/大刀/长剑/弓箭/刀剑/剑气/刀芒、宗门/门派/掌门/长老/内力/灵气/真气/吐纳练气、青袍老者/黑袍魔道等古风装束。科幻星际题材战斗用「念力/能量护盾/拳锋掌力/粒子束」表现，绝不用古龙武侠笔法；历史题材禁止机甲星舰；一切描写必须100%贴合本作worldbuilding。
+12. 🚫 器物与意象必须 100% 贴合【本作前序世界观】（按题材分派，严禁跨题材串味）：
+   - 【历史/古代/架空历史题材】🔴 白名单优先：马匹/战马/骑兵/长枪/大刀/长剑/弓箭/刀剑、火铳/红衣大炮/火药、舆图/军报/公文/名册/官印/路引、驿路/城门/官道、印绶/朝服/纱帽/竹棍、皮甲/棉甲/铁甲、马蹄声/甲叶响/梆子声、灯笼/油灯/火把（按时代选择）——这些都是**本作必需元素**，严禁以"仙侠味"为由删除或替换；🔴 但严禁出现后世科技（电磁/纳米/芯片/机器人/激光/程序/电脑/信号）、严禁出现仙侠体系词（宗门/掌门/长老/内力/灵气/真气/剑气/丹田/筑基）、严禁出现现代都市词（团队/信息/数据/方案/流程/加班/电话/汽车/咖啡/公司/心理/状态/复盘）、严禁出现现代军事词（战术背心/集装箱/冷链/无人机/制高点/狙击）、严禁出现现代娱乐/网文黑话（打卡/副本/团灭/输出/虐菜）。
+   - 【都市/现代/职场/校园/商战题材】🔴 严禁出现：宗门/掌门/长老/内力/灵气/真气/剑气/丹田/筑基/飞升、修仙丹药与法宝、马蹄/战马/骑兵/长枪/大刀、古典官署与圣旨、任何文言公文。
+   - 【玄幻/仙侠/修真/武侠题材】🔴 严禁出现：现代科技（电磁/纳米/芯片/机器人/激光/程序/电脑）、现代都市生活词（便利店/写字楼/快递/咖啡/地铁/球鞋/校服）、历史朝代专名（朝廷/内阁/督抚/圣旨/状元）、科幻设定（机甲/星舰/虫族/维度）。
+   - 【科幻/星际/末世题材】🔴 战斗一律用「念力/能量护盾/拳锋掌力/粒子束/电磁干扰」表现，绝不用古龙武侠笔法；严禁仙侠词与历史官制。
+   - 一切描写必须 100% 贴合本作 worldbuilding 与本章摘要；任何跨题材元素出现即废稿。
 13. 🚫 禁止公式化群演描写模板：如"有人兴奋有人担忧有人期待""有人惊呼有人愤怒有人冷眼旁观"等"有人X有人Y有人Z"三连排比套路；群演反应要具体、有差异、不统一（如有人吓得连连后退/有人死死盯着场中默不作声/有人低声咒骂），且每章同类群演描写至多出现1次。
 14. 🚫 绝对禁止中英混杂：正文必须是纯中文叙事，严禁插入任何英文单词、英文句子或中英夹杂的括号注释（例如 "replaced by a surge of hope" 这类英文片段）。若出现外文专有名词，必须翻译成中文叙述；正文叙述中不得出现成句的英文（个别已通行缩写如 APP/VIP 在都市题材可偶现，但不得成句）。一旦出现英文句子片段即视为废稿。
 15. 🚫 严格贴合本作题材与世界观，禁止擅自引入与题材冲突的超自然/科幻/悬疑设定：都市/历史等现实题材尤其禁止凭空加入平行世界、时空裂缝、神秘符号、古老守护者、异世界等脱离现实的设定（本作既有的"重生/穿越"时空设定除外，但不得由此衍生出平行世界、符号守护者等脱离现实的逻辑）。所有情节必须落在已给定的 corePlot/世界观之内，禁止自由放飞科幻悬疑线。
@@ -34057,6 +35816,13 @@ ${charConfigStr}
 6. 战力逻辑严格遵循本作前序力量体系设定的核心克制逻辑，越级必有合理支撑；
 7. 文风基于本作前序文风定位（writingStyle字段），节奏紧凑、全程高能、开局即入戏、结尾留钩子；
 8. 完全贴合本作前序世界观，保证全书剧情连贯、逻辑闭环。
+【🔥🔥🔥 角色关系对话语气铁律·最高优先级·必须100%命中】
+- 人物对话语气必须严格贴合其与主角的关系本质，绝对禁止错位：
+  · 帝皇/男主 与 宠妃/贵妃/妻妾/红颜知己/恋人/挚爱：须用私密、温存、亲昵、体贴的语气（可昵称、可低语耳语、可撒娇嗔怪、可情动），如同内廷独处、榻前私语；绝不可用君臣奏对、将佐禀报、部下请命的公务/恭敬/疏离语气，也不可写成上下级汇报腔。
+  · 君臣/帝将 与 臣下/将领/谋士：方可用恭敬、公务、禀报语气。
+- 凡角色身份兼具「后妃/宠妃/内廷」与「武将/统领」双重属性时（如女兵营统领入侍后宫）：与主角独处及内廷场景一律以妃嫔之礼、柔情温婉为先；军务/恭敬语气仅限公开朝堂、校场、战场等公务场景，绝不许在私密相处时以将佐口吻与主角对话。
+- 具体判定以本作前序人物设定中该角色的「与主角关系」字段为准：凡该字段含 宠妃/贵妃/妻妾/红颜/恋人/挚爱/亲密 等字样，一律按亲密私密语气书写；含 臣/将/下属/谋士/盟友 等字样，方用公务恭敬语气。
+
 七、【🔥🔥🔥 避坑检查终检同步执行要求·本系统白金爆款标准·100% 命中才能输出】
 本强制规则 = 终检（final-check）模块的全部通关标准。你的输出必须从源头就满足终检所有指标，不允许等后端校准：
 7.1 AI检测率通关要求：
@@ -34126,7 +35892,7 @@ ${charConfigStr}
     - 对话说人话（每人口头禅语气词冷艳"呵可笑"萝莉"哇嘿嘿"腹黑"哦有意思；对话带嘲讽惊讶愤怒调侃害羞；动作代替"说"冷笑挑眉咬牙切齿；少加标签上下文能看出是谁；每段对话必须推进剧情传新信息造冲突）
 8.7 去AI味+合规类：
     - 去AI味打磨（赫然/陡然/猛地/不禁/心中一凛/竟然/居然/定睛/倒吸凉气全删或替换；打破工整；加口语不完美方言；加感官细节；长句短句超短句穿插；模板结尾全换具体悬念；主角思考用词习惯与其他人不同）
-    - 多平台适配（番茄2000字/章短段300字小刺激强钩子；起点3000字/章重设定重逻辑可5章铺垫；飞卢800字/章脑洞爆炸同人文结尾必爽；晋江感情第一精准标签慢热细腻；七猫广告位前必强钩子大众口味；通用红线政治色情暴力宗教毒品赌博敏感历史仇恨歧视8大雷区全不碰）
+    - 多平台适配（番茄2000字/章短段300字小刺激强钩子；起点2000-2400字/章重设定重逻辑；飞卢800字/章脑洞爆炸同人文结尾必爽；晋江感情第一精准标签慢热细腻；七猫广告位前必强钩子大众口味；通用红线政治色情暴力宗教毒品赌博敏感历史仇恨歧视8大雷区全不碰）
     - 内容合规零风险（领导人姓名/国旗国徽国歌绝对不出现；性描写暗示性描写全删或侧面；虐杀分尸酷刑细节一笔带过模糊处理；真实宗教传教封建迷信写架空不映射现实；毒品名称过程吸毒描写零；赌博过程技巧不正面宣传；中日战争文革六四等绝对回避；民族仇恨地域歧视性别对立零）
 8.8 包装+世界观类：
     - 标题简介点击密码（标题15-30字含标签废柴重生+能力系统签到百倍+冲突开局退婚全城笑+转折却没想到竟然居然+数字九世三千年百倍十连+情绪词震惊绝望无敌疯狂；简介三段150-300字身份困境→金手指百倍返还→最终目标悬念）
@@ -34276,7 +36042,7 @@ ${charConfigStr}
 • 本章伏笔方向：${_pcWx.foreshadowing || ''}
 • 本章结尾钩子：${_pcWx.endHook || ''}
 • 本章登场角色（只能出现这些人，禁止乱加无关角色）：${Array.isArray(_pcWx.characters) ? _pcWx.characters.join('、') : ''}
-• 本章目标字数：${_pcWx.targetWordCount?.min || 2000}-${_pcWx.targetWordCount?.max || 2500}字，理想字数约${_pcWx.targetWordCount?.ideal || 2200}字
+• 本章目标字数：${_pcWx.targetWordCount?.min || 2500}-${_pcWx.targetWordCount?.max || 4000}字，理想字数约${_pcWx.targetWordCount?.ideal || 3000}字
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 【第一段·冲突切入（30%，约${_pcConflict.wordCountTarget || 700}字）·必须严格按照以下场景写】
@@ -34358,11 +36124,59 @@ ${_pcQuality.requiredHookAtEnd ? '• 结尾必须有硬钩子·不能平淡收�
         console.log('[content] ✅ 通用逐章剧情卡已注入（连续性铁律+四段式+已设定人物）')
       }
 
+      // 🔥🔥🔥 逐章生成正文·右上角控制面板（字数 / 风格 / 新角色）注入提示词
+      //    由前端向导 step:'content' 请求体传入（经 generateWithLLM 形参 targetWordCount / style / newCharacters）。
+      // 🔥 2026-10-25 反修复（T2 / G-01·G-02）：字数口径改为【单一来源 + 双侧带】——
+      //    来源＝用户设定（默认 2000，夹取到 [800,8000]），区间＝目标 ±10%（默认即 1800-2200）；
+      //    出带属「建议看」项，不自动补写、不自动删减，也不再用"不合格废稿"字面施压（oh-story 口径）。
+      var _userTargetWords = (typeof targetWordCount === 'number' && targetWordCount >= 800 && targetWordCount <= 8000)
+        ? Math.min(8000, Math.max(800, Math.round(targetWordCount)))
+        : DEFAULT_WORD_BAND.target
+      var _wBand = resolveWordBand(_userTargetWords)
+      var _ctMin = _wBand.min
+      var _ctMax = _wBand.max
+      // 🔥 2026-10-26 T9：字数口径统一为「去空白（含标点）字符数」（与 UI 滑块、平台统计、契约 Verify 一致）
+      var _ctRule = '字数落在 ' + _ctMin + '-' + _ctMax + ' 字区间（口径：去空白（含标点）字符数，本章目标 ' + _wBand.target + ' 字）'
+      var _userStyle = (typeof style === 'string' && style.trim()) ? style.trim() : ''
+      var _userNewChars = (typeof newCharacters === 'string' && newCharacters.trim()) ? newCharacters.trim() : ''
+
+      var _genConfigLines: string[] = []
+      _genConfigLines.push('【🔥🔥🔥 本章用户自定义生成要求·最高优先级·必须100%严格落实】')
+      _genConfigLines.push('• 本章目标字数：约 ' + _wBand.target + ' 字，合理区间 ' + _ctMin + '-' + _ctMax + ' 字（口径：去空白（含标点）字符数，全系统唯一口径；本处为唯一来源，' + (_wBand.source === 'user' ? '来自用户设定' : '系统默认') + '，严禁改用其它数字或旧平台口径）。字数出带属「建议看」项：不得为凑字数注水，也不得提前收尾；每300字左右一个小转折/冲突点，每600字内必须有一次爽点或强刺激。')
+      _genConfigLines.push('• 【开篇即入戏】首段前 3 行必须直接切入本章核心冲突/悬念/对话/紧迫决断；严禁用天气、景物、器物、身世铺陈开篇；环境五感全章只点染一两处且必须绑定人物当下处境。')
+      // 🔥 2026-10-26 T6（G-13）：把【全部 open 伏笔/承诺】注入本章（旧实现只看最近 3 章、上限 6 条，
+      //   导致早期埋的长线伏笔永沉）。含 staleOpen 统计：窗口外（距今 >3 章）的长线伏笔也在注入范围内。
+      var _threadKey = String(_novelSettingId || '')
+      var _threadInject: any = { lines: [], openTotal: 0, staleOpen: 0 }
+      try {
+        if (_threadKey) {
+          var _tl = loadThreadLedger(_threadKey)
+          _threadInject = openThreadsFor(_tl, Number(_chapterNumber) || 1, 12)
+        }
+      } catch (_e) { /* 台账读取失败不阻塞 */ }
+      if (_threadInject && _threadInject.lines && _threadInject.lines.length) {
+        _genConfigLines.push('• 【必须推进的未完伏笔·最高优先级】本章至少要推进或回收其中一条（用具体动作/台词兑现，不要只在概述里提一句）：')
+        _threadInject.lines.forEach(function (x: string) { _genConfigLines.push('   - ' + x) })
+        console.log('[content][threads] 注入 open 伏笔 ' + _threadInject.lines.length + ' 条（open 共 ' + _threadInject.openTotal + '，其中窗口外长线 ' + _threadInject.staleOpen + '）')
+      } else if (_threadKey) {
+        console.log('[content][threads] 无待推进伏笔（key=' + _threadKey + '）')
+      }
+      if (_userStyle) {
+        _genConfigLines.push('• 本章生成风格：' + _userStyle + '（全文叙事语气、节奏、用词须贴合该风格，但不得牺牲上方人设与历史/题材铁律）')
+      }
+      if (_userNewChars) {
+        _genConfigLines.push('• 本章需登场新角色：' + _userNewChars + '（须自然融入本章剧情与已设定人物关系，不得喧宾夺主；新角色言行须符合本书时代背景与文风）')
+      }
+      _contentPrompt += '\n\n' + _genConfigLines.join('\n')
+      if (_userTargetWords !== 2000 || _userStyle || _userNewChars) {
+        console.log('[content] ✅ 控制面板已注入：targetWords=' + _userTargetWords + ' style=' + (_userStyle || '(默认)') + ' newChars=' + (_userNewChars || '(空)'))
+      }
+
       var _contentMessages: LLMMessage[] = [
         // 🔥 修复：content 步骤必须注入「个人设置·写作偏好」(bestsellerPrompt) 与「SKILL 技能库」(skillPrompt)，
         // 否则 AI 正文完全不按用户设置的爽点密度/打脸风格/节奏/平台/主角人设与启用技能输出（bug #1 根因）
         { role: 'system', content: _contentPrompt + stylePrompt + bestsellerPrompt + skillPrompt },
-        { role: 'user', content: '【🔥 本章剧情卡·最高优先级·必须100%严格落实·禁止跑题】\n章节：第' + _chapterNumber + '章《' + _chapterTitle + '》\n核心剧情：' + (_corePlot || '（见上方设定）') + '\n' + (_shuangPoints ? '本章必写爽点：' + _shuangPoints + '\n' : '') + (_castLines.length ? '出场人物（禁止新增主角/新核心配角，仅允许跑龙套群众）：\n' + _castLines.join('\n') + '\n' : '') + '请严格按本剧情卡与上方全部设定写正文，绝对禁止写无关的家庭日常/校园平淡/风景水文/新感情线。\n\n请直接输出第' + _chapterNumber + '章《' + _chapterTitle + '》的正文内容。\n\n【黄金三章写作要求，必须严格执行】\n1. 纯小说正文文本，不要JSON、不要Markdown、不要作者说、不要标题，直接开篇；\n2. 【🔥 字数硬性要求】字数必须达到2000-2500字（汉字），不得低于2000字，也不宜超过2500字，每300字左右有一个小转折或冲突点。字数不足视为失败，必须写够字数；\n3. 开篇五感描写：必须有环境渲染——天气（风/雨/雪/阳光）、声音（脚步声/呼吸声/远处的声响）、气味（血腥味/草药味/饭菜香/泥土湿气），不要空泛写景，要和人物当下状态结合；\n4. 细节动作代替心理描写：人物的紧张、愤怒、惊喜、犹豫绝对不能直接说"他很紧张""他心中大喜"，要通过动作表现——攥紧拳头指节发白、指尖发烫、咽了口唾沫、喉结滚动、雨水打湿发梢贴在额头上、手指无意识摩挲剑柄、脚在地上蹭了蹭、咬着下唇没说话；\n5. 生活化对话：人物说话要像真人，不要文绉绉的书面语，要有语气词、有停顿、有言不由衷、有话只说一半。不要"某某说道："xxx""这种格式，要把动作和对话穿插写，比如"他把茶碗往桌上一蹾："不可能。"迪莉娅低着头绞手绢，半天没出声。"；\n6. 短句制造节奏感：打斗、紧张、关键转折处必须用短句，每句不超过10个字，断句要干脆。不要长句子一口气到底；\n7. 禁止套路词：绝对不能出现"震惊全场""不可思议""倒吸一口凉气""实力大增""承上启下""埋下伏笔"这类AI套话；\n8. 承接上一章结尾自然开篇，不要"话说""上回说到"这种过渡语；\n9. 围绕本章核心剧情推进，爽点要落在具体的动作和结果上，不要空喊爽；\n10. 结尾留具体悬念，不要"欲知后事如何"，要停在一个具体的动作或一句话上，比如"他刚推开门，一只手突然搭在了他肩膀上。""剑柄上的宝石，亮了。"\n11. 【爽文节奏感】\n- 每300字必须有一个小转折/小冲突/小爽点，不能平铺直叙超过500字\n- 打脸要快：反派装逼不超过300字就被打脸\n- 升级要爽：突破境界时要有具体的身体变化、力量感、旁人的震惊反应\n- 悬念要钩人：章尾必须是硬钩子（断在最紧张的那一刻），不是软钩子\n12. 【人物立体度】\n- 配角不能是工具人：每个出场的配角都要有自己的小性格（说话方式、小动作、口头禅）\n- 反派要有脑子：不能是纯傻逼，要有合理的动机和算计，被打脸时要有层次感（不信→惊讶→暴怒→恐惧→求饶）\n- 女主/女配不能是花瓶：要有自己的目标和行动，不是等着男主救的摆设\n- 路人反应要真实：围观群众要有不同的反应（有人嫉妒、有人佩服、有人想巴结、有人想看好戏），不能整齐划一地"震惊"\n13. 【生活化细节】\n- 加入真实的生活细节：饭菜的味道、衣服的质感、走路的脚步声、钱币碰撞的声音、酒桌上的劝酒\n- 人物要有小毛病：主角也会抠鼻子、睡懒觉、吃饭吧唧嘴、记仇，不是完美圣人\n- 对话要有潜台词：不能说什么就是什么，要有人话只说七分、拐弯抹角、言不由衷\n14. 【情绪曲线】\n- 一章内情绪要有起伏：紧张→放松→更紧张→爽→新的悬念\n- 不能一直爽，也不能一直压抑\n- 爽点之前必须有压抑（敌人装逼/主角受辱/众人不看好），压抑越狠爽感越强\n15. 【番茄爽文专属技巧】\n- 多用"对比"：主角vs别人的对比、之前vs现在的对比、敌人装逼前vs被打脸后的对比\n- 多用"侧面烘托"：不直接写主角强，写别人的反应、写环境的变化、写敌人的恐惧\n- 多用"预判打脸"：读者都猜到主角要牛逼了，但具体怎么牛逼要超出预期\n- 每章至少有一个"名场面"：能让读者记住的精彩画面\n16. 【去AI化终极铁律】\n- 绝对不能出现"殊不知、岂不知、却不知"这种上帝视角旁白\n- 绝对不能出现"这一切、所有的、全部的"这种概括性词汇\n- 绝对不能出现"xx的是"这种判断句式（改为直接描写）\n- 多用人称代词"他/她"，少用人名（每段人名不超过2次）\n- 多用动词，少用形容词\n- 句子要断：能用逗号分开的，就不用长句\n17. 【暴力与冲突的高级写法】\n- 战斗要写过程不是写结果：刀怎么挥的、血怎么溅的、人怎么退的，不要"一招秒杀""实力碾压"这种空泛描述\n- 暴力要有代价：主角打赢了也会受伤、会疼、会喘，不是无伤碾压，有代价的胜利才真实\n- 复仇要有底线：主角可以有仇报仇，但不能滥杀无辜、不能虐杀、不能为了复仇变成魔头，有底线的主角才让人喜欢\n- 血腥点到为止：写伤口的疼、写血的温度、写死亡的重量，不要刻意渲染血腥追求刺激，高级的暴力是情绪不是血浆\n18. 【价值观的爽感写法】\n- 爽点来自主角凭实力赢，不是来自主角欺负人\n- 反派坏要有坏的道理（为了生存、为了家人、为了野心），不是天生坏种，有逻辑的反派才立得住\n- 主角可以狠，但不能残忍；可以杀伐果断，但不能嗜杀\n- 兄弟情、师生情、爱情这些情感线要真挚，不能全是利用和背叛，有温度的故事才走得远\n\n直接开始写正文：' }
+        { role: 'user', content: '【🔥 本章剧情卡·最高优先级·必须100%严格落实·禁止跑题】\n章节：第' + _chapterNumber + '章《' + _chapterTitle + '》\n核心剧情：' + (_corePlot || '（见上方设定）') + '\n' + (_shuangPoints ? '本章必写爽点：' + _shuangPoints + '\n' : '') + (_castLines.length ? '出场人物（禁止新增主角/新核心配角，仅允许跑龙套群众）：\n' + _castLines.join('\n') + '\n' : '') + '请严格按本剧情卡与上方全部设定写正文，绝对禁止写无关的家庭日常/校园平淡/风景水文/新感情线。\n\n请直接输出第' + _chapterNumber + '章《' + _chapterTitle + '》的正文内容。\n\n【黄金三章写作要求，必须严格执行】\n1. 纯小说正文文本：不要JSON、不要Markdown、不要作者说；【严禁】在正文任何位置出现章节标题、章节号或书名（如"第X章""《永历中兴》""卷名"），首句直接进入场景叙事；\n2. 【🔥 字数硬性要求】' + _ctRule + '，每300字左右有一个小转折或冲突点。字数不足或明显超出均视为不合格废稿；\n3. 【番茄节奏·开篇即入戏】首段必须直接切入本章核心冲突/悬念/对话或主角的紧迫决断，【严禁】用大段天气、景物、器物铺陈开篇（线上实测败笔：开篇连写四段雨、廊、砖、咳，读者三屏没见到冲突）；环境五感（天气/声音/气味）全章只点染一两处，且必须与人物当下处境绑定；【段落要短】每段1-3句，手机阅读每段不超过3行；\n4. 细节动作代替心理描写：人物的紧张、愤怒、惊喜、犹豫绝对不能直接说"他很紧张""他心中大喜"，要通过动作表现——攥紧拳头指节发白、指尖发烫、咽了口唾沫、喉结滚动、雨水打湿发梢贴在额头上、手指无意识摩挲剑柄、脚在地上蹭了蹭、咬着下唇没说话；\n5. 生活化对话：人物说话要像真人，不要文绉绉的书面语，要有语气词、有停顿、有言不由衷、有话只说一半。不要"某某说道："xxx""这种格式，要把动作和对话穿插写，比如"他把茶碗往桌上一蹾："不可能。"迪莉娅低着头绞手绢，半天没出声。"；\n6. 短句制造节奏感：打斗、紧张、关键转折处必须用短句，每句不超过10个字，断句要干脆。不要长句子一口气到底；\n7. 禁止套路词：绝对不能出现"震惊全场""不可思议""倒吸一口凉气""实力大增""承上启下""埋下伏笔"这类AI套话；\n8. 承接上一章结尾自然开篇，不要"话说""上回说到"这种过渡语；\n9. 围绕本章核心剧情推进，爽点要落在具体的动作和结果上，不要空喊爽；\n10. 结尾留具体悬念，不要"欲知后事如何"，要停在一个具体的动作或一句话上，比如"他刚推开门，一只手突然搭在了他肩膀上。""剑柄上的宝石，亮了。"\n11. 【爽文节奏感·番茄标准】\n- 【开篇3行内必须出冲突】主角必须在前3行内遇到危机/冲突/挑衅/紧迫抉择，禁止慢热铺垫\n- 【短段落】每段1-3句，每段不超过3行；对话独立成段\n- 【推进不停】每300字必须有一次剧情推进或转折，禁止连续500字以上的静态描写/心理独白\n\n- 每300字必须有一个小转折/小冲突/小爽点，不能平铺直叙超过600汉字\n- 打脸要快：反派装逼不超过300字就被打脸\n- 升级要爽：突破境界时要有具体的身体变化、力量感、旁人的震惊反应\n- 悬念要钩人：章尾必须是硬钩子（断在最紧张的那一刻），不是软钩子\n12. 【人物立体度】\n- 配角不能是工具人：每个出场的配角都要有自己的小性格（说话方式、小动作、口头禅）\n- 反派要有脑子：不能是纯傻逼，要有合理的动机和算计，被打脸时要有层次感（不信→惊讶→暴怒→恐惧→求饶）\n- 女主/女配不能是花瓶：要有自己的目标和行动，不是等着男主救的摆设\n- 路人反应要真实：围观群众要有不同的反应（有人嫉妒、有人佩服、有人想巴结、有人想看好戏），不能整齐划一地"震惊"\n13. 【生活化细节】\n- 加入真实的生活细节：饭菜的味道、衣服的质感、走路的脚步声、钱币碰撞的声音、酒桌上的劝酒\n- 人物要有小毛病：主角也会抠鼻子、睡懒觉、吃饭吧唧嘴、记仇，不是完美圣人\n- 对话要有潜台词：不能说什么就是什么，要有人话只说七分、拐弯抹角、言不由衷\n14. 【情绪曲线】\n- 一章内情绪要有起伏：紧张→放松→更紧张→爽→新的悬念\n- 不能一直爽，也不能一直压抑\n- 爽点之前必须有压抑（敌人装逼/主角受辱/众人不看好），压抑越狠爽感越强\n15. 【番茄爽文专属技巧】\n- 多用"对比"：主角vs别人的对比、之前vs现在的对比、敌人装逼前vs被打脸后的对比\n- 多用"侧面烘托"：不直接写主角强，写别人的反应、写环境的变化、写敌人的恐惧\n- 多用"预判打脸"：读者都猜到主角要牛逼了，但具体怎么牛逼要超出预期\n- 每章至少有一个"名场面"：能让读者记住的精彩画面\n16. 【去AI化终极铁律】\n- 绝对不能出现"殊不知、岂不知、却不知"这种上帝视角旁白\n- 绝对不能出现"这一切、所有的、全部的"这种概括性词汇\n- 绝对不能出现"xx的是"这种判断句式（改为直接描写）\n- 多用人称代词"他/她"，少用人名（每段人名不超过2次）\n- 多用动词，少用形容词\n- 句子要断：能用逗号分开的，就不用长句\n17. 【暴力与冲突的高级写法】\n- 战斗要写过程不是写结果：刀怎么挥的、血怎么溅的、人怎么退的，不要"一招秒杀""实力碾压"这种空泛描述\n- 暴力要有代价：主角打赢了也会受伤、会疼、会喘，不是无伤碾压，有代价的胜利才真实\n- 复仇要有底线：主角可以有仇报仇，但不能滥杀无辜、不能虐杀、不能为了复仇变成魔头，有底线的主角才让人喜欢\n- 血腥点到为止：写伤口的疼、写血的温度、写死亡的重量，不要刻意渲染血腥追求刺激，高级的暴力是情绪不是血浆\n18. 【价值观的爽感写法】\n- 爽点来自主角凭实力赢，不是来自主角欺负人\n- 反派坏要有坏的道理（为了生存、为了家人、为了野心），不是天生坏种，有逻辑的反派才立得住\n- 主角可以狠，但不能残忍；可以杀伐果断，但不能嗜杀\n- 兄弟情、师生情、爱情这些情感线要真挚，不能全是利用和背叛，有温度的故事才走得远\n\n直接开始写正文：' }
       ]
 
       console.log('[content] 章节上下文构建完成，开始调用LLM...')
@@ -34374,20 +36188,113 @@ ${_pcQuality.requiredHookAtEnd ? '• 结尾必须有硬钩子·不能平淡收�
         return m ? m.length : 0
       }
 
-      var _contentResult = ''
-      var _bestContent = '' // 🔥 2026-08-11 修复：跨重试保留最长有效稿，最终兜底返回真实正文而非空占位
-      var _targetMinWords = 2000 // 最低字数（2000-2500字）
-      var _targetMaxWords = 2500 // 最高字数
+      // 🔥 #209b（2026-09-09）content 出口确定性治理三件套（sensenova 实测暴露：①退化复读尾巴「禁监禁关押羁押…」
+      //   ②括号缺失 ③主角名漂移——质量门原有闸门均未覆盖）：
+      //   ① 退化尾巴剥离：单字连续复读≥10次收敛为1字；1-8字 n-gram 循环≥7次从最早出现处截断（保完整句尾）。
+      //     仅在退化起点 >800 字时才截（保护正文前段正常排比/对话重复），截后不足 600 字则放弃截断交给重试闸门。
+      var _stripContentDegenerate = function(s: string): string {
+        if (!s || typeof s !== 'string') return s
+        var _out = s.replace(/([\u4e00-\u9fa5])\1{9,}/g, '$1')
+        // 🔥 #209b 二次实测升级：重复单元放宽到 1-64 字（sensenova 会退化出 ~60 字排比单元循环，
+        //   如「新起点新高地…新征程」整段循环），单元+连续重复≥4 次（总块≥40字）即判退化，从最早出现处截断
+        var _m = _out.match(/([\u4e00-\u9fa5]{1,64}?)\1{3,}/)
+        if (_m && typeof _m.index === 'number' && _m.index > 800 && _m[0].length >= 40) {
+          var _cut = _out.substring(0, _m.index)
+          var _lastEnd = Math.max(_cut.lastIndexOf('。'), _cut.lastIndexOf('！'), _cut.lastIndexOf('？'), _cut.lastIndexOf('」'))
+          if (_lastEnd > 600) _out = _cut.substring(0, _lastEnd + 1)
+        }
+        // 🔥 #209b 三次实测第三形态：词联想链退化（进化→物种形成→生态位→…无重复单元、数百字无标点）。
+        //   正常网文正文标点间隔 ≤50 字，连续 ≥150 个纯汉字（无任何标点）必为退化链，从起点截断
+        var _chainM = _out.match(/[\u4e00-\u9fa5]{150,}/)
+        if (_chainM && typeof _chainM.index === 'number' && _chainM.index > 800) {
+          var _cut2 = _out.substring(0, _chainM.index)
+          var _lastEnd2 = Math.max(_cut2.lastIndexOf('。'), _cut2.lastIndexOf('！'), _cut2.lastIndexOf('？'), _cut2.lastIndexOf('」'))
+          if (_lastEnd2 > 600) _out = _cut2.substring(0, _lastEnd2 + 1)
+        }
+        // 🔥 #209b 二次实测：模型会退化追加 JSON 元数据尾巴（如 "_note": "以上正文…"），从 '_note' 处截断
+        var _noteIdx = _out.indexOf('"_note"')
+        if (_noteIdx < 0) _noteIdx = _out.indexOf('_note')
+        if (_noteIdx > 800) _out = _out.substring(0, _noteIdx)
+        return _out
+      }
+      // 🔥 #226P 终稿硬截断：正文落库前最后一道字数闸门（防 _deAiPolishPass 润色后再膨胀超标）。
+      //   与上方硬截断口径一致（2300 总长 / 2220 切点 / ≥2000 才切，否则直接截到 2300）。
+      var _hardCapContent = function(s: string): string {
+        if (!s || typeof s !== 'string') return s
+        // 2026-10-15 绍宋级口径：硬截上限提到 4800 总长（≈4200 汉字），切点 4600，≥3800 才切
+        if (s.length <= 4800) return s
+        var _at = 4600
+        var _cut = Math.max(s.lastIndexOf('\n\n', _at), s.lastIndexOf('。', _at), s.lastIndexOf('！', _at), s.lastIndexOf('？', _at))
+        if (_cut >= 3800) return s.substring(0, _cut + 1)
+        return s.substring(0, 4800)
+      }
+      //   ② 括号闭合：与 _sanitizeCharsBrackets._fixOne 同源算法（按「；;换行」分段逐段补「）」）
+      var _contentFixBrackets = function(s: string): string {
+        if (!s || s.indexOf('（') === -1) return s
+        return s.split(/(；|;|\n)/).map(function (part: string) {
+          if (part === '；' || part === ';' || part === '\n') return part
+          var o = (part.match(/（/g) || []).length
+          var c = (part.match(/）/g) || []).length
+          var out = part
+          while (o > c) { out += '）'; c++ }
+          return out
+        }).join('')
+      }
 
+      // 🔥 #226P 修复：判定正文是否"重复坍塌"（同一句子/短语原样重复≥3次，或连续 n-gram 循环≥40字）。
+      //   用于质量门兜底与 best-content 选取——绝不允许坍塌稿落库。
+      var _isCollapsed = function (s: string): boolean {
+        if (!s || typeof s !== 'string') return false
+        var _segs = s.split(/[。！？\n]/).map(function (x) { return x.trim() }).filter(function (x) { return x.length >= 6 })
+        var _cnt: { [k: string]: number } = {}
+        for (var _i = 0; _i < _segs.length; _i++) { var _k = _segs[_i]; _cnt[_k] = (_cnt[_k] || 0) + 1 }
+        for (var _k2 in _cnt) { if (_cnt[_k2] >= 3) return true }
+        var _ng = s.match(/([\u4e00-\u9fa5]{6,40}?)\1{3,}/)
+        if (_ng && _ng[0].length >= 40) return true
+        return false
+      }
+
+      var _contentResult = ''
+      var _contentCfg = llmConfig // 🔥 #226P 修复：坍塌时切换更强模型以逃出复读循环
+      var _strongModels = ['THUDM/GLM-4-9B-0414', 'THUDM/GLM-Z1-9B-0414']
+      var _strongIdx = -1
+      var _bestContent = '' // 🔥 2026-08-11 修复：跨重试保留最长有效稿，最终兜底返回真实正文而非空占位
+      // 🔥 2026-10-15 绍宋级口径统一（修复 P0：三方字数口径互相打架）
+      //   病根：promptLibrary 曾要求旧的长章口径（下限 2500），route 却按 1800 总长验收、
+      //        2300 总长硬截——模型照 2500 写，落地被砍到 ~2000 汉字，永远达不到白金标准。
+      //   🔥 2026-10-26 T9 口径统一：以【去空白（含标点）字符数】为唯一验收基准（不再有"纯汉字/含标点总长"两套）。
+      // 🔥 2026-10-25 T2 反修复（G-01）：验收基准直接取【用户字数带】——不再有独立的旧长章默认值，
+      //   且改为双侧带：下限=用户区间下限（低于它才允许续写保底），上限=用户区间上限×1.05（超出一次净删）。
+      var _stdBase = _wBand.target
+      // 🔥 2026-10-16 修复（Bug 3：同一函数内字数口径单位混用，续写/截断互相打架）
+      //   🔥 2026-10-26 T9：删除「纯汉字 / 阅读器含标点总长」双口径——四个变量统一为同一口径（去空白（含标点）字符数）。
+      //   旧名（_targetMinWords/_targetMaxWords/_targetMinChinese/_targetMaxChinese）保留为别名，避免大范围改名引起回归。
+      var _targetMinUnits = _wBand.min                              // 口径下限＝用户区间下限（只保底，不冲目标）
+      var _targetMaxUnits = Math.round(_wBand.max * 1.05)           // 口径上限＝用户区间上限×1.05（触发一次净删）
+      var _targetMinWords = _targetMinUnits                         // 兼容旧名（口径已统一为去空白含标点）
+      var _targetMaxWords = _targetMaxUnits                         // 兼容旧名
+      var _targetMinChinese = _targetMinUnits                       // 兼容旧名
+      var _targetMaxChinese = _targetMaxUnits                       // 兼容旧名
+
+      //   ③ 质检纠正语回显剥离（#210b）：重试时 _contentFixMsg 会被模型当正文复述到开头
+      //     （实测「爽点密度不足：仅检测到1个爽点标记…」成为第一章第一行）——逐段剥离含质检特征词的开头短段
+      var _stripGateEcho = function(s: string): string {
+        if (!s || typeof s !== 'string') return s
+        var _echoRe = /爽点密度不足|质检未通过|硬性废稿|白金爆款要求|正文字数不足|严重跑题|主角名漂移|必须重写为纯小说叙事|特征库|元叙事步骤标签/
+        var _parts = s.split('\n\n')
+        var _guard = 0
+        while (_parts.length > 1 && _guard < 4 && _parts[0].length < 300 && _echoRe.test(_parts[0])) { _parts.shift(); _guard++ }
+        return _parts.join('\n\n')
+      }
       var _contentFixMsg = ''
-      for (var _contentRetry = 0; _contentRetry < 4; _contentRetry++) {
+      for (var _contentRetry = 0; _contentRetry < 5; _contentRetry++) {
         try {
           // 🔥 针对性重写：把上一稿的质检问题喂回模型，要求其修正后再输出（质量门核心）
           if (_contentFixMsg) {
             var _lastMsg = _contentMessages[_contentMessages.length - 1]
             _lastMsg.content = _lastMsg.content + '\n\n' + _contentFixMsg
           }
-          var _contentResp = await callLLMWithFallback(llmConfig, _contentMessages, undefined, {
+          var _contentResp = await callLLMWithFallback(_contentCfg, _contentMessages, undefined, {
             temperature: Math.max(0.35, _contentTemp - _contentRetry * 0.12),
             maxTokens: _contentMaxTokens,
             step: 'content',
@@ -34401,17 +36308,24 @@ ${_pcQuality.requiredHookAtEnd ? '• 结尾必须有硬钩子·不能平淡收�
           console.log('[content] 第' + (_contentRetry + 1) + '次尝试，模型: ' + _contentResp.usedModel + ', 原始长度: ' + _contentResult.length + ', 汉字数: ' + countChineseChars(_contentResult))
 
           // 🔥 使用小说正文专用清理函数，而不是JSON清理函数
-          _contentResult = cleanNovelContent(_contentResult, _contentPrev)
+          _contentResult = cleanNovelContent(_contentResult, _contentPrev, _genre)
+          // 🔥 #209b 出口治理：退化尾巴剥离 + 括号闭合（先于字数统计，防退化尾巴虚增字数骗过续写/截断逻辑）
+          _contentResult = _stripContentDegenerate(_contentResult)
+          _contentResult = _stripGateEcho(_contentResult)
+          _contentResult = _contentFixBrackets(_contentResult)
 
           var _curWords = countChineseChars(_contentResult)
           // 🔥 保留最长有效稿（即便后续某次生成过短/限流失败，也能回退到此前最佳真实正文）
-          if (_contentResult && _contentResult.length > _bestContent.length) _bestContent = _contentResult
+          // 🔥 #226P 修复：best-content 只保留"非坍塌"稿（坍塌稿因重复虚增长度，绝不能选为最佳）
+          if (_contentResult && !_isCollapsed(_contentResult) && _contentResult.length > _bestContent.length) _bestContent = _contentResult
           if (_contentResult && _curWords > 200) {
-            // 🔥 字数不足自动续写补全（最多续写2次）
+            // 🔥 #210（2026-09-09）字数口径统一到阅读器口径（#148 实锤：阅读器"字数"按含标点总长计）：
+            //   续写触发改用统一口径（此前按纯汉字 ≥1800 触发，与平台口径不符，
+            //   续写→超长→硬截回 2100 总长→汉字仍不足的死循环，每章白烧 3 次续写 + 质量门 3 次重试 ≈5 分钟）
             var _continueAttempts = 0
-            while (_curWords < _targetMinWords && _continueAttempts < 3) {
+            while (_contentResult.length < _targetMinWords && _continueAttempts < 3) {
               _continueAttempts++
-              console.log('[content] 字数不足(' + _curWords + '字)，进行第' + _continueAttempts + '次续写补全...')
+              console.log('[content] 字数不足(总长' + _contentResult.length + '字)，进行第' + _continueAttempts + '次续写补全...')
               
               // 取最后500字作为续写上下文
               var _lastPart = _contentResult.substring(Math.max(0, _contentResult.length - 600))
@@ -34420,15 +36334,17 @@ ${_pcQuality.requiredHookAtEnd ? '• 结尾必须有硬钩子·不能平淡收�
                 { role: 'user', content: '前文如下（直接从最后一段继续写，不要任何衔接语）：\n\n' + _lastPart + '\n\n直接继续：' }
               ]
               try {
-                var _continueResp = await callLLMWithFallback(llmConfig, _continueMessages, undefined, {
+                var _continueResp = await callLLMWithFallback(_contentCfg, _continueMessages, undefined, {
                   temperature: 0.75,
                   maxTokens: 4000,
                   step: 'content',
                   // 🔥 续写补全同为纯散文，跳过 JSON 校验，直接返回首个成功模型（公司 Ollama 首选）
                   skipJsonValidation: true,
-                  timeoutMs: 60000
+                  // 🔥 2026-10-16 修复：续写超时 60s→240s。主模型单次正文生成实测需 100–380s，
+                  //   60s 续写必然超时→3 次补全全失败→正文恒短（探针实测 784/142 汉字）。抬到与主调用同级。
+                  timeoutMs: 240000
                 })
-                var _continueText = cleanNovelContent(_continueResp.content, _contentPrev)
+                var _continueText = cleanNovelContent(_continueResp.content, _contentPrev, _genre)
                 if (_continueText && _continueText.length > 100) {
                   // 移除续写中可能重复的开头（与前文末尾重复的部分）
                   var _overlapCheck = _lastPart.slice(-50)
@@ -34461,23 +36377,70 @@ ${_pcQuality.requiredHookAtEnd ? '• 结尾必须有硬钩子·不能平淡收�
                 _contentResult = _contentResult.substring(0, _lastPara + 1)
               }
             }
-            // 🔥 2026-08-27 #2：阅读器"字数"按含标点总长计，硬截断总长到 ≤2500（落在 2000-2500），在句子/段落边界切
-            if (_contentResult.length > 2500) {
-              var _capAt = 2400
+            // 🔥 #226P：硬截断上限收敛到 2300 字总长（#226O 曾抬到 2500 致部分章节爆字；_deAiPolishPass 润色后还会再膨胀），
+            //   确保正文稳定落在 2000-2300 汉字区间（阅读器口径：含标点总长≈汉字数+标点，2300 总长对应 ~2150 汉字，符合"≥1800"且不会爆字）。在句子/段落边界切。
+            // 2026-10-15 绍宋级口径：硬截上限 4800 总长 / 切点 4600 / ≥3800 才切（原 2300/2220/2000 会把 3000 汉字正文砍废）
+            if (_contentResult.length > 4800) {
+              var _capAt = 4600
               var _capCut = Math.max(
                 _contentResult.lastIndexOf('\n\n', _capAt),
                 _contentResult.lastIndexOf('。', _capAt),
                 _contentResult.lastIndexOf('！', _capAt),
                 _contentResult.lastIndexOf('？', _capAt)
               )
-              if (_capCut >= 2000) _contentResult = _contentResult.substring(0, _capCut + 1)
-              else _contentResult = _contentResult.substring(0, 2500)
+              if (_capCut >= 3800) _contentResult = _contentResult.substring(0, _capCut + 1)
+              else _contentResult = _contentResult.substring(0, 4800)
             }
 
             // 🔥 确定性去AI味后处理（先于最终清理：其字典改写偶发可能在相邻处引入重复虚词，故必须先做，再由下方 cleanNovelContent 兜底）
             _contentResult = deAiCleanup(_contentResult)
             // 🔥 最终再清理一次（语病确定性修正：叠字冗余虚词折叠 + 人名赘「是」剥离）——落库前最后一道确定性关卡，确保绝不泄漏
-            _contentResult = cleanNovelContent(_contentResult, _contentPrev)
+            _contentResult = cleanNovelContent(_contentResult, _contentPrev, _genre)
+            // 🔥 #209b 出口治理（终稿再次执行：续写补全引入的退化/括号问题在此兜底）
+            _contentResult = _stripContentDegenerate(_contentResult)
+            _contentResult = _stripGateEcho(_contentResult)
+            _contentResult = _contentFixBrackets(_contentResult)
+
+            // 🔥 2026-10-25 T2 反修复：oh-story 章级统一确定性门禁（先确定性清洗，再检测 → 五维 → 单一 verdict）
+            //   覆盖 T1 实测的门禁盲区：载体分隔行/***、元叙事全量、英文残留、重复坍塌、金手指人格化、字数出带、章尾硬钩
+            var _qgClean = cleanChapterText(_contentResult)
+            if (_qgClean.changes.length) {
+              console.log('[content][quality-gate] 确定性清洗: ' + _qgClean.changes.join(' + '))
+              _contentResult = _qgClean.text
+            }
+            // 🔥 2026-10-26 T6：门禁参数升级——G-13 期待债计数、G-10 已知设定专名、G-14 契约四问
+            var _thNew: string[] = []
+            var _thResolved = 0
+            try {
+              _thNew = extractThreads(_contentResult, Number(_chapterNumber) || 1).map(function (t: any) { return t.text })
+              if (_threadKey) {
+                var _tl2 = loadThreadLedger(_threadKey)
+                _thResolved = countResolvedBy(_tl2, Number(_chapterNumber) || 1, _contentResult).resolved
+              }
+            } catch (_e) { /* 不阻塞 */ }
+            var _qg = runChapterQualityGate(_contentResult, {
+              chapterNumber: Number(_chapterNumber) || 1,
+              genre: String(genre || ''),
+              userTargetWords: _wBand.target,
+              chapterTitle: String(_chapterTitle || ''),
+              prevEnding: String((_contentPrev && (_contentPrev as any).prevEnding) || _prevEnding || ''),
+              // ---- T6 新增 ----
+              protagonistName: String((_engIdea && _engIdea.protagonistName) || (_engChars && _engChars.protagonist && _engChars.protagonist.name) || ''),
+              castNames: (typeof _castLines !== 'undefined' && Array.isArray(_castLines))
+                ? _castLines.map(function (l: string) { return String(l).split(/[｜|]/)[0].trim() }).filter(Boolean).slice(0, 12)
+                : [],
+              expectCategories: undefined,
+              maxNewConcepts: 3,
+              sceneGate: true,
+              resolvedThreadCount: _thResolved,
+              newThreadCount: _thNew.length,
+            })
+            console.log('[content][quality-gate] ' + summarizeQGate(_qg) +
+              ' · 状态改变 ' + (_qg.state ? _qg.state.changed.length + '/7' : '-') +
+              ' · 场景 ' + (_qg.scenes ? _qg.scenes.scenes.filter(function (s: any) { return s.missing.length === 0 }).length + '/' + _qg.scenes.scenes.length + ' 齐备' : '-') +
+              ' · 契约 ' + (_qg.contract ? _qg.contract.summary.replace('契约四问：', '') : '-') +
+              ' · 伏笔 回收' + _thResolved + '/新增' + _thNew.length +
+              (_qg.findings.length ? ' · 首条=' + _qg.findings[0].rule : ''))
 
             // 🔥 质量门：扫描「全网AI双重判定特征库」残留高危项 + 元叙事标记 + 跑题 + 爽点密度
             // 任一不达标且仍有重试次数 → 触发针对性重写（最多 4 次），从源头消除 AI 特征、保证不跑题、爽点密度达标
@@ -34489,6 +36452,11 @@ ${_pcQuality.requiredHookAtEnd ? '• 结尾必须有硬钩子·不能平淡收�
 
             // 综合质量门：特征库残留 / 跑题 / 爽点密度，任一不达标且仍有重试次数 → 针对性重写
             var _gateIssues: string[] = []
+            // 🔥 2026-10-25 T2：统一门禁的 S1（硬性废稿）入口驱动定点重写；S2/S3 只记录（避免无限重写）
+            var _qgHardFails = (_qg && _qg.findings) ? _qg.findings.filter(function (f: any) { return f.severity === 'S1' }) : []
+            if (_qgHardFails.length) {
+              _gateIssues.push('oh-story章级统一门禁硬性废稿（' + _qg.verdict + '·五维总' + _qg.scores.total + '）：' + _qgHardFails.slice(0, 6).map(function (f: any) { return f.rule + '=' + f.message }).join('；'))
+            }
             // 🔥 硬性废稿：SKILL结构模板/元叙事标签/仙侠自创角色名泄漏 —— 一旦出现必须重生成（不论其他项多少）
             var _hardFails = _violations.filter(function (v: string) { return /SKILL结构模板泄漏|元叙事步骤标签泄漏|仙侠风格自创角色名泄漏/.test(v) })
             if (_hardFails.length > 0) _gateIssues.push('正文泄漏了写作结构模板/元叙事步骤标签/仙侠自创角色名（硬性废稿，必须重写为纯小说叙事，绝对禁止把①铺垫②围观③蓄力这类写作技巧步骤当正文输出）：' + _hardFails.join('、'))
@@ -34522,28 +36490,119 @@ ${_pcQuality.requiredHookAtEnd ? '• 结尾必须有硬钩子·不能平淡收�
               _gateIssues.push('正文残留叠字冗余虚词或人名赘「是」（语病硬伤，必须重写为通顺中文，删除连续重复虚词与冗余「是」字）（兜底闸门触发，请检查 cleanNovelContent 语病修正是否生效）')
             }
             if (_violations.length > 2) _gateIssues.push('「全网AI双重判定特征库」高危项残留' + _violations.length + '条：' + _violations.slice(0, 12).join('、'))
-            if (_finalWords < 2000) _gateIssues.push('正文字数不足(' + _finalWords + '字)，白金爆款要求≥2000字，必须续写补全到足够长度后再输出')
+            // 🔥 #210 口径统一：质量门字数检查同样改用阅读器口径（含标点总长）——与 #148 硬截口径一致，
+            //   消除「两种口径互相打架被判废」的矛盾（T9 已把全系统口径统一为去空白（含标点）字符数）
+            if (countWordUnits(_contentResult) < 1500) _gateIssues.push('正文字数不足(' + countWordUnits(_contentResult) + '字，去空白（含标点）字符数，低于平台最低下限1500字)，必须续写补全后再输出'); else if (countWordUnits(_contentResult) < _targetMinWords) console.warn('[content] 字数偏短(' + countWordUnits(_contentResult) + ' < 目标' + _targetMinWords + '，去空白（含标点）字符数)，平台无硬性字数要求，不阻断')
             if (_offTopic) _gateIssues.push('严重跑题：正文未围绕本章核心剧情【' + (_corePlot || '').slice(0, 40) + '】展开，写成了无关的家庭日常/校园平淡/风景水文')
-            if (_shuangCount < 2) _gateIssues.push('爽点密度不足：仅检测到' + _shuangCount + '个爽点标记（要求≥2，须有打脸/逆袭/突破/装逼/收获机缘/震惊全场/碾压反派等）')
+            if (_shuangCount < 2) _gateIssues.push('爽点密度不足：仅检测到' + _shuangCount + '个爽点标记（要求≥2，须有打脸/逆袭/突破/装逼/收获机缘/碾压反派等）')
+            // 🔥 #209b 主角名漂移闸门：正文中主角名零出现 = 硬性废稿（sensenova 实测会自创「雨田诺」类陌生主角名）
+            if (_canonProtoName && _contentResult.indexOf(_canonProtoName) === -1) {
+              _gateIssues.push('主角名漂移（硬性废稿）：正文通篇未出现主角名「' + _canonProtoName + '」，说明你自创了错误的主角名。主角必须是「' + _canonProtoName + '」，全文必须以其为主角视角展开，绝对禁止使用任何其他名字称呼主角')
+            }
+            // 🔥 #226P 硬性废稿：同一句子/短语原样重复≥3次 = 重复坍塌（弱模型头号退化形态，226P 实测 76/125 章中招）
+            //   无论位置（开头/中间/结尾），一旦 verbatim 重复即废稿触发针对性重写，从源头杜绝"复读机"章节
+            var _repSegs = _contentResult.split(/[。！？\n]/).map(function (x) { return x.trim() }).filter(function (x) { return x.length >= 6 })
+            var _repCount: { [k: string]: number } = {}
+            for (var _ri = 0; _ri < _repSegs.length; _ri++) { var _rk = _repSegs[_ri]; _repCount[_rk] = (_repCount[_rk] || 0) + 1 }
+            var _repWorst = ''
+            var _repWorstN = 0
+            for (var _rk2 in _repCount) { if (_repCount[_rk2] > _repWorstN) { _repWorstN = _repCount[_rk2]; _repWorst = _rk2 } }
+            if (_repWorstN >= 3) {
+              _gateIssues.push('正文出现严重重复坍塌：句子「' + _repWorst.slice(0, 24) + '…」原样重复了 ' + _repWorstN + ' 次（弱模型退化形态）。必须重写为全新不重复的剧情叙事——严禁把同一句话/同一段反复粘贴，每一句都必须推进剧情或刻画人物，禁止任何形式的自我复制。')
+            }
+            // 🔥 #226P 兜底：连续 n-gram 循环（如"新起点新起点新起点新起点"）即便未被句号切分也能命中
+            var _ngM = _contentResult.match(/([\u4e00-\u9fa5]{6,40}?)\1{3,}/)
+            if (_ngM && _ngM[0].length >= 40) {
+              _gateIssues.push('正文存在连续重复的短语块（' + _ngM[0].length + '字循环），重复坍塌，必须重写为全新不重复内容。')
+            }
+            // 🔥 2026-10-15 白金爆款机器门禁（绍宋级·platinum-gate.ts）：把白金标准从「提示词」变成「可执行判据」
+            //   尺子（2026-10-31 对齐番茄官方《作品签约标准说明》+《加强低质内容治理公告》）：
+            //   ① 正文字数 2000-3000（去空白含标点字符数；过少判「空洞水文」，过多判「机械扩写」）
+            //   ② 爽点节拍≥4 且最大平铺≤600 汉字
+            //   ③ 对话占比≥25%（官方「代入感不足」红线；原先 15% 过宽，219 章漏放）
+            //   ④ 单段≤60 汉字（官方手机屏 3-4 行硬约束；原先 120 过宽，590 章漏放）
+            //   ⑤ 语义软循环 / 元叙述污染 / 章末硬钩 / 英文泄漏
+            try {
+              var _pg = evaluateChapterStd(_contentResult)
+              if (!_pg.passed) {
+                _gateIssues.push('白金爆款门禁未通过（' + _pg.metrics.wordUnits + '字 · ' + _pg.metrics.shuangBeats + '爽点 · 最大平铺' + _pg.metrics.maxFlatChinese + ' · 对话' + (_pg.metrics.dialogueRatio * 100).toFixed(1) + '%）：' + _pg.issues.slice(0, 6).join('；'))
+              }
+            } catch (_pgErr) { console.warn('[content] 白金门禁异常(忽略):', _pgErr) }
 
             if (_gateIssues.length === 0) {
               // 🔥 #8 去AI润色→复检闭环：特征库残留仍偏高则做一遍 POLISH_8D 重写再复检
               if (scanContentViolations(_contentResult).length > 2) {
                 _contentResult = await _deAiPolishPass(_contentResult, llmConfig)
               }
+              _contentResult = _hardCapContent(_contentResult)
               return _contentResult
             }
             // 命中任一问题 → 针对性重写（循环回到开头重新调用 LLM）
-            if (_contentRetry < 3) {
-              _contentFixMsg = '【上一稿质检未通过·必须修正后再输出】\n' + _gateIssues.join('\n') + '\n\n请重新输出本章正文，严格满足以下全部要求：\n1. 必须100%围绕上方【本章核心剧情】与【本章爽点】写，绝对禁止写无关的家庭日常/校园平淡/风景水文/新主角新感情线；\n2. 必须包含≥2个具体爽点（打脸/逆袭/突破/装逼/收获机缘/震惊全场/碾压反派），按"冲突→博弈→高潮打脸→收益伏笔"四段式推进；\n3. 彻底替换AI套话/模板神态/元叙事/高危句式，用具象动作、口语化短句、生活化细节；\n4. 严格保持已设定人设与出场人物，禁止引入新主角/新核心配角；\n5. 【🔥 致命错误·严禁再犯】绝对禁止把写作技巧/爽点设计的结构模板当成正文输出！禁止出现「① 铺垫 ② 围观 ③ 蓄力 ④ 爆发 ⑤ 震惊 ⑥ 收尾」这类带圈数字编号的步骤，也禁止出现「铺垫：/蓄力：/爆发：/震惊：/收尾：」这类步骤标签——这些是你的写作方法，不是小说正文！所有出场角色姓名必须来自上方【出场人物】列表，绝对禁止自创仙侠/武侠风格姓名（如凌霄子/萧清风/林婉儿/魔尊等），需要配角时用"一名黑衣人""护卫甲"等泛称。\n6. 【🔥 场景与世界观铁律·严禁再犯】本章段落内时间/地点/人物/物件必须连续统一，禁止在一句话里凭空从"山洞/密林"跳到"桌案/城门/信件"等无来源场景；每章只围绕一个核心冲突场景展开。本作是科幻星际题材，绝对禁止出现古籍/蜡烛/马蹄/长枪/剑气/宗门/灵气等中古武侠仙侠器物，战斗一律用精神念力/基因原能/能量护盾/拳锋掌力/粒子束表现；群演反应要具体有差异，禁止"有人X有人Y有人Z"三连排比套路。\n直接输出新的一版纯小说叙事正文，不要任何解释、不要步骤列表。'
+            if (_contentRetry < 4) {
+              // 🔥 #226P 修复：若仍坍塌，切换更强模型以逃出复读循环（弱模型 glm-4-flash 易退化成复读机）
+              var _hasCollapse = _repWorstN >= 3 || (_ngM && _ngM[0].length >= 40)
+              // 🔥 2026-10-16 修复：白金门禁未通过时同样升级模型——弱模型无法仅靠「降温度重试」达到白金标准，
+              //   必须切换到更强的正文模型才能收敛（这是「不管用哪个大模型都能输出该作品标准」的工程保障）。
+              var _pgFailed = _gateIssues.some(function (g) { return g.indexOf('白金爆款门禁未通过') >= 0 })
+              if ((_hasCollapse || _pgFailed) && _strongIdx < _strongModels.length - 1) {
+                _strongIdx++
+                var _smName = _strongModels[_strongIdx]
+                // 2026-10-16 修复：升级模型必须携带其【独立 provider/baseUrl/apiKey】——此前只换 model 名却复用当前 llmConfig，
+                //   在非硅基 provider 下会 404/400（升级形同虚设）。改为从 models.json 解析该强模型的完整配置，解析不到再退回「同配置换名」。
+                var _smCfg: any = null
+                try {
+                  var _fsSM = require('fs'); var _pathSM = require('path')
+                  var _smPath = _pathSM.join(process.cwd(), '.tuzhong-data', 'models.json')
+                  if (_fsSM.existsSync(_smPath)) {
+                    var _smArr = JSON.parse(_fsSM.readFileSync(_smPath, 'utf-8'))
+                    var _smHit = (Array.isArray(_smArr) ? _smArr : []).find(function (m: any) { return m && m.model === _smName && m.apiKey && !String(m.apiKey).includes('*') })
+                    if (_smHit) {
+                      _smCfg = {
+                        provider: _smHit.provider || llmConfig.provider,
+                        apiKey: String(_smHit.apiKey).replace(/[`'"]/g, '').trim(),
+                        baseUrl: String(_smHit.baseUrl || llmConfig.baseUrl || '').replace(/[`'"]/g, '').trim(),
+                        model: _smHit.model,
+                      }
+                    }
+                  }
+                } catch (_smErr) { /* 忽略，回退「同配置换名」 */ }
+                _contentCfg = _smCfg || Object.assign({}, llmConfig, { model: _smName })
+                console.log('[content] ' + (_hasCollapse ? '检测到重复坍塌' : '白金门禁未通过') + '，切换模型至 ' + _smName + (_smCfg ? '(独立配置)' : '(同配置换名)') + ' 重试（第' + (_contentRetry + 2) + '次）...')
+              }
+              _contentFixMsg = '【上一稿质检未通过·必须修正后再输出】\n' + _gateIssues.join('\n') + '\n\n请重新输出本章正文，严格满足以下全部要求：\n1. 必须100%围绕上方【本章核心剧情】与【本章爽点】写，绝对禁止写无关的家庭日常/校园平淡/风景水文/新主角新感情线；\n2. 必须包含≥2个具体爽点（打脸/逆袭/突破/装逼/收获机缘/碾压反派），按"冲突→博弈→高潮打脸→收益伏笔"四段式推进；\n3. 彻底替换AI套话/模板神态/元叙事/高危句式，用具象动作、口语化短句、生活化细节；\n4. 严格保持已设定人设与出场人物，禁止引入新主角/新核心配角；\n5. 【🔥 致命错误·严禁再犯】绝对禁止把写作技巧/爽点设计的结构模板当成正文输出！禁止出现「① 铺垫 ② 围观 ③ 蓄力 ④ 爆发 ⑤ 震惊 ⑥ 收尾」这类带圈数字编号的步骤，也禁止出现「铺垫：/蓄力：/爆发：/震惊：/收尾：」这类步骤标签——这些是你的写作方法，不是小说正文！所有出场角色姓名必须来自上方【出场人物】列表，绝对禁止自创仙侠/武侠风格姓名（如凌霄子/萧清风/林婉儿/魔尊等），需要配角时用"一名黑衣人""护卫甲"等泛称。\n6. 【🔥 场景与世界观铁律·严禁再犯】本章段落内时间/地点/人物/物件必须连续统一，禁止在一句话里凭空从"山洞/密林"跳到"桌案/城门/信件"等无来源场景；每章只围绕一个核心冲突场景展开。世界观器物、力量体系与战斗表现必须严格贴合本作题材设定（历史/武侠/仙侠/都市/科幻等各自语境），严禁串入其他题材专属器物与能力（如历史题材不得出现修仙魔法、科幻题材不得出现剑气宗门）；群演反应要具体有差异，禁止"有人X有人Y有人Z"三连排比套路。\n7. 【🔥 重复坍塌铁律·严禁再犯】上一稿把同一句话原样反复粘贴了多次，这是最严重错误！每一句都必须与前文不同、都推进剧情或刻画人物；禁止任何自我复制、禁止同一句式反复出现。请逐句全新创作。\n直接输出新的一版纯小说叙事正文，不要任何解释、不要步骤列表。'
               console.log('[content] 质量门未通过(' + _gateIssues.length + '项)，触发针对性重写，将进行第 ' + (_contentRetry + 2) + ' 次生成...')
               continue
             }
             // 已用尽重写次数，返回当前最优稿（best-effort）
+            // 🔥 #226P 修复：绝不允许坍塌稿落库——若当前稿仍坍塌，回退非坍塌历史最佳稿；若仍无，返回失败占位（交由下游重制）
             if (scanContentViolations(_contentResult).length > 2) {
               _contentResult = await _deAiPolishPass(_contentResult, llmConfig)
             }
-            return _contentResult
+            _contentResult = _hardCapContent(_contentResult)
+            // 🔥 2026-10-16 修复（Bug 2）：重试耗尽时按【白金门禁问题数】择优落库，而非只看最后一稿是否坍塌。
+            var _pickCur = !_isCollapsed(_contentResult)
+            var _pickBest = !!( _bestContent && countChineseChars(_bestContent) > 200 && !_isCollapsed(_bestContent) )
+            if (_pickCur && _pickBest) {
+              var _curIssues = 0, _bestIssues = 0
+              try { _curIssues = evaluateChapterStd(_contentResult).issues.length } catch (_e) {}
+              try { _bestIssues = evaluateChapterStd(_bestContent).issues.length } catch (_e) {}
+              if (_bestIssues < _curIssues) {
+                console.log('[content] best-effort 择优：历史最佳稿门禁问题更少（' + _bestIssues + ' < ' + _curIssues + '）')
+                return _hardCapContent(_bestContent)
+              }
+            }
+            if (_pickCur) {
+              var _curGateIssues = 0
+              try { _curGateIssues = evaluateChapterStd(_contentResult).issues.length } catch (_e) {}
+              if (_curGateIssues > 0) console.warn('[content] ⚠️ 重试耗尽，落库稿仍未通过白金门禁（' + _curGateIssues + '项）——质量不达绍宋级，建议重制')
+              return _contentResult
+            }
+            if (_pickBest) {
+              console.log('[content] 当前稿坍塌，回退非坍塌历史最佳稿（汉字数: ' + countChineseChars(_bestContent) + '）')
+              return _hardCapContent(_bestContent)
+            }
+            console.log('[content] 所有尝试均坍塌，返回失败占位（交由下游重制）')
+            return '（本章内容生成失败，请手动补充。本章核心剧情：' + _corePlot + '）'
           }
           console.log('[content] 内容过短或为空，重试...')
         } catch (err) {
@@ -34552,9 +36611,10 @@ ${_pcQuality.requiredHookAtEnd ? '• 结尾必须有硬钩子·不能平淡收�
       }
 
       console.log('[content] AI生成失败，返回兜底内容')
-      // 🔥 2026-08-11 修复：若此前已有成功生成的有效正文（≥200字），优先返回该最佳稿，避免返回空占位符
-      if (_bestContent && countChineseChars(_bestContent) > 200) {
+      // 🔥 #226P 修复：返回历史最佳稿前先确认其非坍塌，否则返回失败占位（绝不落库坍塌稿）
+      if (_bestContent && countChineseChars(_bestContent) > 200 && !_isCollapsed(_bestContent)) {
         console.log('[content] 返回历史最佳稿（汉字数: ' + countChineseChars(_bestContent) + '）')
+        _bestContent = _hardCapContent(_bestContent)
         return _bestContent
       }
       return '（本章内容生成失败，请手动补充。本章核心剧情：' + _corePlot + '）'
@@ -34658,10 +36718,13 @@ ${_pcQuality.requiredHookAtEnd ? '• 结尾必须有硬钩子·不能平淡收�
 }
 
 // ============ Route Handler ============
-// 设置最大执行时长为 300 秒（5 分钟），避免 chapters 等长任务被平台层超时中断
+// 最大执行时长：正文整章精写（节拍表→分场景→质检→定点修复）实测需 400s+，
+// 慢速主模型 + 兜底链重试最坏可达 900s；原 300s 会把正常长章节腰斩（连接重置→客户端 fetch failed）。
+// 提到 900s（15 分钟）以包容单章最坏生成，短任务仍秒回不受影响。
 export const runtime = 'nodejs'
-export const maxDuration = 300
+export const maxDuration = 900
 export async function POST(request: Request) {
+  return runWithLLMRequestContext('', [], async () => {
   try {
     // 修复 v4 C5：强制校验 JWT 登录态，防止匿名调用付费 LLM 接口
     const actor = await getRequestActor(request)
@@ -34676,7 +36739,7 @@ export async function POST(request: Request) {
     //   否则一批 5 个并发请求会撞上「每分钟 5 次」的通用闸门被误封 2 分钟，反而更慢。
     const clientIp = getClientIpFromRequest(request)
     const body = await request.json() as GenerateRequest
-    const { step, novelId, input, keywords, genre, previousData, llmConfig, manualModel, field, enabledSkills, bookAnalysisJson, regeneratePrompt, activeStyle, bestsellerPrefs } = body
+    const { step, novelId, input, keywords, genre, previousData, llmConfig, manualModel, field, frozen, enabledSkills, bookAnalysisJson, regeneratePrompt, activeStyle, bestsellerPrefs } = body
     const _isContentStep = step === 'content'
     const rateLimitKey = 'ai-generate:' + actor.userId + ':' + clientIp + (_isContentStep ? ':content' : ':meta')
     const rateLimitResult = _isContentStep
@@ -34738,8 +36801,9 @@ export async function POST(request: Request) {
         //   若 default 模型无 key（如 OpenRouter :free 未填 key），则回退到列表中
         //   【第一个含有效 key 的模型】，避免回落到 .env 的付费兜底模型（DeepSeek-V3）。
         const _hasValidKey = function (m: any) { return m && m.apiKey && !String(m.apiKey).includes('*') }
-        const _defaultModel = (Array.isArray(_parsedModels) ? _parsedModels : []).find(function (m: any) { return m && m.status === 'default' && _hasValidKey(m) })
-          || (Array.isArray(_parsedModels) ? _parsedModels : []).find(_hasValidKey)
+        const _isPaid = function (m: any) { return m && m.isPaid === true }
+        const _defaultModel = (Array.isArray(_parsedModels) ? _parsedModels : []).find(function (m: any) { return m && !_isPaid(m) && m.status === 'default' && _hasValidKey(m) })
+          || (Array.isArray(_parsedModels) ? _parsedModels : []).find(function (m: any) { return m && !_isPaid(m) && _hasValidKey(m) })
         if (_defaultModel && _hasValidKey(_defaultModel) && _defaultModel.model) {
           _modelsFileCfg = {
             provider: _defaultModel.provider || '硅基流动',
@@ -34775,9 +36839,51 @@ export async function POST(request: Request) {
       }
     } catch (_e) { /* 忽略，沿用默认 */ }
 
-    // 🔥 2026-08-30：把用户 models.json 全量模型注入动态兜底池，作为静态池耗尽后的最后兜底
-    //   （付费稳定 deepseek-v4-flash + OpenRouter 免费档），根治智谱冷却/硅基401/Ollama停用 → 500。
-    try { setExtraFallbackPool(_allModels as any) } catch (_e) { /* 忽略 */ }
+    // 🔥 安全修复：本请求可用的模型池 = 管理员共享模型(isAdminDefault) + 本请求用户自己的模型。
+    //   他人私有模型一律不可见（此前全量读取 models.json，手动指定他人模型名即可白嫖其 Key）。
+    var _vipActor = await getRequestActor(request)
+    var _usableModels: any[] = (_allModels as any[]).filter(function (m: any) {
+      if (!m) return false
+      if (m.isAdminDefault === true) return true
+      return !!(_vipActor && _vipActor.userId && String(m.userId || '') === String(_vipActor.userId))
+    })
+
+    // 🔥 2026-10-21 统一模型路由（用户自有模型优先 + 角色级固定 + 越权防护）：
+    //   ① 用户显式指定（手动模式）→ 用他指定的模型
+    //   ② 注册用户配置了自己的平台+模型 → 全部内容生成都用他的平台与大模型（管理员系统模型让位）
+    //   ③ 否则 → 管理员（kevin）配置的系统默认模型，所有用户共享
+    var _route = resolveRoute({
+      userId: _vipActor && _vipActor.userId ? _vipActor.userId : null,
+      step: String(step || ''),
+      explicit: (llmConfig || null) as any,
+    })
+    console.log('[ai-generate] 路由决策 · 来源=' + _route.source + ' · 角色=' + _route.kind + ' · ' + _route.reason + ' · 兜底链=' + _route.chain.length + ' 个')
+
+    // 🔥 引擎内部角色槽位：正文 / 分镜节拍 / 审核 各固定一个模型（同角色不换人 → 文风稳定），
+    //   命中限流才由 llm.ts 兜底池换人（熔断冷却）。
+    var _uid = _vipActor && _vipActor.userId ? _vipActor.userId : null
+    var _engineRouting: any = {
+      source: _route.source,
+      kind: _route.kind,
+      userId: _uid,
+      primary: _route.primary,
+      chain: _route.chain,
+      prose: null,
+      structure: null,
+      judge: null,
+    }
+    try {
+      _engineRouting.prose = resolveRoute({ userId: _uid, step: 'content' }).primary
+      _engineRouting.structure = resolveRoute({ userId: _uid, step: 'keyPlots' }).primary
+      _engineRouting.judge = resolveRoute({ userId: _uid, step: 'compliance' }).primary
+    } catch (_e) { /* 忽略 */ }
+
+    // 🔥 兜底池越权修复：只允许【管理员共享模型 + 本请求用户自己的模型】，
+    //   他人私有模型一律不下发（此前把全量 models.json 注入兜底池，可白嫖他人 Key）。
+    //   排序按角色铺开：熔断换人时优先同角色模型（正文→正文模型，分镜→推理模型）。
+    try {
+      setExtraFallbackPool(_route.chain as any)
+    } catch (_e) { /* 忽略 */ }
 
     // 🔥 各环节最优模型映射（初始版本，基于模型名称/定位 + 实测迭代）。
     //   映射值 = models.json 中的 model 字段；找不到时回退到默认模型。
@@ -34805,97 +36911,111 @@ export async function POST(request: Request) {
     //    大结构化输出环节实测 >180s 超时，直接导致前端“调用大模型失败”。
     //    改用智谱 glm-4-flash（open.bigmodel.cn，实测 5.6s 返回、题材准确、无 thinking 污染）
     //    作为上述慢环节主模型；idea/powerSystem/正文等可快可稳的环节保留 GLM-4-9B-0414。
-    // 🔥 2026-08-29 模型探测后切换：sensenova-6.8-flash-lite 实测对多数 prompt 返回空(finish=length)、且单次 40~200s，
-    //   是"请求长时间 pending / 全流程 500"的元凶，降级为末位兜底。主模型改用实测【快且稳】的免费模型：
-    //   智谱 glm-4-flash（322ms、非推理、无 thinking 污染、题材准确）为全环节主模型；
-    //   单点失败/限流时由 callLLMWithFallback 自动跨到硅基流动 GLM-4-9B-0414(229ms) 等不同 provider 轮询，分摊 RPM。
-    // 🔥 2026-08-29 用户已配置 DeepSeek(deepseek-v4-flash-vision-exp) 为 default，实测文本 200/1.4s/finish=stop/中文干净，
-    //   全环节主模型切到它；单点失败由 callLLMWithFallback 跨到智谱 glm-4-flash / 硅基流动 GLM-4-9B 等轮询兜底。
-    // 🔥 2026-08-30 任务3：按可用模型重排主模型路由（原 deepseek-v4-flash-vision-exp 已从 models.json 移除→改 deepseek-v4-flash）。
-    //   主力：智谱 glm-4-flash（结构化/创意）+ DeepSeek-V4-Flash（世界观/正文/关系，文笔与长输出）。
-    //   其余已配置的 硅基流动10款 / 商汤 sensenova / OpenRouter 免费档 由 callLLMWithFallback 作为轮询兜底池自动分流。
-    // 🔥 2026-08-31 精简后：映射值必须精确等于 models.json 的 model 字段，否则 find 失败回落默认。
-    //   DeepSeek(deepseek-ai/DeepSeek-V4-Flash) 仅在 bookAnalysis（每部 1 次）作为主模型，
-    //   其余环节走智谱/OpenRouter 免费档，大幅减少 DeepSeek 调用、避免默认回落付费模型。
-    //   硅基流动 Key 失效的环节会在 callLLMWithFallback 中 401 后自动跨平台兜底，不阻断生成。
-    // 🔥 2026-09-01 全局提速：所有环节统一使用智谱 glm-4-flash（实测 ~5.6s，Key 有效、最稳最快）。
-    //   此前 worldbuilding/content/contractScore/imitate 用 glm-4.7-flash(~15.9s)、powerSystem/factions 用硅基 GLM-4-9B(401 兜底额外耗时)、
-    //   relationships 用硅基 GLM-Z1-9B(401+推理)、outline/chapters/coverPrompt 用 minimax:free(偏慢)、keyPlots 用 glm-z1-flash(推理)，
-    //   导致每个环节跳转均 >6s。现全部切到 glm-4-flash，单步耗时压到 ~5.6s。
-    //   质量优先级让位于速度（用户明确要求），如后续需恢复质量可逐环节回退 glm-4.7-flash。
+    // 🔥 2026-09-09 #204 按环节智能选型（全池 22 款真实探活后重写，用户要求"不要总默认 glm-4-flash"）：
+    //   探活实证（probe_model_pool_204）仅 3 款存活：
+    //     - sensenova-6.8-flash-lite（商汤，1306ms）：创意/写作质量最高；llm.ts #194 已禁 thinking +
+    //       finish=length 大 maxTokens 兜底重试，历史"返回空"风险已被双保险覆盖。
+    //     - glm-4-flash（智谱，552ms）：最快最稳、结构化 JSON 遵从好。
+    //     - glm-z1-flash（智谱，801ms）：带 think 推理备选。
+    //   其余全部失效：OpenRouter free 池 10 款（日限/转付费下架）、硅基流动 8 款（key 401）、
+    //   deepseek-v4-flash（随硅基 key 失效）、minimax-m3:free（下架 404）、glm-4.7-flash（间歇 429，靠 llm.ts 冷却表自动跳过）。
+    //   路由原则：创意/长文环节（人物/世界观/正文/润色等）sensenova 优先；结构化/高频 JSON 环节
+    //   （大纲/摘要/势力/章节名等）glm-4-flash 优先；glm-z1-flash 作第三备选。
+    //   失效模型保留在候选池尾部（key 充值/恢复后经 _pickStepModelId 自动复活），由冷却机制兜底。
+    var _SENSE = 'sensenova-6.8-flash-lite'
+    var _GLM4 = 'glm-4-flash'
+    var _Z1 = 'glm-z1-flash'
+    // 🔥 2026-10-25 T2（G-20）：高质量免费模型优先白名单
+    var _DOTS = 'dots-studio/dots-3-note-preview:free'
+    var _NEMO_ULTRA = 'nvidia/nemotron-3-ultra-550b-a55b:free'
+    var _NEMO_SUPER = 'nvidia/nemotron-3-super-120b-a12b:free'
+
+    // 🔥 2026-10-25 T2：探活否决——6 小时内实测失败的模型直接跳过，交给下一档（绝不静默降级到付费模型，
+    //   因为候选池与兜底池都只含免费/管理员共享模型）。长文环节额外否决 longFormOk===false 的模型。
+    var _proseSteps: Record<string, number> = { content: 1, imitate: 1, polish: 1 }
+    var _probeAllows = function (modelName: string, stepName: string): boolean {
+      try {
+        var _hit = loadRouterModels().find(function (m: any) { return m && String(m.model || '') === String(modelName) })
+        if (!_hit) return true
+        var _pr = readModelProbe(_hit as any)
+        if (!_pr) return true
+        var _age = Date.now() - Number(_pr.at || 0)
+        if (_pr.ok === false && _age < 6 * 3600 * 1000) return false
+        if (_pr.ok === true && (_pr as any).longFormOk === false && _proseSteps[String(stepName || '')]) return false
+        return true
+      } catch (_e) { return true }
+    }
+    var _DS4 = 'deepseek-ai/DeepSeek-V4-Flash'
+    var _DS41 = 'deepseek-ai/DeepSeek-V4.1-Flash'
+    var _DOUBAO = 'doubao'
     // ⚠️ 权威表（决定每个环节真实调用的模型）。第四轮教训：step-model-config.ts 的 QUALITY_FIRST/COST_FIRST 与 wizard 的 _STEP_MODEL_MAP_FRONTEND 仅用于 UI 推荐名展示，对真实速度/质量零影响，勿在那些表上改模型。
     const _STEP_MODEL_MAP: Record<string, string> = {
-      'bookAnalysis': 'glm-4-flash',
-      // 🔥 2026-09-02 限流热切换：智谱 glm-4.7-flash 晚高峰持续 429（1305/1302 交替，模型级访问量过大）。
-      //   实测 OpenRouter minimax-m3:free 可用且质量优（历史题材：主角名零漂移、系统流/签到流精神
-      //   历史化保留、零禁词泄漏），故 idea/worldbuilding/powerSystem/characters 临时切 minimax-m3:free。
-      //   智谱限流解除后（非高峰时段）可由管理员在 models.json 恢复 glm-4.7-flash 优先。
-      'idea': 'minimax/minimax-m3:free',
-      // 🔥 2026-09-02 用户实测反馈：世界观设定字段内容大量"截取"而非按小说设定原创设计、金手指未按
-      //    作品类型（系统流/签到流等多选）设计。glm-4-flash 指令遵从度低是根因 → 先切 glm-4.7-flash，
-      //    后因晚高峰限流(429)临时切 OpenRouter minimax-m3:free（已验证 200 + 流派精神保留）。
-      'worldbuilding': 'minimax/minimax-m3:free',
-      'powerSystem': 'minimax/minimax-m3:free',
-      'keyPlots': 'glm-4-flash',
-      // 🔥 2026-09-01 第15轮：用户硬性要求「首批 5 人 30 秒内」。glm-4-flash ~68 tok/s 为当前最稳模型。
-      //   Qwen3.5-4B/DeepSeek-V4-Flash/glm-4.7-flash 在硅基流动实测均超时或 500，故锁定 glm-4-flash，靠 token 预算压时。
-      // 🔥 2026-09-01 第20轮：glm-4-flash/GLM-4-9B 无视「禁止重名」+「用户人物原样纳入」指令——补充批次大量重名被按名去重丢弃、
-      //   用户自设计人物（《永历中兴》42 人技能卡）无法正确落位。用户明确要求「正确、稳定、无漂移、无污染」，
-      //   质量优先于速度 → 切智谱 glm-4.7-flash（免费池中指令遵从最强、200K 上下文；idea/worldbuilding 已实证稳定）。
-      //   配合第20轮「用户人物逐槽绑定 + 阵营职能定位」指令共同兜底；速度由并行单角色生成（5 路并发）补偿。
-      //   ⚠️ 2026-09-02：glm-4.7-flash 晚高峰限流(429) → 临时切 minimax/minimax-m3:free（与 idea 同步热切换）。
-      // 🔥 2026-09-04 主要人物设定切 deepseek-v4-flash：免费模型输出窗口小（glm-4-flash ~2K）导致角色卡 JSON 被 maxTokens 截断，
-      //   且指令遵从弱导致姓名漂移/事件当人名/女主误判。deepseek-v4-flash（默认付费、8K 输出、JSON 遵从强）一并解决截断与质量问题。
-      'characters': 'deepseek-ai/DeepSeek-V4-Flash',
-      'outline': 'glm-4-flash',
-      'chapters': 'glm-4-flash',
-      'factions': 'glm-4-flash',
-      'relationships': 'glm-4-flash',
-      'synopsis': 'glm-4-flash',
-      'content': 'glm-4-flash',
-      'imitate': 'glm-4-flash',
-      'polish': 'glm-4-flash',
-      'compliance': 'glm-4-flash',
-      'originality': 'glm-4-flash',
-      'contractScore': 'glm-4-flash',
-      'coverPrompt': 'glm-4-flash',
+      'bookAnalysis': _GLM4,
+      'idea': _SENSE,
+      'worldbuilding': _SENSE,
+      'powerSystem': _SENSE,
+      'keyPlots': _SENSE,
+      'characters': _SENSE,
+      'outline': _GLM4,
+      'chapters': _GLM4,
+      'factions': _GLM4,
+      'relationships': _SENSE,
+      'synopsis': _GLM4,
+      // 🔥 #209b 三次实测决策：content 回退 glm-4-flash 首选——sensenova 三跑三尾部退化（复读循环/JSON元数据/
+      //   词联想链，形态不同但 100% 复现），长文生成系统性不稳；正文是核心产出环节，稳定性优先。
+      //   sensenova 保留池第 2 位（含续写补全），glm-z1-flash 第三；#209b 出口三件套对任何模型兜底。
+      // 🔥 2026-10-16 修复：content 权威回退表同步改为 sensenova。与候选池排序一致——
+      //   glm-4-flash 实测 HTTP 500、glm-4.7-flash HTTP 429，均不可写整章；sensenova 同机 200 写 6274 汉字。
+      // ⚠️ 2026-10-17 修复：content 主模型回退到 glm-4-flash（免费）
+      //   DeepSeek-V4-Flash 是付费模型，管理员不调用
+      'content': _GLM4,
+      'imitate': _SENSE,
+      'polish': _SENSE,
+      'compliance': _GLM4,
+      'originality': _GLM4,
+      'contractScore': _GLM4,
+      'coverPrompt': _GLM4,
       'coverImage': 'Kwai-Kolors/Kolors',
-      'autoDesignProtagonist': 'glm-4-flash',
-      'generateName': 'glm-4-flash',
+      'autoDesignProtagonist': _SENSE,
+      'generateName': _GLM4,
     }
 
-    // 🔥🔥🔥 2026-09-02 每环节候选模型池（22 款大模型自由切换·核心机制）：
-    //   选模型时不再固定一个，而是按优先级遍历候选池，跳过【冷却中】(llm.ts 健康表)/
-    //   【无有效配置】的模型，取第一个健康可用者作为本环节主模型；
-    //   主模型仍失败时由 callLLMWithFallback 在 22 款全池中自动兜底。
-    //   质量敏感环节（idea/worldbuilding/powerSystem/characters）：minimax-m3 首选（实测
-    //   历史题材流派精神保留 + 主角名零漂移），智谱 glm-4.7-flash 限流时自动跳过。
-    //   高频环节（outline/factions/...）：glm-4-flash 最快最稳（实测 ~5.6s）。
-    //   推理环节（keyPlots/relationships）：glm-z1-flash 推理深度 + minimax-m2.7 备用。
-    //   候选池含 OpenRouter 全部 10 款免费 + 智谱 3 + DeepSeek + 商汤 + 硅基（排末位，Key 401 时自动冷却跳过）。
+    // 🔥🔥🔥 2026-09-09 #204 每环节候选模型池（按探活结果重排）：
+    //   _pickStepModelId 按优先级遍历候选池，跳过【冷却中】(llm.ts 健康表)/【无有效配置】的模型，
+    //   取第一个健康可用者作为本环节主模型；主模型仍失败时由 callLLMWithFallback 全池自动兜底。
+    //   池首只放 3 款探活存活模型（创意/长文环节 sensenova 优先、结构化/高频环节 glm-4-flash 优先、
+    //   glm-z1-flash 第三）；_POOL_TAIL 放失效/降级模型占兜底位（SiliconFlow key 充值或 OpenRouter
+    //   恢复后经 _pickStepModelId 自动复活；glm-4.7-flash 间歇 429 由冷却表自动跳过/恢复）。
+    var _POOL_TAIL: string[] = ['glm-4.7-flash', 'minimax/minimax-m3:free', 'THUDM/GLM-4-9B-0414', 'THUDM/GLM-Z1-9B-0414', 'Qwen/Qwen2.5-7B-Instruct', 'Qwen/Qwen3-8B', 'Qwen/Qwen3.5-4B', 'tencent/Hunyuan-MT-7B', 'minimax/minimax-m2.7:free', 'z-ai/glm-5.2:free', 'google/gemma-4-31b-it:free', 'google/gemma-4-26b-a4b-it:free', 'nvidia/nemotron-3-super-120b-a12b:free', 'nvidia/nemotron-3-ultra-550b-a55b:free', 'dots-studio/dots-3-note-preview:free', 'liquid/lfm-2.5-2.6b:free', 'cohere/north-mini-code:free']
     var _STEP_MODEL_POOL: Record<string, string[]> = {
-      'idea': ['minimax/minimax-m3:free', 'glm-4.7-flash', 'glm-4-flash', 'deepseek-v4-flash', 'minimax/minimax-m2.7:free', 'z-ai/glm-5.2:free', 'google/gemma-4-31b-it:free', 'nvidia/nemotron-3-super-120b-a12b:free', 'dots-studio/dots-3-note-preview:free', 'sensenova-6.8-flash-lite', 'Qwen/Qwen2.5-7B-Instruct', 'THUDM/GLM-4-9B-0414', 'THUDM/GLM-Z1-9B-0414', 'Qwen/Qwen3-8B', 'google/gemma-4-26b-a4b-it:free', 'liquid/lfm-2.5-2.6b:free', 'nvidia/nemotron-3-ultra-550b-a55b:free', 'cohere/north-mini-code:free', 'tencent/Hunyuan-MT-7B', 'Qwen/Qwen3.5-4B'],
-      'worldbuilding': ['minimax/minimax-m3:free', 'glm-4.7-flash', 'glm-4-flash', 'deepseek-v4-flash', 'minimax/minimax-m2.7:free', 'z-ai/glm-5.2:free', 'google/gemma-4-31b-it:free', 'nvidia/nemotron-3-super-120b-a12b:free', 'dots-studio/dots-3-note-preview:free', 'sensenova-6.8-flash-lite', 'Qwen/Qwen2.5-7B-Instruct', 'THUDM/GLM-4-9B-0414', 'THUDM/GLM-Z1-9B-0414', 'Qwen/Qwen3-8B', 'google/gemma-4-26b-a4b-it:free', 'liquid/lfm-2.5-2.6b:free', 'nvidia/nemotron-3-ultra-550b-a55b:free', 'cohere/north-mini-code:free', 'tencent/Hunyuan-MT-7B', 'Qwen/Qwen3.5-4B'],
-      'powerSystem': ['minimax/minimax-m3:free', 'glm-4.7-flash', 'glm-4-flash', 'deepseek-v4-flash', 'minimax/minimax-m2.7:free', 'z-ai/glm-5.2:free', 'google/gemma-4-31b-it:free', 'nvidia/nemotron-3-super-120b-a12b:free', 'dots-studio/dots-3-note-preview:free', 'sensenova-6.8-flash-lite', 'Qwen/Qwen2.5-7B-Instruct', 'THUDM/GLM-4-9B-0414', 'THUDM/GLM-Z1-9B-0414', 'Qwen/Qwen3-8B', 'google/gemma-4-26b-a4b-it:free', 'liquid/lfm-2.5-2.6b:free', 'nvidia/nemotron-3-ultra-550b-a55b:free', 'cohere/north-mini-code:free', 'tencent/Hunyuan-MT-7B', 'Qwen/Qwen3.5-4B'],
-      'characters': ['deepseek-ai/DeepSeek-V4-Flash', 'minimax/minimax-m3:free', 'glm-4.7-flash', 'glm-4-flash', 'minimax/minimax-m2.7:free', 'z-ai/glm-5.2:free', 'google/gemma-4-31b-it:free', 'nvidia/nemotron-3-super-120b-a12b:free', 'dots-studio/dots-3-note-preview:free', 'sensenova-6.8-flash-lite', 'Qwen/Qwen2.5-7B-Instruct', 'THUDM/GLM-4-9B-0414', 'THUDM/GLM-Z1-9B-0414', 'Qwen/Qwen3-8B', 'google/gemma-4-26b-a4b-it:free', 'liquid/lfm-2.5-2.6b:free', 'nvidia/nemotron-3-ultra-550b-a55b:free', 'cohere/north-mini-code:free', 'tencent/Hunyuan-MT-7B', 'Qwen/Qwen3.5-4B'],
-      'keyPlots': ['glm-z1-flash', 'glm-4-flash', 'minimax/minimax-m2.7:free', 'minimax/minimax-m3:free', 'glm-4.7-flash', 'deepseek-v4-flash', 'z-ai/glm-5.2:free', 'google/gemma-4-31b-it:free', 'nvidia/nemotron-3-super-120b-a12b:free', 'dots-studio/dots-3-note-preview:free', 'sensenova-6.8-flash-lite', 'Qwen/Qwen2.5-7B-Instruct', 'THUDM/GLM-4-9B-0414', 'THUDM/GLM-Z1-9B-0414', 'Qwen/Qwen3-8B', 'google/gemma-4-26b-a4b-it:free', 'liquid/lfm-2.5-2.6b:free', 'nvidia/nemotron-3-ultra-550b-a55b:free', 'cohere/north-mini-code:free', 'tencent/Hunyuan-MT-7B', 'Qwen/Qwen3.5-4B'],
-      'relationships': ['glm-z1-flash', 'glm-4-flash', 'minimax/minimax-m2.7:free', 'minimax/minimax-m3:free', 'glm-4.7-flash', 'deepseek-v4-flash', 'z-ai/glm-5.2:free', 'google/gemma-4-31b-it:free', 'nvidia/nemotron-3-super-120b-a12b:free', 'dots-studio/dots-3-note-preview:free', 'sensenova-6.8-flash-lite', 'Qwen/Qwen2.5-7B-Instruct', 'THUDM/GLM-4-9B-0414', 'THUDM/GLM-Z1-9B-0414', 'Qwen/Qwen3-8B', 'google/gemma-4-26b-a4b-it:free', 'liquid/lfm-2.5-2.6b:free', 'nvidia/nemotron-3-ultra-550b-a55b:free', 'cohere/north-mini-code:free', 'tencent/Hunyuan-MT-7B', 'Qwen/Qwen3.5-4B'],
-      // 高频速度环节：glm-4-flash 最快最稳，minimax-m3 次选，其余按序兜底
-      'outline': ['glm-4-flash', 'minimax/minimax-m3:free', 'glm-4.7-flash', 'deepseek-v4-flash', 'glm-z1-flash', 'minimax/minimax-m2.7:free', 'z-ai/glm-5.2:free', 'google/gemma-4-31b-it:free', 'nvidia/nemotron-3-super-120b-a12b:free', 'dots-studio/dots-3-note-preview:free', 'sensenova-6.8-flash-lite', 'Qwen/Qwen2.5-7B-Instruct', 'THUDM/GLM-4-9B-0414', 'THUDM/GLM-Z1-9B-0414', 'Qwen/Qwen3-8B', 'google/gemma-4-26b-a4b-it:free', 'liquid/lfm-2.5-2.6b:free', 'nvidia/nemotron-3-ultra-550b-a55b:free', 'cohere/north-mini-code:free', 'tencent/Hunyuan-MT-7B', 'Qwen/Qwen3.5-4B'],
-      'factions': ['glm-4-flash', 'minimax/minimax-m3:free', 'glm-4.7-flash', 'deepseek-v4-flash', 'glm-z1-flash', 'minimax/minimax-m2.7:free', 'z-ai/glm-5.2:free', 'google/gemma-4-31b-it:free', 'nvidia/nemotron-3-super-120b-a12b:free', 'dots-studio/dots-3-note-preview:free', 'sensenova-6.8-flash-lite', 'Qwen/Qwen2.5-7B-Instruct', 'THUDM/GLM-4-9B-0414', 'THUDM/GLM-Z1-9B-0414', 'Qwen/Qwen3-8B', 'google/gemma-4-26b-a4b-it:free', 'liquid/lfm-2.5-2.6b:free', 'nvidia/nemotron-3-ultra-550b-a55b:free', 'cohere/north-mini-code:free', 'tencent/Hunyuan-MT-7B', 'Qwen/Qwen3.5-4B'],
-      'synopsis': ['glm-4-flash', 'minimax/minimax-m3:free', 'glm-4.7-flash', 'deepseek-v4-flash', 'glm-z1-flash', 'minimax/minimax-m2.7:free', 'z-ai/glm-5.2:free', 'google/gemma-4-31b-it:free', 'nvidia/nemotron-3-super-120b-a12b:free', 'dots-studio/dots-3-note-preview:free', 'sensenova-6.8-flash-lite', 'Qwen/Qwen2.5-7B-Instruct', 'THUDM/GLM-4-9B-0414', 'THUDM/GLM-Z1-9B-0414', 'Qwen/Qwen3-8B', 'google/gemma-4-26b-a4b-it:free', 'liquid/lfm-2.5-2.6b:free', 'nvidia/nemotron-3-ultra-550b-a55b:free', 'cohere/north-mini-code:free', 'tencent/Hunyuan-MT-7B', 'Qwen/Qwen3.5-4B'],
-      'chapters': ['glm-4-flash', 'minimax/minimax-m3:free', 'glm-4.7-flash', 'deepseek-v4-flash', 'glm-z1-flash', 'minimax/minimax-m2.7:free', 'z-ai/glm-5.2:free', 'google/gemma-4-31b-it:free', 'nvidia/nemotron-3-super-120b-a12b:free', 'dots-studio/dots-3-note-preview:free', 'sensenova-6.8-flash-lite', 'Qwen/Qwen2.5-7B-Instruct', 'THUDM/GLM-4-9B-0414', 'THUDM/GLM-Z1-9B-0414', 'Qwen/Qwen3-8B', 'google/gemma-4-26b-a4b-it:free', 'liquid/lfm-2.5-2.6b:free', 'nvidia/nemotron-3-ultra-550b-a55b:free', 'cohere/north-mini-code:free', 'tencent/Hunyuan-MT-7B', 'Qwen/Qwen3.5-4B'],
-      'content': ['glm-4-flash', 'minimax/minimax-m3:free', 'glm-4.7-flash', 'deepseek-v4-flash', 'glm-z1-flash', 'minimax/minimax-m2.7:free', 'z-ai/glm-5.2:free', 'google/gemma-4-31b-it:free', 'nvidia/nemotron-3-super-120b-a12b:free', 'dots-studio/dots-3-note-preview:free', 'sensenova-6.8-flash-lite', 'Qwen/Qwen2.5-7B-Instruct', 'THUDM/GLM-4-9B-0414', 'THUDM/GLM-Z1-9B-0414', 'Qwen/Qwen3-8B', 'google/gemma-4-26b-a4b-it:free', 'liquid/lfm-2.5-2.6b:free', 'nvidia/nemotron-3-ultra-550b-a55b:free', 'cohere/north-mini-code:free', 'tencent/Hunyuan-MT-7B', 'Qwen/Qwen3.5-4B'],
-      'imitate': ['glm-4-flash', 'minimax/minimax-m3:free', 'glm-4.7-flash', 'deepseek-v4-flash', 'glm-z1-flash', 'minimax/minimax-m2.7:free', 'z-ai/glm-5.2:free', 'google/gemma-4-31b-it:free', 'nvidia/nemotron-3-super-120b-a12b:free', 'dots-studio/dots-3-note-preview:free', 'sensenova-6.8-flash-lite', 'Qwen/Qwen2.5-7B-Instruct', 'THUDM/GLM-4-9B-0414', 'THUDM/GLM-Z1-9B-0414', 'Qwen/Qwen3-8B', 'google/gemma-4-26b-a4b-it:free', 'liquid/lfm-2.5-2.6b:free', 'nvidia/nemotron-3-ultra-550b-a55b:free', 'cohere/north-mini-code:free', 'tencent/Hunyuan-MT-7B', 'Qwen/Qwen3.5-4B'],
-      'polish': ['glm-4-flash', 'minimax/minimax-m3:free', 'glm-4.7-flash', 'deepseek-v4-flash', 'glm-z1-flash', 'minimax/minimax-m2.7:free', 'z-ai/glm-5.2:free', 'google/gemma-4-31b-it:free', 'nvidia/nemotron-3-super-120b-a12b:free', 'dots-studio/dots-3-note-preview:free', 'sensenova-6.8-flash-lite', 'Qwen/Qwen2.5-7B-Instruct', 'THUDM/GLM-4-9B-0414', 'THUDM/GLM-Z1-9B-0414', 'Qwen/Qwen3-8B', 'google/gemma-4-26b-a4b-it:free', 'liquid/lfm-2.5-2.6b:free', 'nvidia/nemotron-3-ultra-550b-a55b:free', 'cohere/north-mini-code:free', 'tencent/Hunyuan-MT-7B', 'Qwen/Qwen3.5-4B'],
-      'compliance': ['glm-4-flash', 'minimax/minimax-m3:free', 'glm-4.7-flash', 'deepseek-v4-flash', 'liquid/lfm-2.5-2.6b:free', 'minimax/minimax-m2.7:free', 'z-ai/glm-5.2:free', 'google/gemma-4-31b-it:free', 'nvidia/nemotron-3-super-120b-a12b:free', 'dots-studio/dots-3-note-preview:free', 'sensenova-6.8-flash-lite', 'Qwen/Qwen2.5-7B-Instruct', 'THUDM/GLM-4-9B-0414', 'THUDM/GLM-Z1-9B-0414', 'Qwen/Qwen3-8B', 'google/gemma-4-26b-a4b-it:free', 'nvidia/nemotron-3-ultra-550b-a55b:free', 'cohere/north-mini-code:free', 'tencent/Hunyuan-MT-7B', 'Qwen/Qwen3.5-4B'],
-      'originality': ['glm-4-flash', 'minimax/minimax-m3:free', 'glm-4.7-flash', 'deepseek-v4-flash', 'liquid/lfm-2.5-2.6b:free', 'minimax/minimax-m2.7:free', 'z-ai/glm-5.2:free', 'google/gemma-4-31b-it:free', 'nvidia/nemotron-3-super-120b-a12b:free', 'dots-studio/dots-3-note-preview:free', 'sensenova-6.8-flash-lite', 'Qwen/Qwen2.5-7B-Instruct', 'THUDM/GLM-4-9B-0414', 'THUDM/GLM-Z1-9B-0414', 'Qwen/Qwen3-8B', 'google/gemma-4-26b-a4b-it:free', 'nvidia/nemotron-3-ultra-550b-a55b:free', 'cohere/north-mini-code:free', 'tencent/Hunyuan-MT-7B', 'Qwen/Qwen3.5-4B'],
-      'contractScore': ['glm-4-flash', 'minimax/minimax-m3:free', 'glm-4.7-flash', 'deepseek-v4-flash', 'glm-z1-flash', 'minimax/minimax-m2.7:free', 'z-ai/glm-5.2:free', 'google/gemma-4-31b-it:free', 'nvidia/nemotron-3-super-120b-a12b:free', 'dots-studio/dots-3-note-preview:free', 'sensenova-6.8-flash-lite', 'Qwen/Qwen2.5-7B-Instruct', 'THUDM/GLM-4-9B-0414', 'THUDM/GLM-Z1-9B-0414', 'Qwen/Qwen3-8B', 'google/gemma-4-26b-a4b-it:free', 'nvidia/nemotron-3-ultra-550b-a55b:free', 'cohere/north-mini-code:free', 'tencent/Hunyuan-MT-7B', 'Qwen/Qwen3.5-4B'],
-      'coverPrompt': ['glm-4-flash', 'minimax/minimax-m3:free', 'glm-4.7-flash', 'deepseek-v4-flash', 'glm-z1-flash', 'minimax/minimax-m2.7:free', 'z-ai/glm-5.2:free', 'google/gemma-4-31b-it:free', 'nvidia/nemotron-3-super-120b-a12b:free', 'dots-studio/dots-3-note-preview:free', 'sensenova-6.8-flash-lite', 'Qwen/Qwen2.5-7B-Instruct', 'THUDM/GLM-4-9B-0414', 'THUDM/GLM-Z1-9B-0414', 'Qwen/Qwen3-8B', 'google/gemma-4-26b-a4b-it:free', 'nvidia/nemotron-3-ultra-550b-a55b:free', 'cohere/north-mini-code:free', 'tencent/Hunyuan-MT-7B', 'Qwen/Qwen3.5-4B'],
-      'bookAnalysis': ['glm-4-flash', 'minimax/minimax-m3:free', 'glm-4.7-flash', 'deepseek-v4-flash', 'glm-z1-flash', 'minimax/minimax-m2.7:free', 'z-ai/glm-5.2:free', 'google/gemma-4-31b-it:free', 'nvidia/nemotron-3-super-120b-a12b:free', 'dots-studio/dots-3-note-preview:free', 'sensenova-6.8-flash-lite', 'Qwen/Qwen2.5-7B-Instruct', 'THUDM/GLM-4-9B-0414', 'THUDM/GLM-Z1-9B-0414', 'Qwen/Qwen3-8B', 'google/gemma-4-26b-a4b-it:free', 'nvidia/nemotron-3-ultra-550b-a55b:free', 'cohere/north-mini-code:free', 'tencent/Hunyuan-MT-7B', 'Qwen/Qwen3.5-4B'],
-      'autoDesignProtagonist': ['glm-4-flash', 'minimax/minimax-m3:free', 'glm-4.7-flash', 'deepseek-v4-flash', 'glm-z1-flash', 'minimax/minimax-m2.7:free', 'z-ai/glm-5.2:free', 'google/gemma-4-31b-it:free', 'nvidia/nemotron-3-super-120b-a12b:free', 'dots-studio/dots-3-note-preview:free', 'sensenova-6.8-flash-lite', 'Qwen/Qwen2.5-7B-Instruct', 'THUDM/GLM-4-9B-0414', 'THUDM/GLM-Z1-9B-0414', 'Qwen/Qwen3-8B', 'google/gemma-4-26b-a4b-it:free', 'nvidia/nemotron-3-ultra-550b-a55b:free', 'cohere/north-mini-code:free', 'tencent/Hunyuan-MT-7B', 'Qwen/Qwen3.5-4B'],
-      'generateName': ['glm-4-flash', 'minimax/minimax-m3:free', 'glm-4.7-flash', 'deepseek-v4-flash', 'glm-z1-flash', 'minimax/minimax-m2.7:free', 'z-ai/glm-5.2:free', 'google/gemma-4-31b-it:free', 'nvidia/nemotron-3-super-120b-a12b:free', 'dots-studio/dots-3-note-preview:free', 'sensenova-6.8-flash-lite', 'Qwen/Qwen2.5-7B-Instruct', 'THUDM/GLM-4-9B-0414', 'THUDM/GLM-Z1-9B-0414', 'Qwen/Qwen3-8B', 'google/gemma-4-26b-a4b-it:free', 'nvidia/nemotron-3-ultra-550b-a55b:free', 'cohere/north-mini-code:free', 'tencent/Hunyuan-MT-7B', 'Qwen/Qwen3.5-4B'],
+      'idea': [_SENSE, _GLM4, _Z1],
+      'worldbuilding': [_SENSE, _GLM4, _Z1],
+      'powerSystem': [_SENSE, _GLM4, _Z1],
+      'characters': [_SENSE, _GLM4, _Z1],
+      'keyPlots': [_SENSE, _GLM4, _Z1],
+      'relationships': [_SENSE, _GLM4, _Z1],
+      // 🔥 2026-10-16 修复：content 首选改为 sensenova。原 [_GLM4,_SENSE,_Z1] 把唯一可写整章的模型排在第2位——
+      //   实测 glm-4-flash HTTP 500、glm-4.7-flash HTTP 429，两条失败链耗尽后正文恒短（探针 784/142 汉字）；
+      //   sensenova-6.8-flash-lite 同机 HTTP 200 一次写出 6274 汉字。稳定性由 #209b 出口三件套 + 续写补全兜底。
+      // 🔥 2026-10-17 升级：content 候选池首位改为 DeepSeek-V4-Flash
+      // 🔥 2026-10-25 T2（G-20）：正文候选池＝高质量免费优先（dots-3-note → nemotron-ultra-550b → 商汤 sensenova），
+      //   glm-4-flash 作兜底（稳定但套话多，不占主位）。实测探活失败者由 _probeAllows 自动跳过（见第 5 节复测）。
+      'content': [_DOTS, _NEMO_ULTRA, _SENSE, _GLM4, _Z1],
+      'imitate': [_DOTS, _NEMO_ULTRA, _SENSE, _GLM4, _Z1],
+      'polish': [_SENSE, _DOTS, _GLM4, _Z1],
+      'autoDesignProtagonist': [_SENSE, _GLM4, _Z1],
+      'outline': [_GLM4, _SENSE, _Z1],
+      'synopsis': [_GLM4, _SENSE, _Z1],
+      'chapters': [_GLM4, _SENSE, _Z1],
+      'factions': [_GLM4, _SENSE, _Z1],
+      'bookAnalysis': [_GLM4, _SENSE, _Z1],
+      'compliance': [_NEMO_ULTRA, _DOTS, _GLM4, _SENSE, _Z1],
+      'originality': [_GLM4, _SENSE, _Z1],
+      'contractScore': [_NEMO_ULTRA, _DOTS, _GLM4, _SENSE, _Z1],
+      'coverPrompt': [_GLM4, _SENSE, _Z1],
+      'generateName': [_GLM4, _SENSE, _Z1],
     }
+    Object.keys(_STEP_MODEL_POOL).forEach(function (_pk: string) { _STEP_MODEL_POOL[_pk] = _STEP_MODEL_POOL[_pk].concat(_POOL_TAIL) })
 
     // 🔥🔥🔥 2026-09-02 每环节动态选优：遍历候选池，跳过冷却中/无有效配置的模型，
     //   取第一个健康可用者；全部不可用则回退权威表首选（强行走一次，由 llm.ts 兜底链接管）。
@@ -34906,6 +37026,8 @@ export async function POST(request: Request) {
           var _mid = _pool[_pi]
           if (!_mid) continue
           if (!isLLMModelHealthy(_mid)) continue
+          // 🔥 2026-10-25 T2（G-20）：探活否决（6 小时内实测失败 / 长文环节不能长文者跳过）
+          if (!_probeAllows(_mid, String(stepName || ''))) continue
           var _hasCfg = _allModels.some(function (m: any) { return m && m.model === _mid && m.apiKey && !String(m.apiKey).includes('*') })
           if (_hasCfg) return _mid
         }
@@ -34915,11 +37037,32 @@ export async function POST(request: Request) {
     }
 
     // 🔥 2026-08-21：默认按环节自动选最优模型；用户显式 manualModel=true 且传入有效 llmConfig 时才使用手动备用模型。
-    var _isManualModel = manualModel === true && llmConfig && llmConfig.model && llmConfig.apiKey
+    // 🔥 2026-09-07 QA-3 修复：旧判定要求 body.manualModel===true，但前端从未发送该字段（仅 useState 未入请求体），
+    //   导致用户切换模型后 llmConfig 被静默忽略、重新生成永远走推荐池（「换模型无变化」实锤根因）。
+    //   前端 getStepLlmConfig 只在「手动模式+配置完整」时返回非 null（否则 null），因此「传入有效 llmConfig」
+    //   本身就是手动模式的精确语义 —— 改为以 llmConfig 有效性判定，向后兼容（不传即自动选模）。
+    var _isManualModel = _route.source === 'explicit'
+    // 🔥 2026-10-21：用户自有模型优先——注册用户配置了自己的平台+模型后，
+    //   全部内容生成都用他的平台与大模型（管理员系统默认模型让位）。
+    if (_route.source === 'user-own' && _route.primary) {
+      effectiveLlmConfig = {
+        provider: _route.primary.provider,
+        apiKey: _route.primary.apiKey,
+        baseUrl: _route.primary.baseUrl,
+        model: _route.primary.model,
+      }
+      console.log('[ai-generate] 使用用户自有模型: step=' + step + ', model=' + _route.primary.model + ', provider=' + _route.primary.provider)
+    } else {
     // 🔥 2026-09-02 动态选优：候选池中挑健康可用模型（跳过冷却中/无配置），替代原来的单模型固定映射
     var _stepModelId = _pickStepModelId(String(step) || '')
-    if (!_isManualModel && _stepModelId && _allModels.length > 0) {
-      const _target = _allModels.find(function (m: any) { return m && m.model === _stepModelId && m.apiKey && !String(m.apiKey).includes('*') })
+    try {
+      console.log('[route][free-first] ' + JSON.stringify({
+        content: FREE_FIRST.prose, judge: FREE_FIRST.judge, structure: FREE_FIRST.structure,
+        picked: _stepModelId, fallback: FALLBACK_MODEL,
+      }))
+    } catch (_e) { /* 诊断日志失败不影响主链路 */ }
+    if (!_isManualModel && _stepModelId && _usableModels.length > 0) {
+      const _target = _usableModels.find(function (m: any) { return m && m.model === _stepModelId && m.apiKey && !String(m.apiKey).includes('*') && m.isPaid !== true })
       if (_target) {
         effectiveLlmConfig = {
           provider: _target.provider || '硅基流动',
@@ -34931,24 +37074,25 @@ export async function POST(request: Request) {
       } else {
         console.warn('[ai-generate] 未在 models.json 找到环节模型: step=' + step + ', model=' + _stepModelId + '，沿用默认')
       }
-    } else if (_isManualModel && _allModels.length > 0) {
-      // 用户手动指定模型：在 models.json 中查找匹配且含有效 key 的配置
-      const _manualTarget = _allModels.find(function (m: any) { return m && m.model === llmConfig.model && m.apiKey && !String(m.apiKey).includes('*') })
+    } else if (_isManualModel && _usableModels.length > 0) {
+      // 用户手动指定模型：仅在「管理员共享 + 本人模型」范围内查找匹配且含有效 key 的配置
+      const _manualTarget = _usableModels.find(function (m: any) { return m && m.model === llmConfig!.model && m.apiKey && !String(m.apiKey).includes('*') && m.isPaid !== true })
       if (_manualTarget) {
         effectiveLlmConfig = {
-          provider: _manualTarget.provider || llmConfig.provider || '硅基流动',
+          provider: _manualTarget.provider || llmConfig!.provider || '硅基流动',
           apiKey: String(_manualTarget.apiKey).replace(/[`'"]/g, '').trim(),
-          baseUrl: String(_manualTarget.baseUrl || llmConfig.baseUrl || '').replace(/[`'"]/g, '').trim(),
+          baseUrl: String(_manualTarget.baseUrl || llmConfig!.baseUrl || '').replace(/[`'"]/g, '').trim(),
           model: _manualTarget.model
         }
         console.log('[ai-generate] 使用手动选择模型: step=' + step + ', model=' + _manualTarget.model + ', provider=' + _manualTarget.provider)
       } else {
-        console.warn('[ai-generate] 手动模型在 models.json 中未找到或没有有效 API Key，回退到环节默认: step=' + step + ', model=' + llmConfig.model)
+        console.warn('[ai-generate] 手动模型在可用模型中未找到或没有有效 API Key，回退到环节默认: step=' + step + ', model=' + llmConfig!.model)
       }
+    }
     }
 
     if (step !== 'imitateSearch' && step !== 'bookAnalysis' && step !== 'typeDetail' && step !== 'generateName' && step !== 'autoDesignProtagonist') {
-      const vipCheck = await checkVipPermission(novelId)
+      const vipCheck = await checkVipPermission(_vipActor, novelId)
       if (!vipCheck.allowed) {
         console.log('[ai-generate] VIP权限检查失败:', vipCheck.message)
         return NextResponse.json({
@@ -34966,9 +37110,29 @@ export async function POST(request: Request) {
     //    现改为始终注入 buildNovelThemeGuard，彻底解决"输出与主题不相关/跑题串味"。
     var _novelGuard = buildNovelThemeGuard(genre, keywords, bookAnalysisJson, previousData, step)
     var _imitateConstraint = getImitateConstraint((previousData as any)?.imitate, step)
-    setImitateGuard(_imitateConstraint
-      ? _novelGuard + '\n\n' + _imitateConstraint
-      : _novelGuard)
+    // 🔥🔥🔥 2026-11-01 新增（P0-1·契约层）：把已定设定固化成正向「设定契约」，置于所有约束的最前面。
+    //   根因：11 个环节各自拼上下文，人物名/金手指名/时代约束全靠提示词"求你照做"，出口零校验；
+    //        实测正文出现人物表外角色「赵全」42 次、金手指被写成"脑中一册书"，全程无一门禁拦截。
+    //   契约优先级高于 themeGuard（冲突时以契约为准）：因为 themeGuard 只说"写历史文"，
+    //   契约才说"主角叫朱由榔、人物只有这 43 人、金手指叫史鉴先知且不得具象化"。
+    var _canonContract: any = null
+    var _canonText = ''
+    try {
+      _canonContract = buildCanonContract(previousData)
+      _canonText = renderCanonContract(_canonContract)
+      if (_canonText) {
+        console.log('[canon] 契约构建成功：主角=' + (_canonContract.protagonist && _canonContract.protagonist.name)
+          + ' 金手指=' + (_canonContract.goldenFinger && _canonContract.goldenFinger.name)
+          + ' 人物表=' + ((_canonContract.cast || []).length) + '人'
+          + ' 势力=' + ((_canonContract.factions || []).length) + ' → 注入文本 ' + _canonText.length + ' 字')
+      }
+    } catch (_canonE) {
+      console.warn('[canon] 契约构建失败（不影响主链路）:', _canonE)
+    }
+    setImitateGuard(
+      (_canonText ? _canonText + '\n\n' : '')
+      + (_imitateConstraint ? _novelGuard + '\n\n' + _imitateConstraint : _novelGuard)
+    )
 
     // 🔥 规划步质检重试：生成后跑 validateStage，若必需元素缺失则带纠正指令重试一次（仅规划步 JSON 步；content 自带重试机制，不在此循环）。happy path 无硬伤时立即 break，零额外 LLM 调用。
     var result: any
@@ -34989,22 +37153,109 @@ export async function POST(request: Request) {
         { nocache: body.nocache === true },
         regeneratePrompt,
         activeStyle,
-        bestsellerPrefs
+        bestsellerPrefs,
+        body.targetWordCount,
+        body.style,
+        body.newCharacters,
+        (body as any).platformStandards,
+        _engineRouting,
+        frozen
       )
+      // 🔒 字段级重生成：模型未返回目标字段 → 200 + success:false，让前端保留原值
+      if (field && result && typeof result === 'object' && (result as any).__fieldRegenAbort) {
+        return NextResponse.json({ success: false, error: '字段重生成未返回目标字段，已放弃覆盖' })
+      }
+      // 字段级请求不做整步质检重试，避免整步校验/兜底污染单字段结果
+      if (field) break
       // 仅规划步做质检重试；content/其余步不在此重试（content 已有自身重试）
       if (_JSON_STEPS.indexOf(step) < 0) break
       var _vsRetry = validateStage(step, result, genre, previousData)
       var _hardIssues = (_vsRetry.issues || []).filter(function (i: string) { return /缺失|反派<|配角<|缺 /.test(i) })
       var _contamination = _vsRetry.contamination || 0
-      // 🔥 重试触发条件扩展：① 必需元素缺失（硬伤）② 题材严重串味（原始跨题材词≥5，说明模型根本没遵循题材约束，确定性剥离救不回上下文）
-      var _shouldRetry = (_hardIssues.length > 0) || (_contamination >= 5)
+      // 🔥 #176 朝代串线检测（历史题材·无用户设计）：本作时代不含南明词，结果却混入南明人物/朝代词 → 视为严重串线
+      var _dynastyHit176 = 0
+      var _eraText176 = ''
+      try {
+        var _pd176: any = (previousData as any) || {}
+        var _userDes176 = String(_pd176.detailedDesignInput || '')
+        _eraText176 = String((_pd176.worldbuilding && _pd176.worldbuilding.era) || '')
+        var _eraHay176 = _eraText176 + ' ' + String((_pd176.idea && (_pd176.idea.tagline || _pd176.idea.coreIdea || _pd176.idea.theme)) || '') + ' ' + String(input && typeof input === 'string' ? input : '')
+        var _isHist176 = /历史|权谋|朝堂|种田|朝代|王朝/.test(String(genre || ''))
+        if (_isHist176 && !_userDes176 && !/南明|永历|隆武|弘光|绍武|明末|崇祯|朱由榔/.test(_eraHay176)) {
+          var _nmMarks176 = ['丁魁楚','瞿式耜','李定国','郑成功','沐天波','朱由榔','孙可望','白文选','陈邦彦','张煌言','吴三桂','李成栋','陈子壮','刘文秀','艾能奇','李来亨','多尔衮','孔有德','尚可喜','耿仲明','李自成','张献忠','史可法','黄得功','高杰','刘泽清','何腾蛟','堵胤锡','马士英','阮大铖','左良玉','鳌拜','皇太极','努尔哈赤','多铎','豪格','济尔哈朗','陈圆圆','柳如是','张同敞','焦琏']
+          var _resTxt176 = JSON.stringify(result)
+          for (var _mi176 = 0; _mi176 < _nmMarks176.length; _mi176++) { if (_resTxt176.indexOf(_nmMarks176[_mi176]) >= 0) _dynastyHit176++ }
+          _dynastyHit176 += (_resTxt176.match(/南明|永历|弘光|隆武|绍武|清军入关|八旗|后金|大西军|闯军|东林党/g) || []).length
+        }
+      } catch (_e176) { /* 检测失败不影响主流程 */ }
+      // 🔥 重试触发条件扩展：① 必需元素缺失（硬伤）② 题材严重串味（原始跨题材词≥5，说明模型根本没遵循题材约束，确定性剥离救不回上下文）③ 朝代串线（#176，≥3 处南明人物/朝代词混入）
+      // 🔥 2026-11-07 修复（线上「人物设定耗时超限」根因）：characters 步不因「串味」整步重生成。
+      //   实测：都市商业题材 16 人名册被通用词表命中 118 处（误伤为主），触发 planRetry 整步重跑：
+      //   单轮 ~12 分钟 → 双轮 ~24 分钟，远超前端 900s 预算，用户侧表现为「生成失败/闪退」。
+      //   残留跨题材词已由 validateStage 内 stripTermsDeep 确定性剥离（日志可见 FIX 残留…已确定性剥离），无需整步重来。
+      var _contamTrigger = (_contamination >= 5) && step !== 'characters'
+      var _shouldRetry = (_hardIssues.length > 0) || _contamTrigger || (_dynastyHit176 >= 3)
       if (!_shouldRetry) { if (_vsRetry.value && _vsRetry.value !== result) result = _vsRetry.value; break }
       // 构造针对性纠正指令（带具体缺陷，让模型第二轮能精准修正）
       var _correctiveMsgs = []
       if (_hardIssues.length > 0) _correctiveMsgs.push('补齐以下必需元素：' + _hardIssues.join('；'))
-      if (_contamination >= 5) _correctiveMsgs.push('检测到严重题材串味（' + _contamination + '处跨题材词汇），你必须严格遵循指定题材「' + (genre || '') + '」，禁止出现任何修仙/玄幻/洪荒/西幻专属词汇（如灵气/金丹/元婴/宗门/仙尊/盘古等），请重新生成')
+      if (_contamTrigger) _correctiveMsgs.push('检测到严重题材串味（' + _contamination + '处跨题材词汇），你必须严格遵循指定题材「' + (genre || '') + '」，禁止出现任何修仙/玄幻/洪荒/西幻专属词汇（如灵气/金丹/元婴/宗门/仙尊/盘古等），请重新生成')
+      if (_dynastyHit176 >= 3) _correctiveMsgs.push('🔥 检测到朝代串线（' + _dynastyHit176 + '处南明/明末人物或事件混入）。本作时代背景是【' + _eraText176.slice(0, 60) + '】，严禁出现任何与本作时代无关的朝代、真实历史人物、地名与事件（如南明/永历/清军/八旗/吴三桂/瞿式耜/郑成功/李定国/崇祯等），所有角色、势力、关系、剧情必须严格贴合本作设定朝代原创设计，请重新生成')
       _retryInput = (typeof _retryInput === 'string' ? _retryInput : (input ? JSON.stringify(input) : '')) + '\n【上一轮质检未通过：' + _correctiveMsgs.join('；') + '】'
       console.log('[planRetry] step=' + step + ' 第' + _planAttempt + '次生成未通过质检(硬伤=' + _hardIssues.length + ' 串味=' + _contamination + ')，将带纠正指令重试')
+    }
+
+    // 🔥🔥🔥 2026-11-01 新增（P0-1·契约出口核对）：规划步/正文步出口做确定性一致性核对。
+    //   与既有 validateStage 的分工：validateStage 查「结构齐不齐」（字段非空、反派≥2），
+    //   本核对查「内容对不对」（人物是否在册、金手指有没有被写成面板、敌称是否合规、时序是否越界）。
+    //   只记日志 + 随响应回传，**不阻断主链路**（避免把合理的路人甲当违规误杀，那比漂移更糟）。
+    var _canonReport: any = null
+    if (_canonContract && result) {
+      try {
+        var _canonScope = (step === 'content' || step === 'polish' || step === 'imitate') ? 'content' : 'plan'
+        var _canonBody = typeof result === 'string' ? result : JSON.stringify(result)
+        _canonReport = verifyCanonContract(_canonBody, _canonContract, { scope: _canonScope })
+        if (_canonReport && _canonReport.violations && _canonReport.violations.length) {
+          var _s1c = _canonReport.violations.filter(function (v: any) { return v.severity === 'S1' })
+          console.warn('[canon] step=' + step + ' 契约核对：违规 ' + _canonReport.violations.length + ' 项（S1=' + _s1c.length + '）'
+            + (_s1c.length ? ' 例: ' + _s1c.slice(0, 3).map(function (v: any) { return v.code + ':' + String(v.evidence || '').slice(0, 30) }).join(' | ') : ''))
+        } else {
+          console.log('[canon] step=' + step + ' 契约核对通过（0 违规）')
+        }
+      } catch (_canonVE) { /* 校验失败不影响主链路 */ }
+    }
+
+    // 🔥 #176b relationships 出口过滤：关系两端必须是本作已确定角色，剔除 LLM 凭空捏造的串线人物行
+    //   （实测《上古巫神》：clean 角色名单外凭空出现 商启↔郑成功/岳峥↔吴三桂/岳峥↔瞿式耜 等南明串线关系）
+    if (step === 'relationships' && result && typeof result === 'object' && Array.isArray((result as any).relationships)) {
+      try {
+        var _pd176b: any = (previousData as any) || {}
+        var _known176b: string[] = []
+        var _pc176b = _pd176b.characters || {}
+        if (_pc176b.protagonist && _pc176b.protagonist.name) _known176b.push(String(_pc176b.protagonist.name))
+        if (_pd176b.protagonistSettings && _pd176b.protagonistSettings.name) _known176b.push(String(_pd176b.protagonistSettings.name))
+        if (Array.isArray(_pc176b.femaleLeads)) _pc176b.femaleLeads.forEach(function (c: any) { if (c && c.name) _known176b.push(String(c.name)) })
+        if (_pc176b.femaleLead && _pc176b.femaleLead.name) _known176b.push(String(_pc176b.femaleLead.name))
+        if (Array.isArray(_pc176b.antagonists)) _pc176b.antagonists.forEach(function (c: any) { if (c && c.name) _known176b.push(String(c.name)) })
+        if (_pc176b.antagonist && _pc176b.antagonist.name) _known176b.push(String(_pc176b.antagonist.name))
+        if (Array.isArray(_pc176b.supporting)) _pc176b.supporting.forEach(function (c: any) { if (c && c.name) _known176b.push(String(c.name)) })
+        if (_known176b.length >= 3) {
+          var _before176b = (result as any).relationships.length
+          var _dropped176b: string[] = []
+          ;(result as any).relationships = (result as any).relationships.filter(function (r: any) {
+            if (!r) return false
+            var _from176b = String((r && (r.from || r.fromChar || r.char1)) || '').trim()
+            var _to176b = String((r && (r.to || r.toChar || r.char2)) || '').trim()
+            if (!_from176b || !_to176b) return false
+            var _okFrom = _known176b.indexOf(_from176b) >= 0
+            var _okTo = _known176b.indexOf(_to176b) >= 0
+            if (_okFrom && _okTo) return true
+            _dropped176b.push(_from176b + '→' + _to176b)
+            return false
+          })
+          if (_dropped176b.length) console.log('[relationships] 🔥 #176b 未知角色关系剔除 ' + _dropped176b.length + '/' + _before176b + ' 例: ' + _dropped176b.slice(0, 10).join('、'))
+        }
+      } catch (_e176b) { /* 过滤失败不影响主流程 */ }
     }
 
     // 🔥🔥 2026-09-05 势力步骤统一规范化（挂在主流程出口，覆盖生成/兜底/抢救三条返回路径）：
@@ -35021,6 +37272,46 @@ export async function POST(request: Request) {
         })
         ;(result as any).factions = _facNorm.factions
         console.log('[factions] 🔥 规范化：' + summarizeFactionReport(_facNorm.report) + '（势力数 ' + _facNorm.report.before + '→' + _facNorm.report.after + '）')
+        // 🔥🔥🔥 2026-09-08 #175b 主结果南明防串线：主 LLM 亦会把「历史题材」先验成南明（实测《上古巫神》
+        //   夏商题材主结果 13/13 势力全是 永历朝廷/清廷八旗/郑氏海上集团，glm-z1-flash/glm-4-flash 均可能发生）。
+        //   无用户设计且本作时代/主题无南明词时：剔除含南明真实人物名或南明朝代词的势力，再以中性历史模板补齐 ≥8。
+        var _facUser175b = String(((previousData as any) && (previousData as any).detailedDesignInput) || '')
+        var _pd175b: any = (previousData as any) || {}
+        var _facEraHay175b = String((_pd175b.worldbuilding && _pd175b.worldbuilding.era) || '') + ' ' + String((_pd175b.idea && (_pd175b.idea.tagline || _pd175b.idea.coreIdea)) || '') + ' ' + String(genre || '')
+        var _isNmNovel175b = /南明|永历|隆武|弘光|绍武|明末|崇祯|朱由榔/.test(_facUser175b + ' ' + _facEraHay175b)
+        if (!_facUser175b && !_isNmNovel175b && Array.isArray((result as any).factions)) {
+          var _nmMarks175b = ['丁魁楚','瞿式耜','李定国','郑成功','沐天波','朱由榔','孙可望','白文选','陈邦彦','张煌言','吴三桂','李成栋','陈子壮','刘文秀','艾能奇','李来亨','王夫之','福临','顺治','多尔衮','孔有德','尚可喜','耿仲明','李自成','张献忠','史可法','黄得功','高杰','刘泽清','何腾蛟','堵胤锡','马士英','阮大铖','左良玉','鳌拜','皇太极','努尔哈赤','多铎','豪格','济尔哈朗','陈圆圆','柳如是','张同敞','焦琏']
+          var _before175b = (result as any).factions.length
+          var _kept175b: any[] = []
+          for (var _fi175b = 0; _fi175b < _before175b; _fi175b++) {
+            var _f175b = (result as any).factions[_fi175b]
+            if (!_f175b) continue
+            var _h175b = String(_f175b.name || '') + String(_f175b.leader || '') + String(_f175b.description || '') + String(_f175b.goal || '') + String(_f175b.fate || '')
+            var _bad175b = /南明|永历|弘光|隆武|清廷|八旗|后金|大西军|闯军|东林党/.test(_h175b)
+            if (!_bad175b) { for (var _mi175b = 0; _mi175b < _nmMarks175b.length; _mi175b++) { if (_h175b.indexOf(_nmMarks175b[_mi175b]) >= 0) { _bad175b = true; break } } }
+            if (!_bad175b) _kept175b.push(_f175b)
+          }
+          if (_kept175b.length < _before175b) console.log('[factions] 🔥 #175b 主结果南明串线势力剔除 ' + (_before175b - _kept175b.length) + '/' + _before175b + '（本作时代非南明）')
+          // 中性补齐到 ≥8（与生成路径的题材模板同源，贴合本作主角）
+          var _facProto175b = String((_pd175b.protagonistSettings && _pd175b.protagonistSettings.name) || (_pd175b.idea && _pd175b.idea.protagonistName) || '主角')
+          var _neutral175b = [
+            { name: '朝廷势力', leader: _facProto175b, camp: '己方', type: '朝廷/官府', description: '以' + _facProto175b + '为核心的朝廷中枢，掌控朝政大权与正统名分，内部存在改革派与守旧派之争。', goal: '巩固王权，对抗外敌与内患', strength: '掌控朝政与军队，但派系林立' },
+            { name: '外敌势力', leader: '外族枭雄', camp: '敌方', type: '游牧/外敌', description: '雄踞四方边陲的强敌，兵强马壮，屡次进犯，是全书最大的外部威胁。', goal: '入主中原，吞并本朝', strength: '骑兵精锐，善野战' },
+            { name: '藩镇/权臣集团', leader: '权臣', camp: '敌方', type: '藩镇/权臣', description: '手握重兵或把持朝政的实力派，表面臣服实则心怀异志，朝堂上处处掣肘主角。', goal: '扩张权柄，架空王权', strength: '兵权在手，党羽众多' },
+            { name: '神权/祭司集团', leader: '大祭司', camp: '中立', type: '神权势力', description: '掌握祭祀与天命解释权的神职阶层，与王权既共生又制衡，关键时刻足以倾覆朝局。', goal: '维系神权地位，干预王权更迭', strength: '掌握天命话语与民心' },
+            { name: '地方方国/诸侯', leader: '方国君主', camp: '中立', type: '方国势力', description: '四方方国与诸侯邦国，或臣服或叛离，是主角纵横捭阖的重要棋子。', goal: '保全邦国，伺机而动', strength: '地利人和，物产丰饶' },
+            { name: '隐世势力', leader: '隐世高人', camp: '中立', type: '神秘势力', description: '隐藏在历史暗处的情报组织或隐秘世家，掌握着不为人知的秘密与力量。', goal: '暗中操控局势', strength: '神秘莫测，情报灵通' },
+            { name: '民间义军', leader: '义军首领', camp: '友方', type: '义军势力', description: '不堪重敛而揭竿的民间力量，与主角由摩擦到结盟，共同对抗暴政。', goal: '求生存，争一线生机', strength: '民心所向，悍不畏死' },
+            { name: '商旅行帮', leader: '商帮领袖', camp: '中立', type: '商帮势力', description: '贯通四方的商队与行帮，掌控钱粮货殖，谁占上风便倾向谁。', goal: '逐利避险，左右逢源', strength: '财力雄厚，耳目遍布' },
+          ]
+          var _haveNames175b: Record<string, boolean> = {}
+          _kept175b.forEach(function (f: any) { if (f && f.name) _haveNames175b[String(f.name)] = true })
+          for (var _ni175b = 0; _ni175b < _neutral175b.length && _kept175b.length < 8; _ni175b++) {
+            var _nf175b = _neutral175b[_ni175b]
+            if (!_haveNames175b[_nf175b.name]) { _haveNames175b[_nf175b.name] = true; _kept175b.push(_nf175b) }
+          }
+          ;(result as any).factions = _kept175b
+        }
       } catch (_facNormE) { /* 规范化失败不影响主流程 */ }
     }
 
@@ -35030,6 +37321,55 @@ export async function POST(request: Request) {
     // 跳过字段：title（书名/章节标题用户原创）、protagonistName（人名）、volumeName（卷名）、name（人名/势力名等专有名词）
     var _stepsToClean = ['idea', 'worldbuilding', 'powerSystem', 'characters', 'factions', 'relationships', 'synopsis', 'outline', 'keyPlots', 'chapters']
     if (result && _stepsToClean.indexOf(step) >= 0) {
+      // 🔥 2026-09-10 #220：idea 环节单值字段扁平化兜底。
+      //   根因：LLM 偶发把 targetAudience 等单值字段直接返回成对象（如 {coreConflict, protagonistName}），
+      //   后续清洗只递归改字符串、不扁平化对象，导致该字段以 JSON 对象形态存入并在前端反复出现 "[object Object]"/JSON。
+      //   修复：idea 步骤在清洗前把全部单值字段强制规范为纯文本字符串，杜绝对象/数组形态下钻到存储层。
+      if (step === 'idea' && result && typeof result === 'object') {
+        try {
+          (function () {
+            var _ideaSingle = ['tagline', 'coreConflict', 'protagonistName', 'targetAudience', 'coreSellingPoint', 'writingStyle', 'emotionalTone', 'commercialPositioning', 'theme', 'subject', 'slogan', 'shuangPattern', 'hook', 'goldenQuote']
+            var _flat: (v: any) => string = function (v: any): string {
+              if (v === null || v === undefined) return ''
+              if (typeof v === 'string') return v
+              if (typeof v === 'number' || typeof v === 'boolean') return String(v)
+              if (Array.isArray(v)) return v.map(_flat).filter(Boolean).join('；')
+              if (typeof v === 'object') {
+                var _parts: string[] = []
+                Object.keys(v).forEach(function (k: string) {
+                  var _val: any = (v as any)[k]
+                  if (_val === null || _val === undefined) return
+                  if (typeof _val === 'string' || typeof _val === 'number' || typeof _val === 'boolean') _parts.push(String(_val))
+                })
+                if (_parts.length) return _parts.join('；')
+                try { return JSON.stringify(v) } catch (_e2) { return '' }
+              }
+              return ''
+            }
+            var _flattenedCount = 0
+            _ideaSingle.forEach(function (k: string) {
+              var _raw: any = (result as any)[k]
+              if (_raw !== undefined && _raw !== null && typeof _raw !== 'string') {
+                (result as any)[k] = _flat(_raw)
+                _flattenedCount++
+              }
+            })
+            // 特判 targetAudience：若扁平化后仍是 coreConflict/protagonistName 的错位内容（非读者画像），
+            // 则按其内文重写为可读的读者画像级描述，避免"目标读者=核心冲突"的错误语义反复出现。
+            var _ta: any = (result as any).targetAudience
+            if (_ta) {
+              var _taStr = String(_ta).trim()
+              if (/coreConflict|protagonistName|核心冲突|主角姓名/.test(_taStr)) {
+                var _taFallback = ('面向喜爱历史权谋与朝堂军事演义的读者；看重正史人物、势力与时代细节的还原，期待主角以现代识见突破困局、步步翻盘的智斗与热血爽感。')
+                ;(result as any).targetAudience = _taFallback
+                _flattenedCount++
+                console.log('[idea#220] targetAudience 为错位对象内容，已重写为读者画像兜底')
+              }
+            }
+            if (_flattenedCount > 0) console.log('[idea#220] idea 单值字段扁平化 ' + _flattenedCount + ' 处')
+          })()
+        } catch (_e) { /* 兜底失败不影响主流程 */ }
+      }
       // 题材检测：主要基于 genre 和 keywords，避免LLM生成的跨题材词汇污染检测
       var _kwStrForClean = Array.isArray(keywords) ? keywords.join(' ') : (typeof keywords === 'string' ? keywords : '')
       var _postGenreText = _kwStrForClean + ' ' + (genre || '')
@@ -35252,14 +37592,28 @@ export async function POST(request: Request) {
     //   _skipFields 跳过清洗，导致"秘境/灵山/修士"等仙侠词出现在关键剧情标题/卷名里（串味）。
     //   在此对 keyPlots 的结构化字段做专门的跨题材词替换（只替换明确仙侠/武侠词，不动正常专名）。
     if (result && typeof result === 'object' && step === 'keyPlots') {
+      // 🔥 2026-11-01 修复（P0-3）：本替换表把「王朝→星际帝国」「皇朝→文明联盟」「武林→星际联盟」
+      //   这类**正常中文/史实词**当作题材串味词替换，且原实现**无任何题材门控**。
+      //   后果实测：《永历中兴》（历史/明末权谋）的卷名与关键节点名会被改成科幻短语
+      //   （"王朝更迭"→"星际帝国更迭"、"江湖"→"星域社会"），属于"越清洗越错"。
+      //   现改为：仅【科幻/末世/都市现代】题材启用；历史/仙侠/玄幻/西幻题材一律跳过
+      //   （它们的"秘境/门派/王朝/江湖"本就是正确用词，不该动）。
+      var _kpGenreText = String(genre || '') + ' '
+        + (Array.isArray(keywords) ? keywords.join(' ') : String(keywords || '')) + ' '
+        + String(((previousData as any) && (previousData as any).worldbuilding && (previousData as any).worldbuilding.era) || '')
+      var _kpAllow = /科幻|星际|末世|废土|赛博|机甲|星舰|未来|异星|都市|现代|校园|职场|豪门/.test(_kpGenreText)
+        && !/历史|权谋|朝堂|明朝|明末|南明|清朝|唐朝|宋朝|汉朝|架空历史|仙侠|玄幻|修仙|武侠|洪荒/.test(_kpGenreText)
       var _kpNameRe = /秘境|灵山|福地|洞天|仙府|道观|寺庙|宗祠|门派|师门|修武|武道|剑宗|仙宗|仙门|皇朝|王朝|武林|江湖/
       var _kpNameRep = { '秘境': '禁区', '灵山': '前沿基地', '福地': '基地', '洞天': '星港', '仙府': '空间站', '道观': '观测站', '寺庙': '圣堂', '宗祠': '纪念馆', '门派': '组织', '师门': '训练组织', '修武': '科技进化', '武道': '科技进化', '剑宗': '能量剑士团', '仙宗': '星域组织', '仙门': '星域组织', '皇朝': '文明联盟', '王朝': '星际帝国', '武林': '星际联盟', '江湖': '星域社会' }
       var _kpFix = function (s: any): any {
         if (typeof s !== 'string') return s
+        // 题材门控：非科幻/都市题材不替换（历史文的"王朝/江湖/门派"是正确用词）
+        if (!_kpAllow) return s
         var _n = s
         for (var _kk in _kpNameRep) { if (_n.indexOf(_kk) !== -1) { _n = _n.split(_kk).join(_kpNameRep[_kk]) } }
         return _n
       }
+      if (!_kpAllow) { /* 历史/仙侠题材：跳过 keyPlots 专名科幻化替换 */ }
       var _fixedKp = { keyPlots: 0, volumes: 0, turningPoints: 0 }
       try {
         if (Array.isArray((result as any).keyPlots)) {
@@ -35296,6 +37650,66 @@ export async function POST(request: Request) {
       if (_fixedKp.keyPlots || _fixedKp.volumes || _fixedKp.turningPoints) {
         console.log('[globalClean] keyPlots 专名仙侠/武侠词修复: 节点=' + _fixedKp.keyPlots + ' 卷=' + _fixedKp.volumes + ' 转折=' + _fixedKp.turningPoints)
       }
+      // 🔥🔥🔥 2026-09-08 #179 keyPlots 出口去重：LLM 会产出同题节点（实测《永历中兴》「桂林设伏」×2、
+      //   「昆明危机」×3）与同摘要不同题（「昆明结盟」=「昆明危机」摘要同文）。标题精确去重 + 摘要 4-gram
+      //   相似去重，保留首个；卷号保持原值不重排（下游按卷号归组）。
+      try {
+        // 🔥 #187（2026-09-08）：去重泛化为双数组——keyPlots 步 LLM 结果同时含 keyPlots（节点）与
+        //   turningPoints（转折点）两个平行数组，《永历中兴》实测两处都会有同题重复（turningPoints
+        //   「桂林设伏」×2、「昆明危机」×3 才是 UI「关键转折点」区的真实渲染源）。两列表各自独立
+        //   seen/相似度存储（跨列表名称高度重叠，共享存储会误杀）。
+        var _simDup179 = function (s: string, _keptS179: string[]): boolean {
+          var _s179 = String(s || '').trim()
+          if (_s179.length < 8) return false
+          for (var _ki179 = 0; _ki179 < _keptS179.length; _ki179++) {
+            var _q179 = _keptS179[_ki179]
+            if (_q179.indexOf(_s179) >= 0 || _s179.indexOf(_q179) >= 0) return true
+            var _shared179 = 0
+            for (var _gi179 = 0; _gi179 <= _s179.length - 4; _gi179++) {
+              if (_q179.indexOf(_s179.substring(_gi179, _gi179 + 4)) !== -1) { _shared179++; _gi179 += 3 }
+            }
+            var _min179 = Math.min(_q179.length, _s179.length)
+            if (_min179 >= 12 && _shared179 >= Math.max(3, Math.floor(_min179 / 5))) return true
+          }
+          return false
+        }
+        var _dedupArr179 = function (_arr: any[], _tField: string, _sField: string, _label: string): number {
+          if (!Array.isArray(_arr) || _arr.length < 2) return 0
+          var _seen: Record<string, boolean> = {}
+          var _keptS: string[] = []
+          var _kept: any[] = []
+          var _dups = 0
+          for (var _kj179 = 0; _kj179 < _arr.length; _kj179++) {
+            var _kpItem179 = _arr[_kj179]
+            if (!_kpItem179) { _dups++; continue }
+            var _t179 = String(_kpItem179[_tField] || '').trim()
+            var _sum179 = String(_kpItem179[_sField] || '')
+            if (_t179 && _seen[_t179]) { _dups++; continue }
+            if (_sum179 && _simDup179(_sum179, _keptS) && _kept.length > 0) { _dups++; continue }
+            if (_t179) _seen[_t179] = true
+            _keptS.push(_sum179.trim())
+            _kept.push(_kpItem179)
+          }
+          if (_dups > 0) {
+            ;(result as any)[_label] = _kept
+            console.log('[keyPlots] 🔥 #187 出口去重[' + _label + ']：剔除 ' + _dups + ' 个重复项（同题/同摘要），保留 ' + _kept.length + ' 个')
+          }
+          return _dups
+        }
+        _dedupArr179(Array.isArray((result as any).keyPlots) ? (result as any).keyPlots : [], 'title', 'summary', 'keyPlots')
+        _dedupArr179(Array.isArray((result as any).turningPoints) ? (result as any).turningPoints : [], 'name', 'impact', 'turningPoints')
+        // 卷摘要出口净化（#188）：句级去重 + 模板腔剥离 + 标点修复（覆盖「。，/。；/。。」与病句）
+        if (Array.isArray((result as any).volumes)) {
+          for (var _kvJ179 = 0; _kvJ179 < (result as any).volumes.length; _kvJ179++) {
+            var _kvV179 = (result as any).volumes[_kvJ179]
+            if (_kvV179 && typeof _kvV179.summary === 'string' && _kvV179.summary.length > 0) {
+              var _san179 = _sanitizeVolSummaryText(_kvV179.summary)
+              if (_san179 && _san179 !== _kvV179.summary) _kvV179.summary = _san179
+              else if (!_san179 && /。；/.test(_kvV179.summary)) _kvV179.summary = _kvV179.summary.replace(/。；/g, '；').replace(/；；+/g, '；')
+            }
+          }
+        }
+      } catch (_kpDe179) { /* 去重失败不影响主流程 */ }
     }
     // 🔥🔥🔥 跨步一致性闸门：主角名全链路锁定 + 题材一致性告警 + 必需元素可观测（保证全流程规划数据达标）
     if (result && _stepsToClean.indexOf(step) >= 0) {
@@ -35441,9 +37855,42 @@ export async function POST(request: Request) {
       return v
     }
     try { result = _deepCleanJsonLeak(result) } catch (_ce) { /* never throw */ }
-    return NextResponse.json({ success: true, data: result, qaReport: _qaReport, _meta: { usedModel: _actualUsedModel, usedProvider: _actualUsedProvider } })
+    // 🔥 逐章精写引擎报告（本次请求若走引擎，则带上可验收指标：字数/爽点/对话占比/AI率/复读/跨章重复/修复记录）
+    var _engineReport: any = null
+    if (step === 'content') {
+      try { _engineReport = getLastEngineReport(Number((previousData as any)?.chapterNumber) || undefined) } catch (_er) { _engineReport = null }
+    }
+    // 🔥 2026-11-07 出口兜底：人物设定响应最后一道字段补全（实测前一轮 title/weaknesses 仍有空值，
+    //   在最终响应对象上再补一次，确保前端 13 项必填字段不为空；已有值一律不覆盖）
+    if (step === 'characters' && result && typeof result === 'object') {
+      try {
+        var _fbOut168 = function (c: any) {
+          if (!c || typeof c !== 'object' || !c.name) return
+          if (!String(c.title || '').trim()) {
+            var _oh168 = String(c.identity || '').split(/[，,。；;]/)[0].trim()
+            var _ot168 = _oh168.replace(/^.*?(封|任|官至|授|拜)/, '').trim().slice(0, 8)
+            c.title = (_ot168 && _ot168.length >= 2) ? _ot168 : String(c.rolePosition || c.role || '关键人物')
+          }
+          if (!String(c.weaknesses || '').trim() && !(Array.isArray(c.weaknesses) && c.weaknesses.length)) {
+            var _om168 = String(c.motivation || c.goal || c.personality || '').trim()
+            c.weaknesses = _om168 ? ('执念于' + _om168.slice(0, 16) + '，遇关键抉择时易被此牵制') : '性格与身份所限，权衡之际难免犹豫'
+          }
+        }
+        _fbOut168(result.protagonist)
+        ;(result.femaleLeads || []).forEach(_fbOut168)
+        ;(result.antagonists || []).forEach(_fbOut168)
+        ;(result.supporting || []).forEach(_fbOut168)
+      } catch (_e168) { /* 出口兜底失败不影响响应 */ }
+    }
+    return NextResponse.json({ success: true, data: result, qaReport: _qaReport, canonReport: _canonReport, _meta: { usedModel: _actualUsedModel, usedProvider: _actualUsedProvider, engineReport: _engineReport } })
   } catch (error: any) {
-    console.error('[ai-generate] Error:', error.message || error)
-    return NextResponse.json({ success: false, error: error.message || 'Generation failed' }, { status: 500 })
+    var _errMsg = String(error?.message || 'Generation failed')
+    // 🔥 2026-11-07：人物设定名册不足 15 时由 generateWithLLM 抛出（不再返回 NextResponse 被吞成 200 空对象），
+    //   这里映射为 502 并去掉内部标记，前端才能拿到可展示的错误而不是死循环重试。
+    var _isRosterFail = _errMsg.indexOf('CHARACTERS_ROSTER_INCOMPLETE:') !== -1
+    if (_isRosterFail) _errMsg = _errMsg.replace('CHARACTERS_ROSTER_INCOMPLETE:', '').trim()
+    console.error('[ai-generate] Error:', _errMsg)
+    return NextResponse.json({ success: false, error: _errMsg }, { status: _isRosterFail ? 502 : 500 })
   }
+})
 }
