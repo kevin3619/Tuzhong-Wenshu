@@ -18,6 +18,42 @@ import { buildTaskRoute, STEP_TO_TASK_TYPE, isCostSavingMode } from '@/lib/ai/ll
 import { DE_AI_GLOBAL_SKILL } from '@/lib/ai/de-ai-global'
 import { PLATINUM_SKILLS } from '@/lib/ai/platinum-skills'
 import { setActiveModel } from '@/components/activeModelStore'
+import { runPitfallCheck } from '@/lib/ai/pitfallRules'
+import { buildRepairPlan, applyPatches, applyDeterministicRepairs, buildRepairContext } from '@/lib/ai/repairPlan'
+import type { RepairState } from './wizard-steps/StepChecklistPanel'
+// 🔥 分卷章节划分修复：按「分卷剧情结构」KeyPlotVolume 合成卷摘要（coreObjective+开端事件+高潮事件+卷末钩子），并对重复段落去重
+var synthVolumeSummaryFromDesign = function (vkp: any): string {
+  if (!vkp || typeof vkp !== 'object') return ''
+  var parts: string[] = []
+  // 🔥 #180：剥离段尾句号/分号/逗号，避免 join('；') 后出现「。；」式标量杂乱（实测截图卷摘要）
+  var cleanSeg = function (s: string): string {
+    return String(s || '').trim().replace(/[。，、；;\s]+$/, '')
+  }
+  var dedupPush = function (segment: string) {
+    var s = cleanSeg(segment)
+    if (s.length < 4) return
+    for (var i = 0; i < parts.length; i++) {
+      var p = parts[i]
+      if ((s.length >= 4 && p.indexOf(s) >= 0) || (p.length >= 4 && s.indexOf(p) >= 0)) return
+      // 🔥 #180：4-gram 相似度去重——语义重复但字面不同的段（实测「以火器战术大败清军，成功解救桂林城」vs「以现代知识指导火器战术，成功击败清军将领」）
+      var _shared = 0
+      for (var _gi = 0; _gi <= s.length - 4; _gi++) {
+        if (p.indexOf(s.substring(_gi, _gi + 4)) !== -1) { _shared++; _gi += 3 }
+      }
+      var _minLen = Math.min(p.length, s.length)
+      if (_minLen >= 8 && _shared >= Math.max(2, Math.floor(_minLen / 4))) return
+    }
+    parts.push(s)
+  }
+  if (vkp.coreObjective) dedupPush(vkp.coreObjective)
+  if (vkp.openingNode && vkp.openingNode.event) dedupPush(vkp.openingNode.event)
+  if (vkp.climaxNode && vkp.climaxNode.event) dedupPush(vkp.climaxNode.event)
+  if (vkp.endHook && vkp.endHook.content) dedupPush(vkp.endHook.content)
+  var _joined = parts.join('；').trim()
+  // 统一以句号结尾，与 StepChapters 的卷摘要展示风格一致
+  if (_joined && !/[。！？…]$/.test(_joined)) _joined += '。'
+  return _joined
+}
 var StepIdea = lazy(function () { return import('./wizard-steps/StepIdea'); })
 var StepWorldbuilding = lazy(function () { return import('./wizard-steps/StepWorldbuilding'); })
 var StepPowerSystem = lazy(function () { return import('./wizard-steps/StepPowerSystem'); })
@@ -29,7 +65,6 @@ var StepKeyPlots = lazy(function () { return import('./wizard-steps/StepKeyPlots
 var StepChapters = lazy(function () { return import('./wizard-steps/StepChapters'); })
 var StepSynopsis = lazy(function () { return import('./wizard-steps/StepSynopsis'); })
 var StepGenerating = lazy(function () { return import('./wizard-steps/StepGenerating'); })
-var StepSignatureChecklist = lazy(function () { return import('./wizard-steps/StepSignatureChecklist'); })
 var StepFinalCheck = lazy(function () { return import('./wizard-steps/StepFinalCheck'); })
 var StepCover = lazy(function () { return import('./wizard-steps/StepCover'); })
 
@@ -37,6 +72,9 @@ var StepCover = lazy(function () { return import('./wizard-steps/StepCover'); })
 //   关键教训：锁变量绝不能放在组件函数体内（IIFE 闭包随每次渲染重建，_inflight 形同虚设，实测 R3 仍重复建 2 条草稿）。
 //   必须提升到模块作用域，才能跨组件渲染/跨 effect 触发共享同一把锁。
 var _draftCreateInflight: Promise<string> | null = null
+// 🔥 2026-09-10 #120R：孤儿/错属活动作品自愈——记录本次会话已校验过的活动 id，
+//   仅首次校验一次（避免每次 autosave 都拉全量列表），刷新页面后缓存重置可重试。
+var _selfHealCheckedId = ''
 
 function normalizeIdeaData(data: any): any {
   if (!data || typeof data !== 'object') {
@@ -515,13 +553,16 @@ function cleanTemplatePlaceholder(val: string): string {
   if (!val || typeof val !== 'string') return ''
   var v = val.trim()
   if (!v) return ''
+  // 🔥 #202c 修订：含句读（，。！？；、）的「xxx」/【xxx】包裹值是合法台词/引语（如「大明未亡，朕未死！」），
+  //   不是占位标签——占位标签（「主角」「核心金句」「主角阵营」）从不含句读。先判句读再套模式，防止吃掉台词。
+  var _hasSentPunct = /[，。！？；、]/.test(v)
   // 模式 1：纯标签或标签 + 冒号（无真实内容）："[xxx]"、"【xxx】"、"xxx："+冒号后为空、"核心金句："等
-  if (/^[\[【「『#*]+\s*[^\[【「『\]\】」』#*]{1,20}[\]】」』#*]+\s*$/.test(v)) {
+  if (!_hasSentPunct && /^[\[【「『#*]+\s*[^\[【「『\]\】」』#*]{1,20}[\]】」』#*]+\s*$/.test(v)) {
     // 内容只是字段名/标签本身
     return ''
   }
   // 模式 2：以 "[xxx]" / "【xxx】" / 「xxx」 / "xxx：" 开头且长度仅占位
-  if (/^(\[|【|「|『|#)\s*[^\[【「『\]\】」』]{1,20}(\]|【|」|』|#)\s*$/.test(v)) {
+  if (!_hasSentPunct && /^(\[|【|「|『|#)\s*[^\[【「『\]\】」』]{1,20}(\]|【|」|』|#)\s*$/.test(v)) {
     return ''
   }
   // 模式 3："字段名：xxx" 但字段名是常见模板标签，且后面内容很短（<=8 字）或为空
@@ -578,6 +619,19 @@ function cleanJsonLeakField(s: string): string {
   if (!v) return ''
   v = v.replace(/^[\[{（(\s":：,，、;；|｜】》）)\]}」』“”‘’]+/, '')
   v = v.replace(/[\[{（(\s":：,，、;；|｜】》）)\]}」』“”‘’]+$/, '')
+  // 🔥 #202 括号回补：上面的尾部剥离会把合法的括号注释尾「）」当 JSON 残渣剥掉
+  //   （实锤：「昭宗（永历朝廷追上谥号）」被剥成「…谥号」，随后 autosave 合法回写污染服务端）。
+  //   剥尾后若「（」多于「）」，逐个回补「）」直到平衡——括号注释是合法内容，不是泄漏。
+  var _po = (v.match(/（/g) || []).length
+  var _pc = (v.match(/）/g) || []).length
+  while (_po > _pc) { v += '）'; _pc++ }
+  // 同理回补中文书名号/引号「」与【】（剥尾常把其尾部剥离，需回补以免「疏影」「奉天」等被损）
+  var _co = (v.match(/「/g) || []).length
+  var _cc = (v.match(/」/g) || []).length
+  while (_co > _cc) { v += '」'; _cc++ }
+  var _bo = (v.match(/【/g) || []).length
+  var _bc = (v.match(/】/g) || []).length
+  while (_bo > _bc) { v += '】'; _bc++ }
   if (!v) return ''
   var _onlyPunct = v.replace(/[^\u4e00-\u9fa5A-Za-z0-9·]+/g, '')
   if (!_onlyPunct) return ''
@@ -814,7 +868,13 @@ function normalizeCharactersData(data: any, detailedDesignInput?: string): any {
       return false
     }
     // 说明性/非头衔词黑名单（命中说明括号内不是身份，而是旁注）
-    var _TITLE_DIRTY = ['主角', '女主', '女配', '反派', '配角', '本名', '原名', '诨名', '自称', '人称', '又名', '外号', '绰号', '名号', '身份', '称呼', '别名', '别称', '意即', '小说', '原型', '角色']
+    // 🔥 #218g 追加死亡/败亡类事件词：设定文本中「史可法（扬州殉国）」这类原史事件注记
+    //   会被误提取为头衔并每次前端归一化覆盖正史徽章（实测兵部尚书→扬州殉国循环回退）。
+    // 🔥 #219 追加派系/军旅词：「李定国（原大西军，张献忠死后联明抗清…）」中派系出身注记
+    //   被误提取为徽章（实测晋王→原大西军），同样属于旁注而非身份头衔。
+    var _TITLE_DIRTY = ['主角', '女主', '女配', '反派', '配角', '本名', '原名', '诨名', '自称', '人称', '又名', '外号', '绰号', '名号', '身份', '称呼', '别名', '别称', '意即', '小说', '原型', '角色',
+      '殉国', '殉难', '战死', '阵亡', '就义', '牺牲', '病逝', '遇害', '被俘', '被杀', '遇刺', '自尽', '兵败', '败亡', '覆灭',
+      '大西军', '大顺军', '义军', '明军', '清军', '清兵', '清廷', '降将', '降臣', '降清', '仕清', '归明', '反正', '余部', '旧部', '残部', '起兵', '起义', '流寇', '叛军', '叛将', '劲旅', '麾下']
     var _cleanTitleSeg = function(_raw: string): string {
       var _t = String(_raw || '').trim()
       // 括号/冒号内若含多个身份，取首段（「郑成功(国姓爷，延平王)」→ 国姓爷）
@@ -913,21 +973,21 @@ function normalizeCharactersData(data: any, detailedDesignInput?: string): any {
     var _isApocalypse = /末世|末日/.test(genreHint)
     var _name = _isCult ? '苏挽月' : (_isApocalypse ? '沈临风' : '沈青璃')
     var _age = 20
-    var _title = _isCult ? '玄月宗内门弟子' : (_isApocalypse ? '第七基地首席医官' : '岭南宁家堡大小姐')
-    var _camp = _isCult ? '玄月宗（主角阵营）' : (_isApocalypse ? '第七基地（主角阵营）' : '永历阵营（主角阵营）')
-    var _birth = _isCult ? '中州玄月宗' : (_isApocalypse ? '第七基地' : '岭南（今两广）')
+    var _title = _isCult ? '玄月宗内门弟子' : (_isApocalypse ? '第七基地首席医官' : '没落世家嫡长女')
+    var _camp = _isCult ? '玄月宗（主角阵营）' : (_isApocalypse ? '第七基地（主角阵营）' : '主角阵营')
+    var _birth = _isCult ? '中州玄月宗' : (_isApocalypse ? '第七基地' : '旧族聚居之地')
     var _appearance = '一袭白衣墨发如瀑，眉目清冷中透着坚毅，腕间一枚旧玉幡随步轻晃，周身自有千军难撼的从容。'
     var _personality = '外表温婉娴静，实则心思缜密、杀伐果断；待人以诚、重情重义，于危局中愈显沉着。'
     var _personalityOrigin = '年少时亲历家国倾覆、亲友离散，见惯乱世疾苦，遂养成外柔内刚、处变不惊的性子。'
     var _identity = _isCult ? '中州玄月宗内门弟子，擅术法与医理，身负一桩宗门秘辛。'
       : (_isApocalypse ? '第七基地首席医官，通生物药剂与野外求生，背负半城幸存者的托付。'
-      : '岭南宁家堡嫡长女，自幼随父经商，亦通医术、兵法布阵与商路情报，乱世流落义军后成为一方擎旗者。')
+      : '没落世家嫡长女，自幼随父经商，亦通医术、兵法布阵与商路情报，乱世流落义军后成为一方擎旗者。')
     var _background = _isCult ? '出身中州玄月宗，家世与宗门渊源颇深；师门倾覆后流落人间，凭术法与医理在仙凡之间立足，与主角结下同门之谊。'
       : (_isApocalypse ? '第七基地首席医官，灾变后以一身医术挽救了半城幸存者；为寻解药以身涉险，与主角结为生死之交。'
-      : '岭南富商宁家的嫡长女，家道中落后流落义军，凭医术与谋略在乱世中立足，后与主角并肩谋复山河、历尽战火而不改其志。')
+      : '没落富商世家的嫡长女，家道中落后流落义军，凭医术与谋略在乱世中立足，后与主角并肩谋复山河、历尽战火而不改其志。')
     var _motivation = _isCult ? '要为蒙冤的师门讨回公道，重振玄月宗一脉正名。'
       : (_isApocalypse ? '要在末日废土中为幸存者寻出一条生路，唤醒人类重燃的希望。'
-      : '不愿见山河沦丧、百姓流离，誓要辅佐仁主平定金瓯、再振大明。')
+      : '不愿见山河沦丧、百姓流离，誓要辅佐仁主平定金瓯、重整山河。')
     var _goal = _isCult ? '查清师门倾覆真相，夺回被盗宗门至宝，重振道统。'
       : (_isApocalypse ? '携手共创可自给自足的生态基地，让文明在废土上重建。'
       : '助主角收拢义军、抚慰黎庶，克复故都，还天下一个朗朗乾坤。')
@@ -965,7 +1025,7 @@ function normalizeCharactersData(data: any, detailedDesignInput?: string): any {
       catchphrase: _isCult ? '「道阻且长，行则将至。」' : (_isApocalypse ? '「只要还活着，就有明天。」' : '「山河未复，何以言家？」'),
       quirks: _isCult ? '运术时习惯轻捻指尖结印。' : (_isApocalypse ? '紧张时轻拂腕间医用腕带。' : '紧张时轻抚腰间剑穗。'),
       relationToProtagonist: '并肩作战、生死相托的知己与伴侣',
-      growthBackground: _isCult ? '清修宗门中长大，幼读经卷、长习术法，师门倾覆后流落江湖，以济世救人历练己心。' : (_isApocalypse ? '灾变前是军校医学生，灾变后随基地成长，以救死扶伤与经营生存为重。' : '出身岭南富商世家，自幼习文练武、通读医理，家道中落后以医济世，于乱世结识主角。'),
+      growthBackground: _isCult ? '清修宗门中长大，幼读经卷、长习术法，师门倾覆后流落江湖，以济世救人历练己心。' : (_isApocalypse ? '灾变前是军校医学生，灾变后随基地成长，以救死扶伤与经营生存为重。' : '出身没落富商世家，自幼习文练武、通读医理，家道中落后以医济世，于乱世结识主角。'),
       psychologicalTrauma: _isCult ? '眼睁睁看着师门满门罹难、至宝被盗的当日，是永难释怀的梦魇。' : (_isApocalypse ? '灾变之夜失去双亲与过半同窗，午夜梦回仍觉痛楚。' : '家人为流寇所害、家业尽毁的往昔，今仍是她午夜梦回的痛处。'),
       moralBottomLine: _isCult ? '宁折不弯，纵与天下为敌也绝不行有违道义之事。' : (_isApocalypse ? '宁可同归于尽，也绝不放弃基地里任何一个想活下去的人。' : '宁折不弯，绝不放纵自身行有违道义之事。'),
       decisionPattern: _isCult ? '谋定而后动，善以一己之力牵制全局，换最小代价、最大胜算。' : (_isApocalypse ? '凡事先求保全于人，再图反击，以最小的牺牲换取最大的胜算。' : '谋定而后动，善以最小代价换取最大胜算。'),
@@ -977,8 +1037,8 @@ function normalizeCharactersData(data: any, detailedDesignInput?: string): any {
       realmLevel: _isCult ? '筑基后期' : '',  // 仅修仙题材有"境界"概念；历史/末世不涉境界，避免跨题材污染
       weapons: _weapon,
       techniques: _isCult ? '〔聆风剑诀·封印秘术〕' : (_isApocalypse ? '急救双针·荒野药剂调配' : '宁氏针法（点穴救急）'),
-      experience: _isCult ? '入门苦修→师门罹难→流落江湖→结识主角→寻真相重振道统' : (_isApocalypse ? '灾变求生→受训成医→基地立足→随军远征→寻找解药' : '家道中落→流落义军→献策定岭南→随军北伐→谋复故都'),
-      socialNetwork: _isCult ? '与主角、玄月宗旧部及江湖故交相交颇深' : (_isApocalypse ? '与主角、基地幸存者及各势力头目相交' : '与主角、永历旧臣及岭南义军相交'),
+      experience: _isCult ? '入门苦修→师门罹难→流落江湖→结识主角→寻真相重振道统' : (_isApocalypse ? '灾变求生→受训成医→基地立足→随军远征→寻找解药' : '家道中落→流落义军→献策立足→随军征战→克复故土'),
+      socialNetwork: _isCult ? '与主角、玄月宗旧部及江湖故交相交颇深' : (_isApocalypse ? '与主角、基地幸存者及各势力头目相交' : '与主角、各路义军及旧部故交相交'),
       contradiction: _isCult ? '看似清冷超脱，实则执念深重；医者仁心，为护道统也能痛下杀手。' : (_isApocalypse ? '竭力救人的医者，却不得不一次次亲手做下牺牲他人的取舍。' : '看似清冷疏离，实则重情至深；医者仁心，为大局却能下杀伐狠手。'),
       arcNodes: [
         { stage: '起步', event: _name + '初现身于乱世，于落难之处与主角相遇。', change: '从被命运裹挟，到第一次主动握紧自己的选择。', powerLevel: '' },
@@ -1226,21 +1286,62 @@ function normalizeCharactersData(data: any, detailedDesignInput?: string): any {
     }
     // 🔥 2026-09-03 修复（图一 · 弧光节点空值）：LLM 常省 arcNodes。空则依据「人物弧光成长线」+「经历时间线」
     //   确定性拼出 5 个节点（起步→觉醒→成长→巅峰→超脱），杜绝空列表。素材来自 growthArc/experience，非杜撰。
+    // 🔥 Bug3 修复（主角/女主 arcNodes 空值 + 模板句）：不再产出空 stage/event 或「在此阶段完成从处境到心境的双重转变」模板句，
+    //   改为从角色已有素材（experience / growthArc / background / goal / growthBackground）确定性派生真实节点，
+    //   保证 stage（阶段名，取事件首段，如「肇庆立朝」）、event（该阶段关键事件）、change（含角色名+具体事件的心境转变）均非空、非模板。
+    var _arcStageNames = ['起步', '觉醒', '成长', '巅峰', '超脱']
+    var _arcEventPool = String(char.experience || char.lifeEvents || char.storyArc || char.majorEvents || '')
+      .split(/[→>▸\n]+/).map(function (_x: string) { return String(_x || '').trim() }).filter(function (_x: string) { return _x.length >= 4 })
+    var _arcChangePool = String(growthArc || char.growthBackground || char.background || char.identity || '')
+      .split(/[。！？;；\n]+/).map(function (_x: string) { return String(_x || '').trim() }).filter(function (_x: string) { return _x.length >= 6 })
+    var _arcGoal = normalizeToString(char.goal || char.motivation || char.coreMotivation || motivation || '')
+    // 从事件原文提取阶段名（取首个子句，2-8 字），无则回退通用阶段名
+    var _arcStageFromEvent = function (_evt: string, _idx: number): string {
+      var _s = String(_evt || '').replace(/^[·\-—\s\d.、]+/, '')
+      var _head = (_s.split(/[，,。；;：:、\s]/)[0] || '').trim()
+      if (_head.length >= 2 && _head.length <= 8) return _head
+      if (_head.length > 8) return _head.slice(0, 6)
+      return _arcStageNames[_idx] || ('第' + (_idx + 1) + '阶段')
+    }
     var _arcSource = (function () {
-      var _evts = String(char.experience || char.lifeEvents || char.storyArc || char.majorEvents || '').split(/[→>▸]+/).map(function (_x: string) { return String(_x || '').trim() }).filter(function (_x: string) { return _x.length >= 2 })
-      var _ga = String(growthArc || '').split(/[。！？;；]/).map(function (_x: string) { return String(_x || '').trim() }).filter(function (_x: string) { return _x.length >= 6 })
-      var _stageNames = ['起步', '觉醒', '成长', '巅峰', '超脱']
       var _nodes: any[] = []
+      var _evtLen = _arcEventPool.length
+      var _chgLen = _arcChangePool.length
       for (var _ai = 0; _ai < 5; _ai++) {
+        var _evt = _evtLen > 0 ? _arcEventPool[_ai % _evtLen] : ''
+        var _stage = _evt ? _arcStageFromEvent(_evt, _ai) : (_arcStageNames[_ai] || ('第' + (_ai + 1) + '阶段'))
+        // 事件：优先经历时间线原文（含具体事件）；缺失时用角色名+目标+阶段兜底（仍非模板）
+        var _event = _evt || ((name || '该角色') + (_arcGoal ? '为「' + _arcGoal.slice(0, 12) + '」' : '') + '迈入' + _arcStageNames[_ai] + '阶段，迎来新的转折')
+        // 心境转变：优先成长弧光原文；并显式带角色名与具体事件，杜绝「双重转变」模板句
+        var _mind = _chgLen > 0 ? _arcChangePool[_ai % _chgLen] : '心境由被动承受转向主动进取，立场愈发坚定'
+        if (_mind === _event) _mind = '在心境与立场上完成一次由内而外的转变'
+        var _change = (name ? name + '因「' + _event.slice(0, 16) + '」，' : '') + _mind
         _nodes.push({
-          stage: _stageNames[_ai],
-          event: _evts[Math.min(_ai, _evts.length - 1)] || (name ? name + '迈入第' + (_ai + 1) + '阶段' : ''),
-          change: _ga[Math.min(_ai, _ga.length - 1)] || (name ? name + '的心境在此阶段悄然蜕变' : ''),
+          stage: _stage,
+          event: _event,
+          change: _change,
           powerLevel: '',
         })
       }
       return _nodes
     })()
+    // 🔥 2026-09-08 #165 弧光去重：LLM/兜底常见 event===change，change 空或与 event 同文时按阶段重建，
+    //   杜绝「关键事件/心理变化」两栏内容一模一样（用户实测重复出现的根因之一：后端名单补齐路径 event/change 同值）。
+    function _stageChangeFallback(stageName: string, chName: string): string {
+      var _who = chName ? chName : '此角'
+      var _st = String(stageName || '')
+      if (_st.indexOf('起步') >= 0 || _st.indexOf('初心') >= 0) return _who + '初立其志，在时局洪流中找准自身位置，迈出第一步'
+      if (_st.indexOf('觉醒') >= 0 || _st.indexOf('转折') >= 0) return _who + '遭遇变局，旧有观念被现实击碎，完成第一次蜕变'
+      if (_st.indexOf('成长') >= 0 || _st.indexOf('磨砺') >= 0) return _who + '历经挫折磨砺，处事愈发沉稳，从独善其身转向统御全局'
+      if (_st.indexOf('巅峰') >= 0 || _st.indexOf('高光') >= 0) return _who + '站上巅峰后心态归于从容笃定，格局由取胜转向治世'
+      if (_st.indexOf('超脱') >= 0 || _st.indexOf('归宿') >= 0) return _who + '回望来路信念升华，个人命运汇入时代洪流'
+      // 🔥 Bug3 修复：未命中阶段关键词（如派生阶段名「肇庆立朝」）时，改用角色素材派生具体转变，
+      //   彻底杜绝「在此阶段完成从处境到心境的双重转变」模板句；无素材时给非模板的通用句。
+      var _fbMat = String(growthArc || char.growthBackground || background || goal || char.goal || '').trim()
+      if (_st) return _who + '在「' + _st + '」阶段' + (_fbMat ? '，' + _fbMat.slice(0, 16) : '，完成心境与立场的转变')
+      if (_fbMat) return _who + '于「' + _fbMat.slice(0, 16) + '」中完成心境与立场的转变'
+      return _who + '在时局磨砺中逐步确立自身立场，完成由被动到主动的心境转变'
+    }
     // 🔥 阶段4 P2：双写字段保证前后端兼容（coreSkills/skills、rolePosition/role）
     var coreSkillsValue = Array.isArray(char.coreSkills) ? char.coreSkills : (Array.isArray(char.skills) ? char.skills : [])
     var rolePositionValue = normalizeToString(char.rolePosition || char.role || roleType)
@@ -1312,6 +1413,7 @@ function normalizeCharactersData(data: any, detailedDesignInput?: string): any {
       if (role && role !== 'supporting') {
         var roleLabels: Record<string, string> = {
           '主角': '故事核心人物',
+          'protagonist': '小说男主角（故事核心人物）',
           '女主': '重要女性角色',
           '反派': '关键对手',
           '盟友': '可靠伙伴',
@@ -1456,26 +1558,43 @@ function normalizeCharactersData(data: any, detailedDesignInput?: string): any {
       contradiction: cleanJsonLeakField(normalizeToString(char.contradiction || char.paradox || char.dualTrait || '')),
       arcNodes: (function () {
         var _rawNodes: any[] = Array.isArray(char.arcNodes) ? char.arcNodes : []
+        var _out: any[] = []
         if (!_rawNodes.length) {
           // 🔥 2026-09-03：LLM 未给弧光节点时，回退到「人物弧光/经历」确定性推导的 5 节点，杜绝空列表
           var _fb = Array.isArray(_arcSource) && _arcSource.length ? _arcSource : []
-          return _fb.map(function(n: any) {
+          _out = _fb.map(function(n: any) {
             return {
               stage: normalizeToString(n && n.stage || '起步'),
               event: normalizeToString(n && n.event || ''),
               change: normalizeToString(n && n.change || ''),
               powerLevel: normalizeToString(n && n.powerLevel || ''),
             }
-          }).filter(function(n: any) { return n.stage || n.event || n.change || n.powerLevel })
+          })
+        } else {
+          // 🔥 Bug3 修复：LLM 常给主角/女主「空 stage + 空 event + 模板 change」的节点，
+          //   此处用素材派生的真实节点按序补全，保证 stage/event/change 均非空、非模板句。
+          var _templateRe = /在此阶段完成从处境到心境的双重转变/
+          _out = _rawNodes.map(function(n: any, i: number) {
+            var _derived: any = (_arcSource && _arcSource[i]) || (_arcSource && _arcSource[_arcSource.length - 1]) || {}
+            var _st = normalizeToString(n && n.stage || '')
+            var _ev = normalizeToString(n && n.event || '')
+            var _ch = normalizeToString(n && n.change || '')
+            if (!_st && !_ev) { _st = normalizeToString(_derived.stage || ''); _ev = normalizeToString(_derived.event || '') }
+            if (!_ch || _templateRe.test(_ch)) _ch = normalizeToString(_derived.change || '')
+            return {
+              stage: _st,
+              event: _ev,
+              change: _ch,
+              powerLevel: normalizeToString(n && n.powerLevel || n && n.power || ''),
+            }
+          })
         }
-        return _rawNodes.map(function(n: any) {
-          return {
-            stage: normalizeToString(n && n.stage || ''),
-            event: normalizeToString(n && n.event || ''),
-            change: normalizeToString(n && n.change || ''),
-            powerLevel: normalizeToString(n && n.powerLevel || n && n.power || ''),
-          }
-        }).filter(function(n: any) { return n.stage || n.event || n.change || n.powerLevel })
+        // 🔥 2026-09-08 #165：统一守卫——change 空或与 event 同文 → 按阶段重建，杜绝两栏一样
+        _out = _out.map(function(n: any) {
+          if (!n.change || n.change === n.event) n.change = _stageChangeFallback(n.stage, name)
+          return n
+        })
+        return _out.filter(function(n: any) { return n.stage || n.event || n.change || n.powerLevel })
       })(),
       stats: stats,
       attributes: stats,
@@ -1597,8 +1716,10 @@ function normalizeCharactersData(data: any, detailedDesignInput?: string): any {
   // 触发条件：开头为 1-3 个短角色标签（≤8字，可带"（阵营）"）以逗号分隔的紧凑序列，且总前缀长度≤30字。
   function _stripIdentityRolePrefix(identity: string): string {
     if (!identity) return identity
-    // 匹配开头 1-3 个 role tag 序列：tag1（可选阵营），tag2，tag3，
-    var _m = identity.match(/^((?:[\u4e00-\u9fa5]{2,8}(?:\uFF08[^\uFF09]{2,8}\uFF09)?)(?:[\uFF0C,][\u4e00-\u9fa5]{2,8}(?:\uFF08[^\uFF09]{2,8}\uFF09)?){0,2}[\uFF0C,])/)
+    // 🔥 #177 修订：tag 名长度收紧为 2-6 字（原 2-8 会把「权臣或敌国君主，与主角争夺天下，」这类
+    //   7 字叙述短句误判为角色标签整段剥掉，实测《上古巫神》反派姬昌身份被截去前半）。
+    //   匹配开头 1-3 个 role tag 序列：tag1（可选阵营），tag2，tag3，
+    var _m = identity.match(/^((?:[\u4e00-\u9fa5]{2,6}(?:\uFF08[^\uFF09]{2,8}\uFF09)?)(?:[\uFF0C,][\u4e00-\u9fa5]{2,6}(?:\uFF08[^\uFF09]{2,8}\uFF09)?){0,2}[\uFF0C,])/)
     if (_m && _m[1].length <= 30) {
       var _stripped = identity.substring(_m[1].length).trim()
       // 剥离后不能太短（避免误删），至少 10 字
@@ -1634,6 +1755,15 @@ function normalizeCharactersData(data: any, detailedDesignInput?: string): any {
       }
     }
     console.log('[normalizeCharactersData] femaleLeads数组: ' + finalFemaleLeads.length + ' 位女主')
+  }
+  // 🔥 #217b 双女主保留修复：输入 femaleLeads 为空/缺失但 femaleLead 有效时，回填 [femaleLead] 保底。
+  //   根因实锤：normalize 原先对无 femaleLeads 输入一律输出 femaleLeads:[]，该 [] 随 saveSettings/
+  //   DraftSync autosave/pagehide 整体回写服务端，把数据工程师恢复的双女主（王氏+戴贵人）反复冲掉。
+  //   输入为非空数组时上面循环已逐卡 normalize 原样保留（不深改卡片内容）；
+  //   femaleLeads[0] 与 femaleLead 同名时天然不重复（本分支仅在数组为空时触发）。
+  if (finalFemaleLeads.length === 0 && femaleLead && _hasMeaningfulContent(femaleLead)) {
+    finalFemaleLeads.push(femaleLead)
+    console.log('[normalizeCharactersData] #217b femaleLeads 为空 → 回填 femaleLead「' + (femaleLead.name || '') + '」保底，防保存链冲掉')
   }
   // 🔥 保留所有反派（含完整信息）供关系图谱使用
   var finalAntagonists: any[] = []
@@ -1737,31 +1867,33 @@ function normalizeCharactersData(data: any, detailedDesignInput?: string): any {
     var _isMy = _rl.indexOf('盟') !== -1
     var _ctx = String(_c.identity || _c.background || _c.motivation || '')
     if (!normalizeToString(_c.job)) {
-      if (/皇帝|监国|称帝|天子|帝王/.test(_ctx)) _c.job = _genreIsHistory ? (/永历|南明/.test(_ctx) ? '明朝皇帝（永历朝）' : '王朝帝王') : '当世至尊'
+      // 🔥 #178b 去永历化：job 兜底不写死明朝/永历/清廷，统一贴合本作
+      if (/皇帝|监国|称帝|天子|帝王/.test(_ctx)) _c.job = _genreIsHistory ? '王朝帝王' : '当世至尊'
       else if (/妃|皇后|太后|公主/.test(_ctx)) _c.job = '后宫眷属'
       else if (/总督|巡抚|尚书|大学士|总兵|参将|副将|都督|锦衣|知府|知县|参政|布政/.test(_ctx)) _c.job = String(_ctx).replace(/[。，、].*$/, '').slice(0, 20)
-      else if (_isFp) _c.job = /清|满/.test(_ctx) ? '清廷要员' : '反派权臣'
-      else if (_isZj) _c.job = _genreIsHistory ? '永历朝核心人物' : '本作核心人物'
+      else if (_isFp) _c.job = '对立阵营权臣'
+      else if (_isZj) _c.job = _genreIsHistory ? '本作核心人物' : '本作核心人物'
       else _c.job = _genreIsHistory ? '朝臣武弁' : '本作重要角色'
     }
     if (!normalizeToString(_c.goal)) {
-      if (_isFp) _c.goal = /清|满/.test(_ctx) ? '助清剪灭南明余烬，博取从龙之功' : '倾轧忠良、把持朝纲，处心积虑打压主角势力'
+      if (_isFp) _c.goal = '倾轧忠良、把持朝纲，处心积虑打压主角势力'
       else if (_isNz) _c.goal = '辅佐主角共渡时艰，同心同德成就大业'
-      else if (_isZj) _c.goal = _genreIsHistory ? '统合抗清力量，光复大明江山，开创中兴盛世' : '统合各方力量，成就一番伟业，登临绝巅'
+      else if (_isZj) _c.goal = _genreIsHistory ? '统合各方力量，廓清寰宇，开创盛世' : '统合各方力量，成就一番伟业，登临绝巅'
       else if (/总督|巡抚|总兵|参将|副将|都督|提督|大将|将军/.test(_ctx)) _c.goal = '整军经武、廓清贼氛，为大局开疆固本'
       else if (/尚书|大学士|侍郎|参政|布政|知府|知县/.test(_ctx)) _c.goal = '辅弼朝纲、肃清党争，助大局归于清明'
       else _c.goal = _genreIsHistory ? '于乱世中为大业贡献力量，求取功名前程' : '于风云际会中建功立业，不负平生所学'
     }
     if (!normalizeToString(_c.camp)) {
-      if (/清军|清廷|清朝|满清/.test(_ctx)) _c.camp = '清军阵营（敌对）'
-      else if (/永历|南明|明朝|明室/.test(_ctx)) _c.camp = '永历阵营（主角）'
+      if (/清军|清廷|清朝|满清/.test(_ctx)) _c.camp = '敌对阵营（与主角对立）'
+      else if (/永历|南明|明朝|明室/.test(_ctx)) _c.camp = '主角阵营'
       else if (_isFp) _c.camp = '敌对阵营（反派）'
       else if (_isMy) _c.camp = '主角阵营·盟友'
       else if (_isZj || _isNz) _c.camp = '主角阵营·核心'
       else _c.camp = '主角阵营'
     }
     if (!normalizeToString(_c.birthplace)) {
-      _c.birthplace = /桂林/.test(_ctx) ? '广西桂林' : (/辽东|山海关/.test(_ctx) ? '辽东（山海关）' : (/北京|京师/.test(_ctx) ? '北直隶京师' : (_isZj ? '广西桂林桂王府' : (_genreIsHistory ? '大明疆土' : '出生之地'))))
+      // 🔥 #178b 去永历化：出生地兜底不再写死桂林/桂王府/大明
+      _c.birthplace = _isZj ? '本作都城' : (_genreIsHistory ? '本作疆土' : '出生之地')
     }
     if (!normalizeToString(_c.realmLevel)) {
       _c.realmLevel = _isFp ? '权倾一方之枭雄' : (_isNz ? '深居内闱之女眷' : (_isZj ? '权倾朝野之帝王（超品）' : (_isMy ? '一方将帅重臣' : '一方家臣将佐')))
@@ -1873,6 +2005,34 @@ function normalizeCharactersData(data: any, detailedDesignInput?: string): any {
       _dedupSup.push(finalSupporting[_gs])
     }
     finalSupporting = _dedupSup
+  }
+
+  // 🔥 2026-09-10：主角外貌-年龄一致性清洗（同步后端修复，覆盖已加载/草稿数据的旧污染）。
+  //   历史/现实向题材年轻主角（≤30）被写成白发老者、手执法杖时，替换为年龄相符的年轻外貌。
+  if (normalizeToString(protagonist && protagonist.name)) {
+    var _pN = protagonist || {}
+    var _pA = parseInt(String(_pN.age || 0), 10)
+    var _pApp = normalizeToString(_pN.appearance)
+    var _oldMark = /须发皆白|白发苍苍|鹤发|白须|银发苍苍|古稀|花甲|满脸皱纹|皱纹纵横|拄|法杖|拂尘|仙风道骨|道骨仙风|鹤发童颜|慈眉善目|年迈|老者|老朽|苍老/
+    if (_pA > 0 && _pA <= 30 && _pApp && _oldMark.test(_pApp)) {
+      protagonist.appearance = '身形清瘦挺拔，年方' + _pA + '岁，面容清俊、肤色微带风霜，束发于顶。虽经国变流亡、朝堂倾轧之苦，眉宇间却不失这个年纪的英气与坚毅，目光沉静，气度稳重，全然不似同年浮华少年。'
+      console.log('[normalizeCharactersData] 🔥 主角外貌与年龄冲突(' + _pA + '岁)已修正为年轻外貌')
+    } else if (_pApp && _oldMark.test(_pApp)) {
+      protagonist.appearance = _pApp
+        .replace(/手[持执]?(古朴)?法杖/g, '手扶佩剑')
+        .replace(/手持长剑/g, '腰悬长剑')
+        .replace(/拂尘/g, '折扇')
+        .replace(/仙风道骨/g, '气度威严')
+        .replace(/道骨仙风/g, '气度威严')
+    }
+  }
+
+  // 🔥 2026-11-06 修复：删除「朱由榔/永历帝」南明硬编码模板注入。
+  //   该模板会把其它题材（都市/玄幻等）草稿的主角污染成明末皇帝，属于错误兜底。
+  //   现在仅做安全的角色标签补齐：主角核心字段缺失时保持原样（由用户编辑或重新生成补齐），绝不注入他书人物。
+  if (protagonist) {
+    if (!normalizeToString(protagonist.rolePotential || protagonist.role)) protagonist.role = '主角'
+    if (!normalizeToString(protagonist.rolePosition)) protagonist.rolePosition = '主角'
   }
 
   return {
@@ -2159,7 +2319,7 @@ function buildFactionFallback(ctx: any): any[] {
       { name: '藩镇/权臣集团', leader: '权臣', camp: '敌方', type: '藩镇/权臣', description: '手握重兵或把持朝政的地方实力派，表面臣服实则心怀异志，处处掣肘主角，是内部主要对手。', goal: '扩张自身权力，架空或取代皇权', strength: '兵权在手，党羽众多，与朝堂盘根错节', territory: '地方重镇', philosophy: '权柄至上' },
       { name: '清流/改革派', leader: '改革领袖', camp: '友方', type: '朝堂派系', description: '与主角志同道合的清流文臣，主张变法图强，是主角推行新政的中坚力量与可靠盟友。', goal: '辅佐主角推行新政，清除积弊', strength: '清望卓著，掌握舆论与言路', territory: '朝堂', philosophy: '以正直清流匡扶社稷' },
       { name: '地方士绅/商帮', leader: '商帮领袖', camp: '中立', type: '士绅/商会', description: '盘踞地方的大族与商帮，掌控钱粮与民间力量，谁的胜算大便倾向谁，是主角争取的中间力量。', goal: '保全家族利益，寻求利益最大化', strength: '财力雄厚，人脉遍布，掌握地方实权', territory: '江南各处', philosophy: '趋利避害，左右逢源' },
-      { name: '边军将领', leader: '边关主帅', camp: '友方', type: '边军', description: '戍守边关的武将集团，重兵在握，既是大明的屏障，也因功高望重而成为朝局举足轻重的力量。', goal: '保境安民，凭军功立足朝堂', strength: '边防精锐，实战经验丰富', territory: '九边重镇', philosophy: '将在外君命有所不受' },
+      { name: '边军将领', leader: '边关主帅', camp: '友方', type: '边军', description: '戍守边关的武将集团，重兵在握，既是本朝的屏障，也因功高望重而成为朝局举足轻重的力量。', goal: '保境安民，凭军功立足朝堂', strength: '边防精锐，实战经验丰富', territory: '边关重镇', philosophy: '将在外君命有所不受' },
       { name: '宗室藩邸', leader: '宗室亲王', camp: '中立', type: '宗室', description: '坐镇藩地的宗室亲王，各有私心，伺机而动，牵一发而动全身，是朝堂上最难缠的隐秘对手。', goal: '扩张封地影响，觊觎更多的权力', strength: '名分尊崇，封地富庶，党羽私下串联', territory: '封藩之地', philosophy: '静待时机，图谋大位' },
       { name: '绿林/民间义军', leader: '义军首领', camp: '中立', type: '民间势力', description: '揭竿而起的民间力量，鱼龙混杂，时而是隐患，时而又能成为主角的臂助。', goal: '自救求存，推翻苛政', strength: '士气高昂，熟悉地形，深得民心', territory: '流寇山区', philosophy: '官逼民反' },
     ]
@@ -2222,15 +2382,18 @@ function normalizeFactionsData(data: any, ctx?: any): any {
       var _territory = normalizeToString(f.territory)
       if (_territory) _descParts.push('盘踞' + _territory)
       var _philosophy = normalizeToString(f.philosophy)
-      if (_philosophy) _descParts.push('秉持"' + _philosophy.substring(0, 30) + '"的理念')
+      // 🔥 2026-09-06 修复（#129）：原为 substring(0,30) 硬截断，导致理念只剩半句
+      if (_philosophy) _descParts.push('秉持"' + _philosophy + '"的理念')
       if (_descParts.length > 0) _description = _name + '：' + _descParts.join('，') + '。'
     }
     // 🔥 2026-09-02 修复（图7）：描述仍为空时，用与主角关系/历史恩怨等描述性文本兜底
     if (!_description && _name) {
       var _relWithTxt = normalizeToString(f.relationshipWith || f.relationToProtagonist)
       var _histTxt = normalizeToString(f.historyGrudges)
-      if (_relWithTxt && _relWithTxt.length >= 8) _description = _name + '：' + _relWithTxt.substring(0, 80) + (_relWithTxt.length > 80 ? '……' : '')
-      else if (_histTxt && _histTxt.length >= 8) _description = _name + '：' + _histTxt.substring(0, 80) + (_histTxt.length > 80 ? '……' : '')
+      // 🔥 2026-09-06 修复（#129）：原为 substring(0,80) + '……'，UI 上就是"截取内容"。
+      //   描述兜底一律用完整原文，不再截断也不再加省略号。
+      if (_relWithTxt && _relWithTxt.length >= 8) _description = _name + '：' + _relWithTxt
+      else if (_histTxt && _histTxt.length >= 8) _description = _name + '：' + _histTxt
       // 🔥 第五轮复测：硬描述兜底（不再"暂无详细描述"占位，多源拼接给一个看得过去的故事）
       //   复现实锤：截图 7「孙可望集团」描述为空、仅占位文案「暂无详细描述，可点击重新生成补充。」
       //   根因 = 无 allies、无 relationshipWith、无 historyGrudges 时第三条兜底分支触发。
@@ -2245,11 +2408,12 @@ function normalizeFactionsData(data: any, ctx?: any): any {
         else if (_ldr) _fallbackParts.push('由' + _ldr + '统领')
         else if (_ter) _fallbackParts.push('盘踞' + _ter)
         var _gl = normalizeToString(f.goal || '')
-        if (_gl) _fallbackParts.push('其志在' + _gl.substring(0, Math.min(20, _gl.length)))
+        // 🔥 2026-09-06 修复（#129）：以下三处原为 substring(0,20/20/15)，拼接出的描述全是半截词
+        if (_gl) _fallbackParts.push('其志在' + _gl)
         var _phil = normalizeToString(f.philosophy || '')
-        if (_phil) _fallbackParts.push('秉持"' + _phil.substring(0, Math.min(20, _phil.length)) + '"的理念')
+        if (_phil) _fallbackParts.push('秉持"' + _phil + '"的理念')
         var _histG = normalizeToString(f.historyGrudges || '')
-        if (_histG) _fallbackParts.push('与' + _histG.substring(0, Math.min(15, _histG.length)))
+        if (_histG) _fallbackParts.push('与' + _histG)
         if (_camp) _fallbackParts.unshift('属' + _camp + '阵营')
         if (_fallbackParts.length === 0) {
           _description = _name + '是本作品' + (_camp || '重要') + '势力之一，与主线故事深度交织，参与多次重要剧情推进。可在编辑面板补充其历史、行事风格与核心人物等细节。'
@@ -2282,9 +2446,10 @@ function normalizeFactionsData(data: any, ctx?: any): any {
     var _strengthV = normalizeToString(f.strength)
     var _campIsMing = /明|永历|朝廷|忠臣|主角|义军|南明|大明/.test(_camp + _name)
     var _campIsEnemy = /清|满清|后金|鞑子|降清|吴三桂|孔有德|尚可喜|耿仲明|多尔衮/.test(_camp + _name)
-    var _side = _campIsEnemy ? '敌方' : (_campIsMing ? '永历朝廷阵营' : '中立方')
-    var _enemySideName = _campIsEnemy ? '永历朝廷与反清义军' : '满清与降清诸镇'
-    var _allySideName = _campIsEnemy ? '满清王公与降清诸镇' : '永历朝廷忠臣义师'
+    // 🔥 #178b 去永历化：阵营侧名不再写死永历朝廷/满清（原泛词「朝廷/主角」即可误命中任意题材势力）
+    var _side = _campIsEnemy ? '敌方' : (_campIsMing ? '正统阵营' : '中立方')
+    var _enemySideName = _campIsEnemy ? '正统王朝与勤王义师' : '敌对势力与依附诸镇'
+    var _allySideName = _campIsEnemy ? '敌国权贵与归附诸镇' : '正统阵营忠臣义师'
     // 🔥 2026-09-06 势力「领地/成员/内部派系」正史化兜底：按首领名查表（永历·明末清初史料真实性），
     //   杜绝 field 空值（领地/内部派系曾整栏为空），且让各势力领地、成员、派系真正贴合人物设定与史实，而非通用占位。
     var _derivedFac = (function deriveHistoricalDetail(leaderN: string, nameN: string) {
@@ -2417,7 +2582,8 @@ function normalizeFactionsData(data: any, ctx?: any): any {
       philosophy: _philosophy,
       internalFactions: (Array.isArray(f.internalFactions) && f.internalFactions.some(function(im: any) { return normalizeToString(im) }))
         ? f.internalFactions.map(normalizeToString).filter(Boolean)
-        : (_derivedFac ? _derivedFac[2] : (_philosophy ? [_philosophy.substring(0, 12) + '派系'] : [])),
+        // 🔥 2026-09-06 修复（#129）：原为 substring(0,12)+'派系'，内部派系名被砍成半截
+        : (_derivedFac ? _derivedFac[2] : (_philosophy ? [_philosophy + '派系'] : [])),
       coreResources: _coreResources,
       allies: _allies,
       enemies: _enemies,
@@ -2545,21 +2711,26 @@ function extractGoalStages(c: any): { name: string; desc: string }[] {
   return out
 }
 function historyStageTemplate(c: any): { name: string; desc: string }[] {
+  // 🔥 #178 中性化：原模板写死《永历中兴》明末背景（明清鼎革/扬州十日/湘桂粤滇/签到），任何历史题材
+  //   字段缺失时都会被灌入 → 改为贴合 c.era/c.pn/c.sysName 的朝代无关通用阶段
+  var _era178 = c.era || '王朝将倾的乱世'
   return [
-    { name: '临危受命·立足岭南', desc: c.pn + '于明清鼎革的至暗时刻觉醒' + (c.sysName || '系统') + '，在残山剩水间拉起基业，逆转扬州十日的亡国之危。' },
-    { name: '清君侧·整肃内政', desc: '铲除把持朝政的权奸党争，收拢财权兵权，重建中枢权威，为恢复河山蓄势。' },
-    { name: '练兵图强·首战立威', desc: '凭借签到所得粮草火器编练新军，革新战法，于湘桂粤滇展开反攻，屡挫强敌。' },
-    { name: '挥师北伐·克复失地', desc: '主动出击，两蹶名王，大破强敌，光复中原故都，拉开中兴序幕。' },
-    { name: '一统山河·再造新局', desc: '扫清残敌、定鼎称制，确立中兴新规，海内归心，开创一代盛世。' },
+    { name: '临危受命·立足根基', desc: c.pn + '于' + _era178 + '的至暗时刻觉醒' + (c.sysName || '神秘金手指') + '，在风雨飘摇中建立根基，迈出逆转命运的第一步。' },
+    { name: '整肃内政·聚拢人心', desc: '铲除把持朝政的权奸党争，收拢财权兵权，重建中枢权威，为图存图强蓄势。' },
+    { name: '练兵图强·首战立威', desc: '凭借金手指之利编练新军、革新战法，于内外强敌的夹击中首战告捷，威望初立。' },
+    { name: '主动出击·克复失地', desc: '转守为攻，连挫强敌劲旅，收复沦陷的故土重镇，拉开反击序幕。' },
+    { name: '一统山河·再造新局', desc: '扫清残敌、定鼎立制，确立全新秩序，海内归心，开创一代盛世。' },
   ]
 }
 function deriveSynopsis(c: any): any {
-  var shortIntro = c.coreConflict || (c.pn + '魂穿明末乱世，附身末代藩王，凭山河签到系统与后世先知，于废土之中绝地反击、再造中兴。')
+  // 🔥 #178 中性化：原兜底写死「魂穿明末/末代藩王/山河签到系统/降清/大明」，任何题材命中都会被污染
+  var _era178 = c.era || '王朝将倾的乱世'
+  var shortIntro = c.coreConflict || (c.pn + '身处' + _era178 + '，凭' + (c.sysName || '神秘金手指') + '与过人胆识，于绝境之中崛起，一步步改写既定的命运。')
   var longIntro = [
     c.era,
     c.coreConflict,
-    c.pn + '身负后世记忆与' + (c.sysName || '签到系统') + '，踏城即签到，每至一处可得粮草火器精兵。',
-    '从岭南残局到克复故都，他于权谋纷争与铁马金戈间步步为营，终将飘零山河重铸为一统盛世。'
+    c.pn + '身负' + (c.sysName || '神秘金手指') + '，于危局中步步为营，聚拢人心与班底，在权谋与征伐的漩涡中逆流而上。',
+    '从孤立无援到执掌全局，他在权谋纷争与金戈铁马间砥砺前行，终将倾颓的局势重铸为全新盛世。'
   ].filter(Boolean).join('。') + '。'
   return {
     shortIntro: shortIntro,
@@ -2567,29 +2738,30 @@ function deriveSynopsis(c: any): any {
     longIntro: longIntro,
     fullIntro: longIntro,
     coreSellingPoints: [
-      '反套路开局：现代思维穿越乱世末帝，历史先知+签到系统双重外挂',
-      '权谋与铁血并重：朝堂党争背后发刀，沙场争霸高燃不断',
-      '系统流成长：踏城签到、攻城略地，粮草火器精兵步步为营',
-      '中兴爽点拉满：从残山剩水到克复故都、再造山河',
+      '反套路开局：主角于乱世绝境中强势崛起，金手指+谋略双重加持',
+      '权谋与铁血并重：朝堂博弈背后发刀，沙场争锋高燃不断',
+      '步步为营的成长线：从微末到执掌全局，每一步都有因果与代价',
+      '逆袭爽点拉满：从危局残局到定鼎乾坤、再造新局',
     ],
     sellingPoints: [],
-    keywords: ['架空历史', '系统流', '签到', '明末', '权谋', '中兴', '穿越', '争霸'],
-    tag: ['历史', '系统流', '权谋', '争霸'],
-    tags: ['历史', '系统流', '权谋', '争霸'],
-    openingHook: '清军铁蹄踏破北国之际，一缕现代魂魄落入偏安岭南的末代藩王体内——山河可用签到之力骤起，千军万马、粮秣火器唾手可得，复兴之志从这一刻点燃。',
-    suspenseSetup: ['签到系统的真正来历成谜，是历史钦定还是另有黑手？', '朝中权奸与降清暗桩步步紧逼，谁才是真正的掘墓人？', '穿越者先知能否改写既定的亡国宿命，天意与人力孰重？'],
-    coreGoldenQuote: '山河破碎从来不是终点——我走得越远，签到的越多，脚下的地便是大明再次崛起的起点。',
-    goldenQuote: '山河破碎从来不是终点——我走得越远，签到的越多，脚下的地便是大明再次崛起的起点。',
+    keywords: ['架空历史', '权谋', '逆袭', '成长', '争霸', '权谋智斗'],
+    tag: ['历史', '权谋', '争霸'],
+    tags: ['历史', '权谋', '争霸'],
+    openingHook: _era178 + '，一缕不甘平庸的意志在绝境中觉醒——' + (c.sysName || '神秘金手指') + '骤然降临，粮秣兵源、谋略先机纷至沓来，逆袭之志从这一刻点燃。',
+    suspenseSetup: [(c.sysName || '金手指') + '的真正来历成谜，是天命所归还是另有黑手？', '朝中权奸与各方暗桩步步紧逼，谁才是真正的掘墓人？', '既定的衰亡宿命能否被改写，天意与人力孰重？'],
+    coreGoldenQuote: '绝境从来不是终点——我走得越远，脚下的每一步，都是命运被改写的证明。',
+    goldenQuote: '绝境从来不是终点——我走得越远，脚下的每一步，都是命运被改写的证明。',
     fanqieVersion: longIntro,
     qidianVersion: longIntro,
-    targetReaderProfile: '喜欢历史架空、系统流、乱世争霸与权谋智斗的读者；偏好主角依靠知识与金手指逐步碾压逆势翻盘的爽文受众；对' + (c.pn || '主角') + '式草根逆袭崛起史感兴趣的网文读者。',
+    targetReaderProfile: '喜欢历史架空、乱世争霸与权谋智斗的读者；偏好主角依靠智识与金手指逐步逆转逆势的爽文受众；对' + (c.pn || '主角') + '式草根逆袭崛起史感兴趣的网文读者。',
   }
 }
 function deriveOutline(c: any): any {
   var stages = extractGoalStages(c)
   if (stages.length === 0) stages = historyStageTemplate(c)
   var mainPlot = stages.map(function (s) { return s.name + '：' + s.desc })
-  var histLadder = ['白身微末', '县丞知县', '州府道台', '方面大员', '部堂重臣', '中枢辅臣', '封疆军权', '秉国太阿', '定策元勋', '公侯之尊', '亲王之贵', '九五之尊']
+  // 🔥 #178 中性化：原 histLadder 为明清官职专名（县丞知县/州府道台…），改为朝代无关成长阶梯
+  var histLadder = ['微末之身', '崭露头角', '初掌一隅', '独当一面', '位居要冲', '执掌一方', '权倾朝野', '定策中枢', '股肱重臣', '名震天下', '定鼎乾坤', '开创新局']
   var stageObjs = stages.map(function (s, i) { return {
     name: s.name,
     summary: s.desc,
@@ -2598,12 +2770,12 @@ function deriveOutline(c: any): any {
     powerLevel: histLadder[Math.min(i, histLadder.length - 1)],
   } })
   var keyEvents = [
-    { name: '魂穿落子', position: stages[0].name || '第一阶段', impact: c.pn + '觉醒签到系统，于乱世中锚定立足之基与初始班底' },
+    { name: '觉醒落子', position: stages[0].name || '第一阶段', impact: c.pn + '觉醒' + (c.sysName || '金手指') + '，于乱世中锚定立足之基与初始班底' },
     { name: '整肃朝纲', position: '第二阶段', impact: '扳倒权奸、清扫党争，夺回中枢实权' },
-    { name: '练兵立威', position: '第二阶段', impact: '凭签到所获编练新军，首战扭转败局' },
-    { name: '平定内患', position: '第三阶段', impact: '肃清割据与降清暗桩，稳固钱粮根基' },
-    { name: '挥师北伐', position: '第四阶段', impact: '两蹶名王、大破强敌，光复失地' },
-    { name: '再造中兴', position: '第四阶段', impact: '定鼎立制、万国来朝，开创一统新局' },
+    { name: '练兵立威', position: '第二阶段', impact: '凭金手指之利编练新军，首战扭转败局' },
+    { name: '平定内患', position: '第三阶段', impact: '肃清割据势力与内部暗流，稳固钱粮根基' },
+    { name: '主动出击', position: '第四阶段', impact: '连挫强敌劲旅，收复沦陷失地' },
+    { name: '再造新局', position: '第四阶段', impact: '定鼎立制、万邦来朝，开创一统新局' },
   ]
   return {
     storyOrigin: c.era || (c.pn + '身处乱世漩涡，于王朝将倾之际谋定后动'),
@@ -2616,15 +2788,15 @@ function deriveOutline(c: any): any {
       powerSystem: c.sysName || '',
     },
     narrativeLines: [
-      { name: '复国中兴主线', type: '主线', description: c.pn + '从乱世立足到驱逐外虏、再造社稷的完整历程', keyNodes: stages.slice(0, 5).map(function (s) { return s.name }) },
-      { name: '朝堂权谋线', type: '主线', description: '清洗投降派与党争内耗，重建中枢权威，权衡各方势力', keyNodes: ['铲除权奸', '整肃朝纲', '推行新政', '集权中枢'] },
-      { name: '军事改革线', type: '副线', description: '编练新军、革新火器战法，打造嫡系武装', keyNodes: ['创建新军', '初战立威', '攻坚野战', '决战破敌'] },
-      { name: '情牵家国线', type: '副线', description: '主角与女主在乱世中相知相守、共担家国之重', keyNodes: ['患难相识', '并肩抗压', '生死考验', '携手中兴'] },
+      { name: '崛起主线', type: '主线', description: c.pn + '从乱世立足到扫除外患、重整山河的完整历程', keyNodes: stages.slice(0, 5).map(function (s) { return s.name }) },
+      { name: '朝堂权谋线', type: '主线', description: '清洗投机派系与党争内耗，重建中枢权威，权衡各方势力', keyNodes: ['铲除权奸', '整肃朝纲', '推行新政', '集权中枢'] },
+      { name: '军事改革线', type: '副线', description: '编练新军、革新战法，打造嫡系武装', keyNodes: ['创建新军', '初战立威', '攻坚野战', '决战破敌'] },
+      { name: '情牵家国线', type: '副线', description: '主角与女主在乱世中相知相守、共担家国之重', keyNodes: ['患难相识', '并肩抗压', '生死考验', '携手终成'] },
     ],
     foreshadowingMap: [
       { id: '主角来历之秘', content: '其超前识见令身边人暗自疑窦 → 关键节点先见之明部分显露，成为凝聚人心契机', plantedChapter: '第1-2卷', recoveredChapter: '中期卷', importance: 5 },
-      { id: '降清暗桩', content: '议和之声与重臣暧昧书信若隐若现 → 出卖军机之谋败露，触发清洗投降派高潮', plantedChapter: '第1卷', recoveredChapter: '第3-5卷', importance: 5 },
-      { id: '新军雏形', content: '主角暗中编练的新式部队早期不被看好 → 国运危殆时成为翻盘利刃', plantedChapter: '第2卷', recoveredChapter: '北伐阶段', importance: 5 },
+      { id: '内部暗流', content: '议和之声与重臣暧昧书信若隐若现 → 出卖军机之谋败露，触发清洗内奸高潮', plantedChapter: '第1卷', recoveredChapter: '第3-5卷', importance: 5 },
+      { id: '新军雏形', content: '主角暗中编练的新式部队早期不被看好 → 国运危殆时成为翻盘利刃', plantedChapter: '第2卷', recoveredChapter: '反攻阶段', importance: 5 },
       { id: '敌国内隙', content: '敌方阵营权力交接与内部分歧暗流涌动 → 决战之际内乱爆发，提供战略窗口', plantedChapter: '第4卷', recoveredChapter: '结局卷', importance: 3 },
     ],
     protagonistGrowthCurve: stages.map(function (s, i) { return {
@@ -2639,19 +2811,20 @@ function deriveOutline(c: any): any {
       { stage: '败亡收束', antagonist: '强敌', growthPoint: '内乱外患交织，终被彻底击破', powerLevel: histLadder[3], threatLevel: '中' },
     ],
     conflictLayers: [
-      { layer: '外部存亡', conflict: '强敌兵锋直指存亡，步步进逼岭南残局', stakes: '国祚存续、天下归属' },
-      { layer: '朝堂内斗', conflict: '权奸党争与降清暗桩从中作梗，掣肘中兴大业', stakes: '皇权稳固、新政推行' },
-      { layer: '理念之争', conflict: '守成与变法的路线博弈，新锐与旧贵短兵相接', stakes: '中兴道路之抉择' },
+      { layer: '外部存亡', conflict: '强敌兵锋直指存亡，步步进逼危局残局', stakes: '国祚存续、天下归属' },
+      { layer: '朝堂内斗', conflict: '权奸党争与投机派系从中作梗，掣肘图强大业', stakes: '王权稳固、新政推行' },
+      { layer: '理念之争', conflict: '守成与变法的路线博弈，新锐与旧贵短兵相接', stakes: '复兴道路之抉择' },
     ],
     keyArtifacts: [
-      { name: c.sysName || '山河签到系统', type: '金手指', origin: '横空出世，来历成谜', function: '每踏一城签到即得粮草、火器、精兵，为主角提供逆势翻盘的根本依托', owner: c.pn, importance: 5 },
+      { name: c.sysName || '神秘金手指', type: '金手指', origin: '横空出世，来历成谜', function: '为主角提供立足乱世、逆转局势的根本依托，随成长不断解锁新能力', owner: c.pn, importance: 5 },
     ],
   }
 }
 function deriveKeyPlots(c: any): any {
   var stages = extractGoalStages(c)
   if (stages.length === 0) stages = historyStageTemplate(c)
-  var histHooks = ['逆转扬州十日之危', '清君侧扳倒权奸', '编练新军首战告捷', '两蹶名王大破强敌', '克复故宫定鼎中兴', '万国来朝海内归心']
+  // 🔥 #178 中性化：原 histHooks 写死明末事件（扬州十日/克复故宫定鼎中兴）
+  var histHooks = ['绝境觉醒逆转危局', '整肃朝纲扳倒权奸', '编练新军首战告捷', '连挫强敌收复失地', '定鼎立制再造新局', '海内归心开创盛世']
   var keyPlots = stages.map(function (s, i) { return {
     title: s.name,
     volume: i + 1,
@@ -2669,11 +2842,11 @@ function deriveKeyPlots(c: any): any {
     summary: s.desc,
   } })
   return {
-    coreConflict: c.coreConflict || (c.pn + '凭山河签到系统于重劫之中绝地逆袭、再造中兴'),
+    coreConflict: c.coreConflict || (c.pn + '凭' + (c.sysName || '神秘金手指') + '于重劫之中绝地逆袭、重整山河'),
     volumes: volumes,
     keyPlots: keyPlots,
     turningPoints: turningPoints,
-    climax: c.pn + '在两蹶名王、克复故都的关键决战中，彻底击溃强敌，奠定一统之基。',
+    climax: c.pn + '在决定命运走向的关键决战中，彻底击溃最强之敌，奠定一统之基。',
   }
 }
 
@@ -2700,6 +2873,12 @@ function normalizeSynopsisData(data: any, ctx?: any): any {
   var keywords = Array.isArray(data.keywords) ? data.keywords.map(normalizeToString).filter(Boolean) : []
   var suspenseSetup = Array.isArray(data.suspenseSetup) ? data.suspenseSetup.map(normalizeToString).filter(Boolean) : []
   var coreGoldenQuote = normalizeToString(data.coreGoldenQuote || data.goldenQuote || data.slogan || data.tagline || '')
+  // 🔥 2026-09-08 #163 金句回退（交接包 P2）：synopsis 自身无金句时，回退 idea.coreGoldenQuote。
+  //   此前 StepSynopsis 显示层只有 data.coreGoldenQuote 兜底，而 API 新生成的 synopsis 不含该字段
+  //   → 金句空白触发"必填"红色警告，只能靠数据层脚本（F9）兜底。三字段在此统一。
+  var _ideaQuote = (ctx && ctx.idea && normalizeToString(ctx.idea.coreGoldenQuote)) || ''
+  var coreGoldenSentence = normalizeToString(data.coreGoldenSentence || data.coreGoldenQuote || data.goldenQuote || data.slogan || _ideaQuote || '')
+  var coreGoldenQuoteFinal = coreGoldenQuote || coreGoldenSentence
   var openingHook = normalizeToString(data.openingHook || data.openingSuspense || '')
   var fanqieVersion = normalizeToString(data.fanqieVersion || data.tomatoVersion || '')
   var qidianVersion = normalizeToString(data.qidianVersion || data.qdVersion || '')
@@ -2717,8 +2896,9 @@ function normalizeSynopsisData(data: any, ctx?: any): any {
     keywords,
     openingHook,
     suspenseSetup,
-    coreGoldenQuote,
-    goldenQuote: coreGoldenQuote,
+    coreGoldenQuote: coreGoldenQuoteFinal,
+    goldenQuote: coreGoldenQuoteFinal,
+    coreGoldenSentence: coreGoldenSentence,
     fanqieVersion,
     qidianVersion,
     targetReaderProfile,
@@ -3159,6 +3339,187 @@ function createDefaultChar(role: string): any {
   }
 }
 
+// ============================================================================
+// 🔥🔥🔥 2026-09-11 严重 bug 修复：书架↔向导草稿箱双向同步 + 删除同步
+//   根因：书架草稿箱读服务端 /api/novels(status==='drafting')，向导草稿箱只读
+//        localStorage['tuzhong-drafts-index']，两套数据源互不相通；删除互不通知。
+//   方案：服务端为唯一权威源；localStorage 仅补充「服务端尚未建单」的临时草稿；
+//        删除统一走 deleteDraftShared()（服务端删除 + 本地清理 + 事件广播），
+//        同页自定义事件 + 跨标签 storage 事件，两侧即时同步。供 page.tsx 复用。
+// ============================================================================
+export interface DraftEntry {
+  id: string
+  title: string
+  lastStep: string
+  updatedAt: number
+  genre?: string
+  coverUrl?: string
+  wordCount?: number
+  lastModified?: string
+  fromServer?: boolean
+}
+
+export const DRAFTS_INDEX_KEY = 'tuzhong-drafts-index'
+export const DRAFTS_SERVER_IDS_KEY = 'tuzhong-drafts-server-ids'
+export const ACTIVE_NOVEL_ID_KEY = 'tuzhong-active-novel-id'
+export const PENDING_OPEN_DRAFT_KEY = 'tuzhong-pending-open-draft'
+export const DRAFTS_CHANGED_EVENT = 'tuzhong-drafts-changed'
+const DRAFTS_MAX = 30
+const DRAFT_LOCAL_KEY_PREFIXES = [
+  'tuzhong-draft-data-',
+  'tuzhong-draft-step-',
+  'tuzhong-draft-theme-',
+  'tuzhong-draft-chapters-',
+  'tuzhong-draft-chapter-idx-',
+  'tuzhong-draft-volume-',
+]
+
+/** 读取本地草稿索引（容错，永不抛错） */
+export function readLocalDraftsIndex(): DraftEntry[] {
+  try {
+    const raw = localStorage.getItem(DRAFTS_INDEX_KEY)
+    if (!raw) return []
+    const parsed = JSON.parse(raw)
+    return Array.isArray(parsed) ? parsed.filter((d: any) => d && d.id) : []
+  } catch { return [] }
+}
+
+function writeLocalDraftsIndex(list: DraftEntry[]) {
+  try { localStorage.setItem(DRAFTS_INDEX_KEY, JSON.stringify(list)) } catch { /* ignore */ }
+}
+
+function readServerDraftIds(): string[] {
+  try {
+    const raw = localStorage.getItem(DRAFTS_SERVER_IDS_KEY)
+    if (!raw) return []
+    const parsed = JSON.parse(raw)
+    return Array.isArray(parsed) ? parsed.map((x: any) => String(x)) : []
+  } catch { return [] }
+}
+
+function writeServerDraftIds(ids: string[]) {
+  try { localStorage.setItem(DRAFTS_SERVER_IDS_KEY, JSON.stringify(Array.from(new Set(ids.filter(Boolean))))) } catch { /* ignore */ }
+}
+
+/** 仅保留「进行中」草稿（lastStep 存在且非 complete） */
+export function filterInProgressDrafts(list: DraftEntry[]): DraftEntry[] {
+  return (list || []).filter((d) => d && d.id && d.lastStep && d.lastStep !== 'complete')
+}
+
+/** 拉取服务端草稿列表（status==='drafting'）；失败返回 [] */
+export async function fetchServerDrafts(): Promise<any[]> {
+  try {
+    const token = localStorage.getItem('token') || ''
+    const headers: Record<string, string> = {}
+    if (token) headers['Authorization'] = 'Bearer ' + token
+    const r = await fetch('/tuzhong-wenshu/api/novels', { headers })
+    if (!r || !r.ok) return []
+    const j = await r.json()
+    if (!j || !Array.isArray(j.data)) return []
+    return j.data.filter((n: any) => n && n.id && String(n.status) === 'drafting')
+  } catch { return [] }
+}
+
+function serverDraftToEntry(n: any, local?: DraftEntry): DraftEntry {
+  const ts = Date.parse(String(n.lastModified || n.updatedAt || ''))
+  return {
+    id: String(n.id),
+    title: (local && local.title) || n.title || '（未命名草稿）',
+    // 服务端不携带 lastStep（由向导本地记录），故优先本地、缺省 'idea'
+    lastStep: (local && local.lastStep) || 'idea',
+    updatedAt: (local && local.updatedAt) || (isNaN(ts) ? Date.now() : ts),
+    genre: (local && local.genre) || n.genre || '',
+    coverUrl: (local && local.coverUrl) || n.coverUrl || n.cover || '',
+    wordCount: Number(n.wordCount || 0),
+    lastModified: String(n.lastModified || ''),
+    fromServer: true,
+  }
+}
+
+/**
+ * 服务端 ∪ 本地，按 id 去重（同 id 以服务端为准）；并剪除「服务端曾存在、现已被删」的条目。
+ * knownServerIds = 上一次对账时服务端存在的 id 集合，用于识别服务端侧删除。
+ */
+export function buildDraftUnion(serverDrafts: any[], localIndex: DraftEntry[], knownServerIds: string[]): DraftEntry[] {
+  const serverList = Array.isArray(serverDrafts) ? serverDrafts.filter((n) => n && n.id) : []
+  const serverIds = new Set(serverList.map((n) => String(n.id)))
+  const known = new Set((knownServerIds || []).map(String))
+  // 本地项：服务端已删（曾存在 now 不存在）→ 剪除；其余保留（含服务端尚未建单的临时草稿）
+  const localKept = (localIndex || []).filter((d) => {
+    const id = String(d && d.id)
+    if (!id) return false
+    if (known.has(id) && !serverIds.has(id)) return false
+    return true
+  })
+  const byId = new Map<string, DraftEntry>()
+  localKept.forEach((d) => byId.set(String(d.id), Object.assign({}, d, { fromServer: serverIds.has(String(d.id)) })))
+  serverList.forEach((n) => {
+    const id = String(n.id)
+    byId.set(id, serverDraftToEntry(n, byId.get(id)))
+  })
+  const list = Array.from(byId.values())
+  list.sort((a, b) => (Number(b.updatedAt) || 0) - (Number(a.updatedAt) || 0))
+  return list.slice(0, DRAFTS_MAX)
+}
+
+/**
+ * 与服务端对账：剪除已删 → 并集去重 → 写回本地索引 & 服务端 id 集合 → 返回「进行中」列表。
+ * 服务端列表为空时同样执行（用于收敛两侧 id 集合），失败时回退本地索引。
+ */
+export function reconcileDraftsWithServer(serverDrafts: any[]): DraftEntry[] {
+  try {
+    const local = readLocalDraftsIndex()
+    const known = readServerDraftIds()
+    const union = buildDraftUnion(serverDrafts, local, known)
+    writeLocalDraftsIndex(union)
+    writeServerDraftIds((Array.isArray(serverDrafts) ? serverDrafts : []).map((n) => String(n && n.id)).filter(Boolean))
+    return filterInProgressDrafts(union)
+  } catch {
+    return filterInProgressDrafts(readLocalDraftsIndex())
+  }
+}
+
+/** 广播草稿变更（同页跨组件即时同步；跨标签页由 storage 事件覆盖） */
+export function notifyDraftsChanged(detail?: { deletedId?: string; wasActive?: boolean }) {
+  try { window.dispatchEvent(new CustomEvent(DRAFTS_CHANGED_EVENT, { detail: detail || {} })) } catch { /* ignore */ }
+}
+
+/**
+ * 统一删除草稿：服务端删除 + 本地索引/副本清理 + 悬挂 active 清理 + 事件广播。
+ * 书架与向导两侧必须调用同一个本函数，禁止各写一套。
+ */
+export async function deleteDraftShared(draftId: string, _title?: string): Promise<{ ok: boolean; serverDeleted: boolean }> {
+  if (!draftId) return { ok: false, serverDeleted: false }
+  let serverDeleted = false
+  try {
+    const token = localStorage.getItem('token') || ''
+    const res = await fetch('/tuzhong-wenshu/api/novels?id=' + encodeURIComponent(draftId), {
+      method: 'DELETE',
+      headers: token ? { Authorization: 'Bearer ' + token } : {},
+    })
+    serverDeleted = !!res && res.ok
+  } catch { serverDeleted = false }
+
+  // ① 本地 per-draft 副本
+  try { for (const p of DRAFT_LOCAL_KEY_PREFIXES) localStorage.removeItem(p + draftId) } catch { /* ignore */ }
+  // ② 本地索引
+  writeLocalDraftsIndex(readLocalDraftsIndex().filter((d) => String(d.id) !== String(draftId)))
+  // ③ 服务端 id 集合
+  writeServerDraftIds(readServerDraftIds().filter((id) => String(id) !== String(draftId)))
+  // ④ 悬挂引用：被删的正是当前 active → 清 key
+  let wasActive = false
+  try {
+    if ((localStorage.getItem(ACTIVE_NOVEL_ID_KEY) || '') === draftId) {
+      wasActive = true
+      localStorage.removeItem(ACTIVE_NOVEL_ID_KEY)
+    }
+    if ((localStorage.getItem(PENDING_OPEN_DRAFT_KEY) || '') === draftId) localStorage.removeItem(PENDING_OPEN_DRAFT_KEY)
+  } catch { /* ignore */ }
+  // ⑤ 广播
+  notifyDraftsChanged({ deletedId: draftId, wasActive })
+  return { ok: true, serverDeleted }
+}
+
 interface AIGenerateWizardProps {
   onClose?: () => void
   onComplete?: (data: {
@@ -3173,9 +3534,12 @@ interface AIGenerateWizardProps {
   embedded?: boolean
 }
 
-type Step = 'input' | 'idea' | 'synopsis' | 'outline' | 'worldbuilding' | 'characters' | 'relationships' | 'factions' | 'powerSystem' | 'chapters' | 'keyPlots' | 'generating' | 'checklist' | 'cover' | 'finalCheck' | 'complete'
+type Step = 'input' | 'idea' | 'synopsis' | 'outline' | 'worldbuilding' | 'characters' | 'relationships' | 'factions' | 'powerSystem' | 'chapters' | 'keyPlots' | 'content' | 'generating' | 'checklist' | 'cover' | 'finalCheck' | 'complete'
 
 export interface GeneratedData {
+  // 🔥 修订计数器（运行时注入的额外字段，由分步保存/回返恢复逻辑维护）
+  _charsRev?: number
+  _secRev?: Record<string, number>
   idea?: {
     title: string
     tagline: string
@@ -3337,6 +3701,21 @@ export interface GeneratedData {
 export default function AIGenerateWizard({ onClose, onComplete, initialGenre, isCreating, embedded }: AIGenerateWizardProps) {
   var __TEST_MODE__ = false
   var [step, setStep] = useState<Step>('input')
+  // 🔥 2026-11-05 刷新保持向导步骤：step 写入 localStorage，刷新/重开后回到原步骤（数据由快照+后端同步恢复）
+  var _WIZARD_STEPS = ['input','idea','synopsis','outline','worldbuilding','characters','relationships','factions','powerSystem','chapters','keyPlots','content','generating','checklist','cover','finalCheck','complete']
+  useEffect(function() {
+    try {
+      if (typeof window === 'undefined') return
+      var _saved = localStorage.getItem('tuzhong-wizard-step')
+      if (_saved && _WIZARD_STEPS.indexOf(_saved) >= 0) {
+        setStep(_saved as Step)
+        console.log('[WizardStep] 已恢复步骤:', _saved)
+      }
+    } catch (_se) {}
+  }, [])
+  useEffect(function() {
+    try { if (typeof window !== 'undefined') localStorage.setItem('tuzhong-wizard-step', step) } catch (_se2) {}
+  }, [step])
   var [keywords, setKeywords] = useState('')
   var [detailedDesignInput, setDetailedDesignInput] = useState('')
   var [userBookTitle, setUserBookTitle] = useState('')
@@ -3375,10 +3754,10 @@ export default function AIGenerateWizard({ onClose, onComplete, initialGenre, is
     if (userModifiedVolumeConfig) return
     var _kp = (generatedData && (generatedData as any).keyPlots) || {}
     var _vols = Array.isArray(_kp.volumes) ? _kp.volumes : []
-    if (_vols.length >= 2) {
+    if (_vols.length > 0) {
       setVolumeConfig(function (prev: { volumeCount: number; chaptersPerVolume: number }) {
         if (prev.volumeCount === _vols.length) return prev
-        console.log('[Chapters] 🔥 卷数自动对齐关键剧情节点:', prev.volumeCount, '→', _vols.length)
+        console.log('[Chapters] 🔥 卷数自动对齐分卷剧情结构:', prev.volumeCount, '→', _vols.length)
         return { volumeCount: _vols.length, chaptersPerVolume: prev.chaptersPerVolume || 60 }
       })
     }
@@ -3395,6 +3774,8 @@ export default function AIGenerateWizard({ onClose, onComplete, initialGenre, is
   var [draftsIndex, setDraftsIndex] = useState<Array<{ id: string; title: string; lastStep: string; updatedAt: number; genre?: string; coverUrl?: string }>>([])
   var [showDraftBox, setShowDraftBox] = useState(false)
   var [draftBoxMsg, setDraftBoxMsg] = useState('')
+  // 🔥 2026-09-07（#147）主题变更守卫的可见横幅（渲染在 wizard 主体，非草稿箱 Modal 内——Modal 已关闭时用户也能看到清空提示）
+  var [themeGuardMsg, setThemeGuardMsg] = useState('')
   // 草稿箱恢复用：标记是否正在从草稿箱点击进入某个旧草稿（防止 mount 阶段误清空）
   var draftRestoreInProgressRef = useRef(false)
   // 🔥 2026-09-01 第13轮：角色分批生成的定时器句柄，重新生成 / 组件卸载时统一清理，避免幽灵批次串数据
@@ -3415,36 +3796,110 @@ export default function AIGenerateWizard({ onClose, onComplete, initialGenre, is
   var [imitateSearch, setImitateSearch] = useState('')
   var [imitateData, setImitateData] = useState<any>(null)
   var imitateDataRef = useRef<any>(null)
+  // 🔥 2026-11-06：异步回调（openDraft 服务端同步）读取最新搜索词的 ref
+  var imitateSearchRef = useRef('')
+  useEffect(function () { imitateSearchRef.current = imitateSearch }, [imitateSearch])
   // 🔥 三种创作方式：'normal'(普通) | 'imitate'(仿写) | 'fanfiction'(同人文) | 'custom'(自己设计)
   var [creationMode, setCreationMode] = useState<'normal' | 'imitate' | 'fanfiction' | 'custom'>('normal')
   var [appendRoleInput, setAppendRoleInput] = useState('')
   var abortCtrlRef = useRef<AbortController | null>(null)
   var genDebounceRef = useRef(0)
   var saveDebounceRef = useRef(0)
+  // 🔥 #224：自动保存的「上一帧快照」，用于区分「真实内容变更」与「仅 rev 采纳」。
+  //   服务端每次接受写入都会把 _secRev/_charsRev 加一（nextRev = max(srv,inc)+1），
+  //   旧实现把新 rev setState 回 generatedData 又会触发下面的自动保存 effect →
+  //   保存 → 采纳新 rev → 再保存 → 无限自激（实测静置 141s 仍每 2.7s 一次 POST，
+  //   每次整库 9.8MB 落盘）。rev 采纳是 Object.assign({}, prev, {_charsRev,_secRev})，
+  //   其余键保持同一引用，故用「浅引用比较」即可零成本识别 rev-only 变更并跳过保存。
+  var lastGenSnapshotRef = useRef<any>(null)
   var chapterGenLockRef = useRef(false)  // 🔥 章节生成互斥锁，防止重复API调用
   var chapterConfigGenLockRef = useRef(false)  // 🔥🔥🔥 章节配置生成独立锁，防止componentGenerateChaptersFromConfig被重复调用
+
+  // 🔥 2026-11-06 复测根因：_buildPersistedIdea 会被 beforeunload/防抖定时器以「首帧闭包」调用，
+  //   直接读 state 永远拿到初始值（creationMode='normal'、imitate 为空）→ 服务端 idea 丢失仿写状态。
+  //   与 genreRef 同模式，为 creationMode / bookAnalysisResult 建立实时 ref。
+  var creationModeRef = useRef(creationMode)
+  useEffect(function () { creationModeRef.current = creationMode }, [creationMode])
+  var bookAnalysisResultRef = useRef<any>(null)
+
+  // 🔥 2026-11-06：idea 落服务端时必须携带「输入主题」环节的交互状态（作品类型多选 / 创作模式 / 仿写原作品）。
+  //   此前 genre/creationMode/imitate 只存浏览器 localStorage 快照，服务端 idea 里根本没有这些字段，
+  //   换设备或清缓存后打开草稿就会出现：仿写作品显示为空、作品类型只剩小说记录里的单个旧值（图1/图2 的根因）。
+  var _buildPersistedIdea = function (baseIdea: any) {
+    var _idea = Object.assign({}, baseIdea || {})
+    var _g = String(genreRef.current || '').trim()
+    if (_g) _idea.genre = _g
+    // 🔥 2026-11-06 复测发现：beforeunload/防抖等回调捕获的是首帧闭包，
+    //   直接读 state（creationMode/imitateSearch/bookAnalysisResult）会拿到旧值 'normal'/空，
+    //   导致服务端 idea.creationMode/imitate 丢失。全部改读 ref（与 genreRef 同一模式）。
+    var _cm = creationModeRef.current
+    _idea.creationMode = _cm
+    if (_cm === 'imitate' || _cm === 'fanfiction') {
+      var _im = imitateDataRef.current || null
+      var _title = String(imitateSearchRef.current || (_im && _im.title) || '').trim()
+      if (_title || _im || bookAnalysisResultRef.current) {
+        _idea.imitate = { title: _title, analysis: _im || null, bookAnalysis: bookAnalysisResultRef.current || null }
+      }
+    }
+    return _idea
+  }
 
   var saveSettings = async function(data: any) {
     try {
       var novelId = localStorage.getItem('tuzhong-active-novel-id') || 'temp'
       if (!novelId || novelId === 'temp') return
-      await fetch('/tuzhong-wenshu/api/settings', {
+      var _resp = await fetch('/tuzhong-wenshu/api/settings', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           novelId,
           type: 'batch',
+          // 🔥 #199 人物版本号回带：服务端据此拒绝旧快照整体回写
+          _charsRev: (data && Number(data._charsRev)) || 0,
+          // 🔥 #201 全环节版本号回带
+          _secRev: (data && data._secRev && typeof data._secRev === 'object') ? data._secRev : {},
           worldbuilding: data.worldbuilding || {},
           powerSystem: data.powerSystem || {},
           characters: data.characters || {},
           factions: data.factions || {},
           relationships: data.relationships || {},
           keyPlots: data.keyPlots || {},
-          idea: data.idea || {},
+          idea: _buildPersistedIdea(data.idea),
           synopsis: data.synopsis || {},
           outline: data.outline || {},
         }),
       })
+      // 🔥 #199/#201：保存成功后采纳服务端最新版本号；落后环节被拒收时定向回拉权威数据
+      try {
+        var _j = await _resp.json()
+        var _revChanged = false
+        if (_j && _j.data && _j.data._charsRev != null) {
+          var _nv = Number(_j.data._charsRev) || 0
+          if ((Number(generatedDataRef.current && generatedDataRef.current._charsRev) || 0) !== _nv) {
+            _revChanged = true
+            generatedDataRef.current = Object.assign({}, generatedDataRef.current, { _charsRev: _nv })
+          }
+        }
+        if (_j && _j.data && _j.data._secRev && typeof _j.data._secRev === 'object') {
+          var _curSecRev = (generatedDataRef.current && generatedDataRef.current._secRev) || {}
+          if (JSON.stringify(_curSecRev) !== JSON.stringify(_j.data._secRev)) {
+            _revChanged = true
+            generatedDataRef.current = Object.assign({}, generatedDataRef.current, { _secRev: _j.data._secRev })
+          }
+        }
+        if (_revChanged) {
+          var _finalRef = generatedDataRef.current
+          setGeneratedData(function (prev: any) { return Object.assign({}, prev, { _charsRev: _finalRef._charsRev, _secRev: _finalRef._secRev }) })
+          try { localStorage.setItem('tuzhong-generated-data', JSON.stringify(generatedDataRef.current)) } catch (_le) {}
+        }
+        var _staleList: string[] = []
+        if (_j && _j.staleCharacters) _staleList.push('characters')
+        if (_j && Array.isArray(_j.staleSections)) _staleList = _staleList.concat(_j.staleSections)
+        if (_staleList.length > 0) {
+          console.warn('[Settings] #199/#201 落后环节被拒收，定向回拉:', _staleList.join(','))
+          resyncSections(novelId, _staleList)
+        }
+      } catch (_je) {}
       console.log('[Settings] Saved successfully')
     } catch (e) {
       console.warn('[WARN] Failed to save settings')
@@ -3459,6 +3914,25 @@ export default function AIGenerateWizard({ onClose, onComplete, initialGenre, is
       await saveSettings(data)
     }, 2000)
   }, [])
+
+  // 🔥 修复3：角色页 characters 变更后立即落盘（不等 2s 防抖 / 不依赖步骤切换触发 persistDraftProgress）。
+  //   背景：StepCharacters「一键校正徽章与定位」onChange 只写 React state，用户停留角色页时
+  //   syncDraftFromServer 的服务端权威整体覆盖会把旧 title 打回。
+  //   实现：同步把 corrected characters 合入 generatedDataRef（不受 React 批处理时序影响），
+  //   记录校正时间戳（保护窗口依据），再走既有 saveSettings —— 上送回带最新 _charsRev/_secRev，
+  //   被服务端 #199/#201 拒收时自动走既有 resyncSections 定向回拉流程，不破坏版本守卫语义。
+  var persistCharactersChange = function (updated: any) {
+    try {
+      var _cur: any = generatedDataRef.current || {}
+      generatedDataRef.current = Object.assign({}, _cur, { characters: updated })
+      charCorrectedAtRef.current = Date.now()
+      // 节流：5s 内多次变更只立即落盘一次，其余由既有 2s 防抖保存兜底
+      var _now = Date.now()
+      if (_now - _lastCharsPersistAtRef.current < 5000) return
+      _lastCharsPersistAtRef.current = _now
+      void saveSettings(generatedDataRef.current)
+    } catch (_e) { console.warn('[StepCharacters onChange] characters 立即落盘失败:', _e) }
+  }
 
   // 🔥 Bug修复：保持 generatedDataRef 始终与 generatedData 同步，解决 React 闭包陷阱
   useEffect(function () {
@@ -3492,7 +3966,7 @@ export default function AIGenerateWizard({ onClose, onComplete, initialGenre, is
     queueMicrotask(function() {
       try {
         var savedStep = localStorage.getItem('tuzhong-current-step')
-        var steps: Step[] = ['input', 'idea', 'synopsis', 'outline', 'worldbuilding', 'powerSystem', 'characters', 'relationships', 'factions', 'keyPlots', 'chapters', 'generating', 'complete']
+        var steps: Step[] = ['input', 'idea', 'synopsis', 'outline', 'worldbuilding', 'powerSystem', 'characters', 'relationships', 'factions', 'keyPlots', 'chapters', 'content', 'generating', 'complete']
         if (savedStep && steps.indexOf(savedStep as Step) !== -1 && savedStep !== 'input') {
           setStep(savedStep as Step)
         }
@@ -3546,12 +4020,21 @@ export default function AIGenerateWizard({ onClose, onComplete, initialGenre, is
                 var _resolvedInput = resolveInputFromIdea((parsed && parsed.idea) || null, _th.keywords, _th.genre)
                 if (_resolvedInput.keywords) setKeywords(_resolvedInput.keywords)
                 if (_resolvedInput.genre) setGenre(_resolvedInput.genre)
-                if (_th.detailedDesignInput) setDetailedDesignInput(_th.detailedDesignInput)
+                // 🔥 #217 快照可能比服务端 idea.userDesign 旧/截断 → reconcile 补全
+                setDetailedDesignInput(function (prev: string) {
+                  var _snapDesign = typeof _th.detailedDesignInput === 'string' ? _th.detailedDesignInput : ''
+                  var _serverDesign = ((parsed && parsed.idea && parsed.idea.userDesign) || '') as string
+                  return _reconcileDesignInput(_snapDesign, _serverDesign)
+                })
                 if (_th.protagonistName) setProtagonistName(_th.protagonistName)
                 if (_th.userBookTitle) setUserBookTitle(_th.userBookTitle)
                 if (_th.protagonistGender) setProtagonistGender(_th.protagonistGender)
                 if (_th.protagonistAge) setProtagonistAge(_th.protagonistAge)
                 if (_th.protagonistIdentity) setProtagonistIdentity(_th.protagonistIdentity)
+                // 🔥 修复2：服务端 idea.userSpecifiedIdentity 非空即为权威值，覆盖浏览器旧快照
+                //   （快照可能是旧口径，如「程序员雨田诺」；服务端已是修正后的「史学青年」口径）
+                var _srvIdentity = (parsed && parsed.idea && (parsed.idea as any).userSpecifiedIdentity) || ''
+                if (_srvIdentity) setProtagonistIdentity(String(_srvIdentity))
                 if (_th.creationMode) setCreationMode(_th.creationMode)
                 // 🔥 2026-09-06 输入主题类型回填：从服务端作品记录补齐 genre
                 backfillGenreFromServer(localStorage.getItem('tuzhong-active-novel-id') || '')
@@ -3567,6 +4050,23 @@ export default function AIGenerateWizard({ onClose, onComplete, initialGenre, is
               if (_id.userSpecifiedGender) setProtagonistGender(_id.userSpecifiedGender)
               if (_id.userSpecifiedAge) setProtagonistAge(String(_id.userSpecifiedAge))
               if (_id.userSpecifiedIdentity) setProtagonistIdentity(_id.userSpecifiedIdentity)
+              // 🔥 #226 缺陷1修复：草稿恢复时补回 creationMode。
+              //   此前该回退分支（tuzhong-theme-input 快照缺失）从不恢复 creationMode，而 useState 初值为 'normal'，
+              //   于是「自己设计」卡片不高亮、无 ✓，但详细设定输入区却有内容（用户报的 bug）。
+              //   优先级：服务端 idea.creationMode（权威值）> 语义推断（userDesign 非空 → 'custom'，否则 'normal'）。
+              var _restoreCM = ''
+              if (typeof (_id as any).creationMode === 'string' && (_id as any).creationMode) {
+                _restoreCM = (_id as any).creationMode
+              } else if (typeof _id.userDesign === 'string' && _id.userDesign.trim()) {
+                _restoreCM = 'custom'
+              } else {
+                _restoreCM = 'normal'
+              }
+              if (_restoreCM === 'imitate' || _restoreCM === 'fanfiction' || _restoreCM === 'custom' || _restoreCM === 'normal') {
+                setCreationMode(_restoreCM as 'normal' | 'imitate' | 'fanfiction' | 'custom')
+                // 与卡片点击行为保持一致：仿写/同人文联动 imitateMode（供 buildImitatePayload 判定）
+                setImitateMode(_restoreCM === 'imitate' || _restoreCM === 'fanfiction')
+              }
               backfillGenreFromServer(localStorage.getItem('tuzhong-active-novel-id') || '')
             }
           } catch (_te) { /* ignore */ }
@@ -3610,6 +4110,172 @@ export default function AIGenerateWizard({ onClose, onComplete, initialGenre, is
   }, [])
 
   // 🔥🔥🔥 2026-09-02 修复图二·草稿箱断点续创作：
+  // 🔥 2026-09-07（#144）草稿服务器优先同步：草稿箱/挂载恢复此前只读 localStorage，
+  //   用户换浏览器/清缓存/服务端数据已修复重生成时，本地旧数据会"原问题显示"（用户实测反馈）。
+  //   所有生成步骤都会 persistDraftProgress 落盘到服务端 settings → 服务端为权威数据源。
+  //   打开草稿/挂载恢复后异步拉取服务端数据：有有效 idea 时整体覆盖本地 generatedData 并写回 localStorage。
+  // 🔥 修复3：角色页「一键校正徽章与定位」/手动编辑角色后，本地 characters 的最新修改时间戳。
+  //   syncDraftFromServer 回包合并时若处于 5 分钟保护窗口内，保留本地 characters 不被服务端旧数据覆盖。
+  var charCorrectedAtRef = useRef<number>(0)
+  // 🔥 修复3：立即落盘节流（5s 内只发一次全量 batch，密集编辑交给既有 2s 防抖兜底）
+  var _lastCharsPersistAtRef = useRef<number>(0)
+
+  var syncDraftFromServer = function (novelId: string) {
+    if (!novelId || String(novelId).indexOf('draft-') === 0) return
+    try {
+      var _token = localStorage.getItem('token') || ''
+      var _headers: Record<string, string> = {}
+      if (_token) _headers['Authorization'] = 'Bearer ' + _token
+      fetch('/tuzhong-wenshu/api/settings?novelId=' + encodeURIComponent(novelId), { headers: _headers })
+        .then(function (r) { return r && r.ok ? r.json() : null })
+        .then(function (j) {
+          if (!j || !j.success || !j.data) return
+          var _s: any = j.data
+          // 服务端无有效生成数据（没有 idea）则不同步，避免空数据覆盖本地
+          if (!_s.idea || typeof _s.idea !== 'object') return
+          var _serverData: any = {}
+          var _keys = ['idea', 'worldbuilding', 'powerSystem', 'characters', 'factions', 'relationships', 'keyPlots', 'synopsis', 'outline', 'chapters']
+          for (var _i = 0; _i < _keys.length; _i++) {
+            var _k = _keys[_i]
+            if (_s[_k] && typeof _s[_k] === 'object') _serverData[_k] = _s[_k]
+          }
+          // 🔥 #199 服务端人物版本号随快照下发，保存时回带（落后回写会被服务端拒收）
+          _serverData._charsRev = Number(_s._charsRev) || 0
+          // 🔥 #201 全环节版本号随快照下发
+          _serverData._secRev = (_s._secRev && typeof _s._secRev === 'object') ? _s._secRev : {}
+          // 🔥 2026-09-08 #161 封面恢复：服务端快照 cover.coverUrl 映射回 generatedData.coverUrl。
+          //   缺失后果：草稿重开后封面步解锁门（hasStepData('cover')=!!coverUrl）失败被弹回，
+          //   且草稿索引写入 coverUrl=undefined → 书架封面缩略图丢失。
+          if (_s.cover && typeof _s.cover === 'object' && _s.cover.coverUrl) _serverData.coverUrl = _s.cover.coverUrl
+          if (!_serverData.idea) return
+          try {
+            var _designInput = ''
+            try { var _t = JSON.parse(localStorage.getItem('tuzhong-draft-theme-' + novelId) || 'null'); if (_t && _t.detailedDesignInput) _designInput = _t.detailedDesignInput } catch (_e2) {}
+            if (_serverData.characters) _serverData.characters = normalizeCharactersData(_serverData.characters, _designInput)
+            if (_serverData.factions) _serverData.factions = normalizeFactionsData(_serverData.factions, {
+              protagonistName: (_serverData.idea && _serverData.idea.protagonistName) || (_serverData.characters && _serverData.characters.protagonist && _serverData.characters.protagonist.name) || '',
+              genre: (_serverData.idea && _serverData.idea.genre) || '',
+              era: (_serverData.worldbuilding && _serverData.worldbuilding.era) || '',
+              keywords: Array.isArray(_serverData.idea && _serverData.idea.keywords) ? _serverData.idea.keywords.join('、') : '',
+            } as any)
+            if (_serverData.relationships) _serverData.relationships = normalizeRelationshipsData(_serverData.relationships)
+          } catch (_ne) { console.warn('[DraftSync] #144 服务端草稿重归一化失败:', _ne) }
+          // 🔥 修复3：角色页刚编辑/校正过徽章（5 分钟保护窗口内）→ 保留本地 characters，
+          //   防止在途的服务端权威整体覆盖把已校正的 title/定位打回旧值（仅 characters 环节受保护）。
+          if (_serverData.characters && charCorrectedAtRef.current > 0 && (Date.now() - charCorrectedAtRef.current) < 5 * 60 * 1000) {
+            var _localChars = generatedDataRef.current && generatedDataRef.current.characters
+            if (_localChars && typeof _localChars === 'object') {
+              _serverData.characters = _localChars
+              console.log('[DraftSync] 修复3 校正保护窗口内：保留本地 characters，不被服务端覆盖:', novelId)
+            }
+          }
+          // 写回 localStorage（下次打开离线也能拿到新数据）
+          try { localStorage.setItem('tuzhong-draft-data-' + novelId, JSON.stringify(_serverData)) } catch (_e3) {}
+          // 仅当是该草稿仍为活跃草稿时热替换当前会话状态
+          if ((localStorage.getItem('tuzhong-active-novel-id') || '') === novelId) {
+            setGeneratedData(_serverData)
+            generatedDataRef.current = _serverData
+            try { localStorage.setItem('tuzhong-generated-data', JSON.stringify(_serverData)) } catch (_e4) {}
+            // 卷章框架以服务端 chapters.volumes / keyPlots.volumes 设计卷数对齐
+            try {
+              var _sv = _serverData.chapters && Array.isArray(_serverData.chapters.volumes) ? _serverData.chapters.volumes.length : 0
+              var _kv = _serverData.keyPlots && Array.isArray(_serverData.keyPlots.volumes) ? _serverData.keyPlots.volumes.length : 0
+              var _dv = _sv > 0 ? _sv : _kv
+              if (_dv > 0) setVolumeConfig(function (prev: any) { return { volumeCount: _dv, chaptersPerVolume: (prev && prev.chaptersPerVolume) || 60 } })
+            } catch (_e5) {}
+            // 🔥 #217 输入主题字段随服务端权威数据补全（reconcile 只增不删，绝不缩短用户本地编辑）
+            var _serverDesign = (_serverData.idea && typeof _serverData.idea.userDesign === 'string') ? _serverData.idea.userDesign : ''
+            if (_serverDesign) {
+              setDetailedDesignInput(function (prev: string) { return _reconcileDesignInput(prev, _serverDesign) })
+              try {
+                var _thKey = 'tuzhong-draft-theme-' + novelId
+                var _thObj: any = {}
+                try { _thObj = JSON.parse(localStorage.getItem(_thKey) || '{}') || {} } catch (_e6) { _thObj = {} }
+                if (_reconcileDesignInput(_thObj.detailedDesignInput || '', _serverDesign) === _serverDesign && _thObj.detailedDesignInput !== _serverDesign) {
+                  _thObj.detailedDesignInput = _serverDesign
+                  localStorage.setItem(_thKey, JSON.stringify(_thObj))
+                }
+              } catch (_e7) { /* ignore */ }
+            }
+            // 🔥 修复2：服务端 idea.userSpecifiedIdentity 非空即为权威值 → 覆盖本地身份口径，
+            //   并回写 per-draft 主题快照，避免下次打开又恢复旧身份。
+            var _syncSrvIdentity = (_serverData.idea && (_serverData.idea as any).userSpecifiedIdentity) || ''
+            if (_syncSrvIdentity) {
+              setProtagonistIdentity(String(_syncSrvIdentity))
+              try {
+                var _thKey2 = 'tuzhong-draft-theme-' + novelId
+                var _thObj2: any = {}
+                try { _thObj2 = JSON.parse(localStorage.getItem(_thKey2) || '{}') || {} } catch (_e10) { _thObj2 = {} }
+                if (_thObj2.protagonistIdentity !== String(_syncSrvIdentity)) {
+                  _thObj2.protagonistIdentity = String(_syncSrvIdentity)
+                  localStorage.setItem(_thKey2, JSON.stringify(_thObj2))
+                }
+              } catch (_e9) { /* ignore */ }
+            }
+            // 关键词为空时从服务端 idea.userKeywords/keywords 回填（resolveInputFromIdea 已有该逻辑，复用）
+            var _rinput = resolveInputFromIdea(_serverData.idea, '', '')
+            setKeywords(function (prev: string) { return (prev && prev.trim()) ? prev : _rinput.keywords })
+            if (!String(genreRef.current || '').trim() && _rinput.genre) setGenre(_rinput.genre)
+            console.log('[DraftSync] #144 已从服务端同步草稿数据:', novelId)
+          }
+        })
+        .catch(function (_e) { console.warn('[DraftSync] #144 服务端同步失败:', _e) })
+    } catch (_e) { /* ignore */ }
+  }
+
+  // 🔥 Bug1 修复（草稿箱两套数据源互不相通）：以服务端 /tuzhong-wenshu/api/novels（status==='drafting'）为唯一权威源，
+  //   把服务端草稿按 id 并集去重合并进本地 draftsIndex，使「书架草稿箱」与「向导内草稿箱」同源；
+  //   结果写回 localStorage['tuzhong-drafts-index']，刷新后仍在。请求失败静默降级（保留本地索引），绝不抛错/阻断渲染。
+  // 🔥 Bug1 修复：以服务端为权威源对账草稿列表（含剪除服务端已删项、并集去重、跨端同步）。
+  //   注意：即便服务端返回 0 条也必须执行（用于收敛两侧 id 集合、剔除本地残留）。
+  var mergeServerDraftsIntoIndex = function () {
+    try {
+      fetchServerDrafts().then(function (list) {
+        var _reconciled = reconcileDraftsWithServer(list)
+        setDraftsIndex(_reconciled)
+      }).catch(function (_e) { console.warn('[DraftBox] 服务端草稿对账失败（保留本地索引）:', _e) })
+    } catch (_e) { /* 静默降级，绝不阻断渲染 */ }
+  }
+
+  // 🔥 #199/#201 定向回拉：保存时某些环节被判「落后回写」拒收后，只从服务端拉取被拒环节覆盖本地
+  //   （服务端赢策略）。不做整体 setGeneratedData 替换——保住本地其他环节未被拒的新编辑。
+  var resyncSections = function (novelId: string, sections: string[]) {
+    if (!novelId || String(novelId).indexOf('draft-') === 0 || !sections || !sections.length) return
+    try {
+      var _token2 = localStorage.getItem('token') || ''
+      var _headers2: Record<string, string> = {}
+      if (_token2) _headers2['Authorization'] = 'Bearer ' + _token2
+      fetch('/tuzhong-wenshu/api/settings?novelId=' + encodeURIComponent(novelId), { headers: _headers2 })
+        .then(function (r) { return r && r.ok ? r.json() : null })
+        .then(function (j) {
+          if (!j || !j.success || !j.data) return
+          var _s: any = j.data
+          setGeneratedData(function (prev: any) {
+            var _upd: any = Object.assign({}, prev)
+            for (var _i = 0; _i < sections.length; _i++) {
+              var _k = sections[_i]
+              if (_s[_k] !== undefined) _upd[_k] = _s[_k]
+            }
+            if (_s._secRev && typeof _s._secRev === 'object') _upd._secRev = _s._secRev
+            if (_s._charsRev != null) _upd._charsRev = Number(_s._charsRev) || 0
+            try {
+              if (_upd.characters && typeof _upd.characters === 'object') {
+                var _designInput = ''
+                try { var _t = JSON.parse(localStorage.getItem('tuzhong-draft-theme-' + novelId) || 'null'); if (_t && _t.detailedDesignInput) _designInput = _t.detailedDesignInput } catch (_e2) {}
+                _upd.characters = normalizeCharactersData(_upd.characters, _designInput)
+              }
+            } catch (_ne) { /* 归一化失败不阻塞回拉 */ }
+            generatedDataRef.current = _upd
+            try { localStorage.setItem('tuzhong-generated-data', JSON.stringify(_upd)) } catch (_e3) {}
+            try { localStorage.setItem('tuzhong-draft-data-' + novelId, JSON.stringify(_upd)) } catch (_e4) {}
+            return _upd
+          })
+          console.log('[Settings] #199/#201 已定向回拉被拒环节:', sections.join(','))
+        })
+        .catch(function (_e) { console.warn('[Settings] #199/#201 定向回拉失败:', _e) })
+    } catch (_e) { /* ignore */ }
+  }
+
   //   ① 挂载时从 tuzhong-drafts-index 读取所有进行中的草稿，渲染草稿箱列表
   //   ② 当步骤变化 / 关键数据变化时，把当前 active 草稿同步写回索引（更新 lastStep/updatedAt/title）
   //   ③ 当 idea 步骤首次生成成功 → 自动给当前 active 分配/创建一个持久化草稿 id 并加入索引
@@ -3625,7 +4291,70 @@ export default function AIGenerateWizard({ onClose, onComplete, initialGenre, is
           setDraftsIndex(inProgress)
         }
       }
+      // 🔥 #144 挂载恢复后异步拉取服务端最新草稿数据（换浏览器/清缓存/服务端已修复时本地旧数据自动更新）
+      var _mountActiveId = localStorage.getItem('tuzhong-active-novel-id') || ''
+      if (_mountActiveId) syncDraftFromServer(_mountActiveId)
+      // 🔥 Bug1 修复：挂载后以服务端为权威源合并草稿箱列表（换浏览器/清缓存后书架有草稿则向导同样可见）
+      mergeServerDraftsIntoIndex()
+      // 🔥 2026-09-11：书架草稿箱点「继续创作」时写入的待打开草稿 → 向导挂载后立即恢复
+      try {
+        var _pendingOpen = localStorage.getItem(PENDING_OPEN_DRAFT_KEY) || ''
+        if (_pendingOpen) {
+          localStorage.removeItem(PENDING_OPEN_DRAFT_KEY)
+          var _plist = filterInProgressDrafts(readLocalDraftsIndex())
+          var _pentry = _plist.filter(function (d: any) { return String(d.id) === String(_pendingOpen) })[0]
+          window.setTimeout(function () {
+            openDraft(_pentry || { id: _pendingOpen, title: '（未命名草稿）', lastStep: 'idea' })
+          }, 0)
+        }
+      } catch (_e2) { /* ignore */ }
     } catch (_e) { /* ignore */ }
+  }, [])
+
+  // 草稿箱删除「当前正在编辑」的草稿后，把向导复位到「新建」状态，避免留下指向已删 id 的悬挂引用
+  var resetWizardToNew = function () {
+    try {
+      draftRestoreInProgressRef.current = false
+      setGeneratedData({})
+      generatedDataRef.current = {}
+      setGeneratedChapters([])
+      generatedChaptersRef.current = []
+      setCurrentChapterIndex(0)
+      try { localStorage.removeItem('tuzhong-generated-data') } catch (_e0) { /* ignore */ }
+      try { localStorage.setItem('tuzhong-current-step', 'input') } catch (_e1) { /* ignore */ }
+      setStep('input')
+      setDraftBoxMsg('该草稿已删除，已回到「新建创作」。')
+      window.setTimeout(function () { setDraftBoxMsg('') }, 2500)
+    } catch (_e) { console.warn('[DraftBox] 复位到新建失败:', _e) }
+  }
+
+  // 🔥 2026-09-11 严重 bug 修复：书架↔向导草稿箱「删除/变更」双向同步
+  //   同页：自定义事件 tuzhong-drafts-changed；跨标签页：storage 事件（草稿索引 / active id 变化）
+  useEffect(function () {
+    var refreshFromLocal = function () {
+      try { setDraftsIndex(filterInProgressDrafts(readLocalDraftsIndex())) } catch (_e0) { /* ignore */ }
+    }
+    var onDraftsChanged = function (e: any) {
+      var detail = (e && e.detail) || {}
+      refreshFromLocal()
+      mergeServerDraftsIntoIndex()
+      if (detail && detail.wasActive) resetWizardToNew()
+    }
+    var onStorage = function (e: any) {
+      try {
+        if (!e || !e.key) return
+        if (e.key === DRAFTS_INDEX_KEY || e.key === ACTIVE_NOVEL_ID_KEY) {
+          refreshFromLocal()
+          mergeServerDraftsIntoIndex()
+        }
+      } catch (_e1) { /* ignore */ }
+    }
+    window.addEventListener(DRAFTS_CHANGED_EVENT, onDraftsChanged)
+    window.addEventListener('storage', onStorage)
+    return function () {
+      window.removeEventListener(DRAFTS_CHANGED_EVENT, onDraftsChanged)
+      window.removeEventListener('storage', onStorage)
+    }
   }, [])
 
   // 步骤变化 / 数据更新时同步草稿索引
@@ -3674,20 +4403,67 @@ export default function AIGenerateWizard({ onClose, onComplete, initialGenre, is
       else if (Array.isArray(idea.keywords)) k = (idea.keywords as any[]).filter(Boolean).join('、')
       else if (idea.keywords && typeof idea.keywords === 'string') k = (idea.keywords as string).trim()
     }
-    if (!String(g).trim() && idea && idea.genre) g = String(idea.genre)
+    // 🔥 修复1：genre 为逗号拼接多选串 —— 快照与服务端 idea.genre 都非空时取「类型数多者胜」
+    //   （相等取快照），修复服务端单值/旧值导致多选回显只剩 1 个的问题。
+    if (idea && idea.genre) {
+      var _ig = String(idea.genre).trim()
+      var _sg = String(g).trim()
+      if (_ig && _sg) {
+        var _snapCount = _sg.split(',').filter(function (s: string) { return !!s.trim() }).length
+        var _ideaCount = _ig.split(',').filter(function (s: string) { return !!s.trim() }).length
+        if (_ideaCount > _snapCount) g = _ig
+      } else if (_ig) {
+        g = _ig
+      }
+    }
     return { keywords: k, genre: g }
+  }
+
+  // 🔥 #217 输入主题完整显示修复：本地快照可能比服务端 idea.userDesign 旧/截断
+  //   （换设备、清缓存、粘贴中途被防抖快照保存）。以「更完整者」为准：
+  //   服务端更长或本地为空 → 采用服务端补全；本地更长（用户后续手动补写）→ 保留本地。
+  var _reconcileDesignInput = function (localVal: string, serverVal: string): string {
+    var _l = typeof localVal === 'string' ? localVal : ''
+    var _s = typeof serverVal === 'string' ? serverVal : ''
+    if (!_s.trim()) return _l
+    if (!_l.trim()) return _s
+    return _s.length > _l.length ? _s : _l
   }
 
   // 🔥 2026-09-06 输入主题类型回填：快照与 idea 均无 genre 时，从服务端作品记录回填
   //   （旧作品的 genre 只存在于服务端 books/novels 数据，本地 idea 无 genre 字段）。
+  // 🔥 修复1：服务端 genre 与当前 genre 求并集（逗号分隔去重），仅当并集比当前多时才更新 ——
+  //   服务端返回完整多选串时补齐本地缺失类型，且不再因「当前非空」直接跳过回填。
   var backfillGenreFromServer = function (novelId: string) {
-    if (!novelId || String(genreRef.current || '').trim()) return
+    if (!novelId) return
     try {
+      // 🔥 2026-11-06：补 Authorization 头——此前只带 cookie，服务端按 userId 过滤时 401/查不到，
+      //   genre 回填静默失败（作品类型恢复缺数据的根因之一）
+      var _bgHeaders: Record<string, string> = {}
+      try { var _bgTok = localStorage.getItem('token') || ''; if (_bgTok) _bgHeaders['Authorization'] = 'Bearer ' + _bgTok } catch (_hge) {}
       fetch('/tuzhong-wenshu/api/novels?id=' + encodeURIComponent(novelId), {
-        headers: { 'Authorization': 'Bearer ' + (localStorage.getItem('token') || '') }
+        credentials: 'same-origin',
+        headers: _bgHeaders
       }).then(function (r) { return r.json() }).then(function (j) {
         var g = j && j.data && j.data.genre
-        if (g && !String(genreRef.current || '').trim()) setGenre(String(g))
+        if (!g) return
+        var _srv = String(g).trim()
+        if (!_srv) return
+        var _cur = String(genreRef.current || '').trim()
+        if (!_cur) { setGenre(_srv); return }
+        var _seen: Record<string, boolean> = {}
+        var _parts: string[] = []
+        var _addParts = function (raw: string) {
+          var _arr = raw.split(',')
+          for (var _ai = 0; _ai < _arr.length; _ai++) {
+            var _t = String(_arr[_ai] || '').trim()
+            if (_t && !_seen[_t]) { _seen[_t] = true; _parts.push(_t) }
+          }
+        }
+        _addParts(_cur)
+        _addParts(_srv)
+        var _curCount = _cur.split(',').filter(function (s: string) { return !!s.trim() }).length
+        if (_parts.length > _curCount) setGenre(_parts.join(','))
       }).catch(function () {})
     } catch (_e) { /* ignore */ }
   }
@@ -3743,6 +4519,69 @@ export default function AIGenerateWizard({ onClose, onComplete, initialGenre, is
         generatedDataRef.current = _loadedData
         // 同步到全局键（兼容性）
         try { localStorage.setItem('tuzhong-generated-data', JSON.stringify(_loadedData)) } catch (_e) {}
+        // 🔥 2026-11-05 openDraft 金手指同步：草稿数据（localStorage）的金手指可能是旧版——
+        //   异步拉服务端 settings 的 powerSystem，若服务端为「中兴币」新版而草稿为旧版 → 以服务端覆盖
+        ;(function (_draftNovelId: string) {
+          try {
+            if (!_draftNovelId || _draftNovelId === 'temp') return
+            var _odHeaders: Record<string, string> = {}
+            try { var _odTok = localStorage.getItem('token') || ''; if (_odTok) _odHeaders['Authorization'] = 'Bearer ' + _odTok } catch (_ohe) {}
+            fetch('/tuzhong-wenshu/api/settings?novelId=' + encodeURIComponent(_draftNovelId), { credentials: 'same-origin', headers: _odHeaders })
+              .then(function (r) { return r.ok ? r.json() : null })
+              .then(function (j) {
+                // 🔥 2026-11-06：服务端 idea 恢复（仿写原作品 + 作品类型多选）——
+                //   本地快照缺失/过期时以服务端 idea.imitate / idea.genre 为准补齐（图1/图2 根因修复）。
+                var _srvIdea = j && j.data && j.data.idea
+                if (_srvIdea) {
+                  var _srvIm = _srvIdea.imitate || _srvIdea.imitateData
+                  if (_srvIm) {
+                    try {
+                      var _odIm = typeof _srvIm === 'string' ? JSON.parse(_srvIm) : _srvIm
+                      var _odImTitle = String((_odIm && _odIm.title) || '').trim()
+                      if (_odImTitle && !String(imitateSearchRef.current || '').trim()) {
+                        setImitateMode(true)
+                        setImitateSearch(_odImTitle)
+                        if (!imitateDataRef.current && (_odIm.analysis || _odIm.title)) setImitateData(_odIm.analysis || _odIm)
+                        if (!bookAnalysisResult && _odIm.bookAnalysis) setBookAnalysisResult(_odIm.bookAnalysis)
+                        try { localStorage.setItem('tuzhong-imitate-data', JSON.stringify(_odIm)) } catch (_oie) {}
+                        console.log('[openDraft] 已从服务端恢复仿写原作品:', _odImTitle)
+                      }
+                    } catch (_odImE) {}
+                  }
+                  var _srvGenreStr = String(_srvIdea.genre || '').trim()
+                  if (_srvGenreStr) {
+                    var _odCur = String(genreRef.current || '').trim()
+                    var _odSeen: Record<string, boolean> = {}
+                    var _odParts: string[] = []
+                    var _odAdd = function (raw: string) {
+                      raw.split(',').forEach(function (s) { var t = String(s || '').trim(); if (t && !_odSeen[t]) { _odSeen[t] = true; _odParts.push(t) } })
+                    }
+                    _odAdd(_srvGenreStr)
+                    _odAdd(_odCur)
+                    if (_odParts.length > (_odCur ? _odCur.split(',').filter(function (s: string) { return !!s.trim() }).length : 0)) {
+                      setGenre(_odParts.join(','))
+                      console.log('[openDraft] 服务端 idea.genre 更完整 → 合并回填作品类型')
+                    }
+                  }
+                }
+                var _srvPS = j && j.data && j.data.powerSystem
+                if (!_srvPS || typeof _srvPS !== 'object') return
+                var _srvPA = _srvPS.protagonistAbility
+                if (!_srvPA) return
+                var _srvDesc = String(_srvPA.description || '')
+                var _curDesc = String((generatedDataRef.current.powerSystem && generatedDataRef.current.powerSystem.protagonistAbility && generatedDataRef.current.powerSystem.protagonistAbility.description) || '')
+                if (_srvDesc.indexOf('中兴币') >= 0 && _curDesc.indexOf('中兴币') === -1) {
+                  console.log('[openDraft 金手指同步] 草稿金手指为旧版 → 应用服务端最新版（中兴币设定）')
+                  var _next = Object.assign({}, generatedDataRef.current, { powerSystem: _srvPS })
+                  generatedDataRef.current = _next
+                  setGeneratedData(_next)
+                  try { localStorage.setItem('tuzhong-generated-data', JSON.stringify(_next)) } catch (_e2) {}
+                  try { localStorage.setItem(_dataKey, JSON.stringify(_next)) } catch (_e3) {}
+                }
+              })
+              .catch(function () {})
+          } catch (_odE) {}
+        })((draft && (draft.novelId || draft.id)) || (typeof localStorage !== 'undefined' ? (localStorage.getItem('tuzhong-active-novel-id') || '') : ''))
       }
       try {
         var _rawCh = localStorage.getItem(_chaptersKey)
@@ -3750,10 +4589,16 @@ export default function AIGenerateWizard({ onClose, onComplete, initialGenre, is
       } catch (_e) {}
       try { var _rawCi = localStorage.getItem(_chapterIdxKey); if (_rawCi) { var _ci = parseInt(_rawCi, 10); if (!isNaN(_ci) && _ci >= 0) setCurrentChapterIndex(_ci) } } catch (_e) {}
       try { var _rawVol = localStorage.getItem(_volKey); if (_rawVol) { var _vc = JSON.parse(_rawVol); if (_vc && _vc.volumeCount) {
-        // 🔥 2026-09-06：若草稿数据已含卷章框架，以实际数据卷数为准对齐，避免旧卷配置（如5卷×60章）与数据（10卷）冲突触发「配置已变更」误报
+        // 🔥 2026-09-06：草稿恢复时以“设计卷数”为准对齐卷配置，避免旧配置（如5卷×60章）覆盖设计卷数（10卷）。
+        //   设计卷数优先级：草稿数据内卷章框架 > 关键剧情节点分卷结构 > 已生成章节框架。
         var _dataVols = _loadedData && _loadedData.chapters && Array.isArray(_loadedData.chapters.volumes) ? _loadedData.chapters.volumes.length : 0
-        if (_dataVols > 0 && _vc.volumeCount !== _dataVols) {
-          setVolumeConfig({ volumeCount: _dataVols, chaptersPerVolume: _vc.chaptersPerVolume || 60 })
+        var _kpVols = _loadedData && _loadedData.keyPlots && Array.isArray(_loadedData.keyPlots.volumes) ? _loadedData.keyPlots.volumes.length : 0
+        var _genVols = Array.isArray(generatedChaptersRef.current) ? generatedChaptersRef.current.length : 0
+        var _designVols = _dataVols > 0 ? _dataVols : (_kpVols > 0 ? _kpVols : _genVols)
+        if (_designVols > 0 && _vc.volumeCount !== _designVols) {
+          // 配置与设计卷数不一致 → 以设计卷数为准对齐，且不标记为“用户手动修改”，让设计卷数真正生效
+          setVolumeConfig({ volumeCount: _designVols, chaptersPerVolume: _vc.chaptersPerVolume || 60 })
+          setUserModifiedVolumeConfig(false)
         } else {
           setVolumeConfig(_vc); setUserModifiedVolumeConfig(true)
         }
@@ -3763,19 +4608,58 @@ export default function AIGenerateWizard({ onClose, onComplete, initialGenre, is
         var _resolvedInput = resolveInputFromIdea((_loadedData && _loadedData.idea) || null, _loadedTheme.keywords, _loadedTheme.genre)
         if (_resolvedInput.keywords) setKeywords(_resolvedInput.keywords)
         if (_resolvedInput.genre) setGenre(_resolvedInput.genre)
-        if (_loadedTheme.detailedDesignInput) setDetailedDesignInput(_loadedTheme.detailedDesignInput)
+        // 🔥 #217 快照可能比服务端 idea.userDesign 旧/截断 → reconcile 补全
+        var _designFromData = ((_loadedData && _loadedData.idea && (_loadedData.idea as any).userDesign) || '') as string
+        var _mergedDesign = _reconcileDesignInput(_loadedTheme.detailedDesignInput || '', _designFromData)
+        if (_mergedDesign) setDetailedDesignInput(_mergedDesign)
         if (_loadedTheme.protagonistName) setProtagonistName(_loadedTheme.protagonistName)
         if (_loadedTheme.userBookTitle) setUserBookTitle(_loadedTheme.userBookTitle)
         if (_loadedTheme.protagonistGender) setProtagonistGender(_loadedTheme.protagonistGender)
         if (_loadedTheme.protagonistAge) setProtagonistAge(_loadedTheme.protagonistAge)
         if (_loadedTheme.protagonistIdentity) setProtagonistIdentity(_loadedTheme.protagonistIdentity)
+        // 🔥 修复2：服务端 idea.userSpecifiedIdentity 非空即为权威值，覆盖本地旧快照
+        var _openSrvIdentity = (_loadedData && _loadedData.idea && (_loadedData.idea as any).userSpecifiedIdentity) || ''
+        if (_openSrvIdentity) setProtagonistIdentity(String(_openSrvIdentity))
         if (_loadedTheme.creationMode) setCreationMode(_loadedTheme.creationMode)
       } else if (_loadedData && _loadedData.idea) {
         var _resolvedInput2 = resolveInputFromIdea(_loadedData.idea, '', (_loadedData.idea as any).genre || '')
         if (_resolvedInput2.keywords) setKeywords(_resolvedInput2.keywords)
+        // 🔥 #217 快照缺失时也必须恢复详细设定（此前该分支完全没恢复 detailedDesignInput）
+        if ((_loadedData.idea as any).userDesign) setDetailedDesignInput(String((_loadedData.idea as any).userDesign))
+        // 🔥 #226 缺陷1修复：草稿箱打开路径同样补回 creationMode（与 mount 恢复分支同一根因）
+        var _odIdea = _loadedData.idea as any
+        var _odCM = (typeof _odIdea.creationMode === 'string' && _odIdea.creationMode)
+          ? _odIdea.creationMode
+          : (String(_odIdea.userDesign || '').trim() ? 'custom' : 'normal')
+        if (_odCM === 'imitate' || _odCM === 'fanfiction' || _odCM === 'custom' || _odCM === 'normal') {
+          setCreationMode(_odCM as 'normal' | 'imitate' | 'fanfiction' | 'custom')
+          setImitateMode(_odCM === 'imitate' || _odCM === 'fanfiction')
+        }
       }
       // 🔥 2026-09-06 输入主题类型回填：快照/idea 均无 genre 时，从服务端作品记录补齐
       backfillGenreFromServer(draft.id)
+      // 🔥 2026-11-06：恢复仿写原作品（搜索词/拆书数据/拆书概览）。
+      //   优先本地主题快照，其次草稿数据里的 idea.imitate；都没有时由上方异步服务端同步兜底。
+      //   修「打开草稿后输入主题环节仿写作品显示为空」（图1）。
+      var _odThemeIm = _loadedTheme && (_loadedTheme.imitateSearch || _loadedTheme.imitateData || _loadedTheme.bookAnalysisResult) ? _loadedTheme : null
+      var _odIdeaIm = _loadedData && _loadedData.idea && ((_loadedData.idea as any).imitate || (_loadedData.idea as any).imitateData)
+      if (_odThemeIm) {
+        setImitateMode(true)
+        setImitateSearch(String(_odThemeIm.imitateSearch || (_odThemeIm.imitateData && _odThemeIm.imitateData.title) || ''))
+        if (_odThemeIm.imitateData) setImitateData(_odThemeIm.imitateData)
+        if (_odThemeIm.bookAnalysisResult) setBookAnalysisResult(_odThemeIm.bookAnalysisResult)
+      } else if (_odIdeaIm) {
+        try {
+          var _odImObj = typeof _odIdeaIm === 'string' ? JSON.parse(_odIdeaIm) : _odIdeaIm
+          var _odImTitle = String((_odImObj && _odImObj.title) || '').trim()
+          if (_odImTitle) {
+            setImitateMode(true)
+            setImitateSearch(_odImTitle)
+            if (_odImObj.analysis || _odImObj.title) setImitateData(_odImObj.analysis || _odImObj)
+            if (_odImObj.bookAnalysis) setBookAnalysisResult(_odImObj.bookAnalysis)
+          }
+        } catch (_odie) {}
+      }
       // 跳到草稿中断的步骤
       var _restoreStep = _loadedStep as Step
       // 🔥 2026-09-06 草稿恢复：中断于「分卷章节划分」且未生成过卷章框架时，
@@ -3789,6 +4673,8 @@ export default function AIGenerateWizard({ onClose, onComplete, initialGenre, is
       setStep(_restoreStep as Step)
       try { localStorage.setItem('tuzhong-current-step', _loadedStep) } catch (_e) {}
       setDraftBoxMsg('已恢复到《' + (draft.title || '未命名草稿') + '》的「' + _loadedStep + '」步骤，继续往下创作即可。')
+      // 🔥 #144 打开草稿后异步拉取服务端最新数据（服务端为权威源，本地旧数据自动被修复后的数据覆盖）
+      syncDraftFromServer(draft.id)
       // 短暂消息提示后清空
       window.setTimeout(function () { setDraftBoxMsg(''); draftRestoreInProgressRef.current = false }, 1500)
   } catch (_e) {
@@ -3797,24 +4683,12 @@ export default function AIGenerateWizard({ onClose, onComplete, initialGenre, is
     }
   }
 
-  // 删除草稿（含数据）
+  // 删除草稿（含数据）：统一走 deleteDraftShared（服务端删除 + 本地清理 + 事件广播），
+  //   书架与向导共用同一实现；列表刷新与「复位到新建」由上面的 tuzhong-drafts-changed 监听器统一处理。
   var deleteDraft = function (draft: any) {
     if (!draft || !draft.id) return
     if (!window.confirm('确定删除草稿《' + (draft.title || '未命名') + '》？此操作不可撤销。')) return
-    try {
-      var keys = ['tuzhong-draft-data-', 'tuzhong-draft-step-', 'tuzhong-draft-theme-', 'tuzhong-draft-chapters-', 'tuzhong-draft-chapter-idx-', 'tuzhong-draft-volume-']
-      for (var _ki = 0; _ki < keys.length; _ki++) { try { localStorage.removeItem(keys[_ki] + draft.id) } catch (_e) {} }
-      var cur = draftsIndex.filter(function (d: any) { return d.id !== draft.id })
-      localStorage.setItem('tuzhong-drafts-index', JSON.stringify(cur))
-      setDraftsIndex(cur)
-      try { if ((localStorage.getItem('tuzhong-active-novel-id') || '') === draft.id) localStorage.removeItem('tuzhong-active-novel-id') } catch (_e2) {}
-      try {
-        fetch('/tuzhong-wenshu/api/novels?id=' + encodeURIComponent(draft.id), {
-          method: 'DELETE',
-          headers: { 'Authorization': 'Bearer ' + (localStorage.getItem('token') || '') }
-        }).catch(function () {})
-      } catch (_e3) {}
-    } catch (_e) { console.warn('[DraftBox] 删除失败:', _e) }
+    void deleteDraftShared(draft.id, draft.title)
   }
 
   // 当前 active 草稿同步保存为"按草稿id分隔的"副本，确保多草稿隔离
@@ -3833,6 +4707,9 @@ export default function AIGenerateWizard({ onClose, onComplete, initialGenre, is
         protagonistName: protagonistName, userBookTitle: userBookTitle,
         protagonistGender: protagonistGender, protagonistAge: protagonistAge,
         protagonistIdentity: protagonistIdentity, creationMode: creationMode,
+        // 🔥 2026-11-06：仿写原作品状态入快照——此前只存全局 tuzhong-imitate-data（跨草稿污染），
+        //   打开草稿时不读，导致「仿写作品显示为空」
+        imitateSearch: imitateSearch, imitateData: imitateData || null, bookAnalysisResult: bookAnalysisResult || null,
       }))
       if (Array.isArray(generatedChapters) && generatedChapters.length > 0) {
         localStorage.setItem('tuzhong-draft-chapters-' + activeId, JSON.stringify(generatedChapters))
@@ -3842,7 +4719,7 @@ export default function AIGenerateWizard({ onClose, onComplete, initialGenre, is
         localStorage.setItem('tuzhong-draft-volume-' + activeId, JSON.stringify(volumeConfig))
       }
     } catch (_e) { /* ignore */ }
-  }, [step, generatedData, generatedChapters, currentChapterIndex, keywords, genre, detailedDesignInput, protagonistName, userBookTitle, protagonistGender, protagonistAge, protagonistIdentity, creationMode, volumeConfig, userModifiedVolumeConfig])
+  }, [step, generatedData, generatedChapters, currentChapterIndex, keywords, genre, detailedDesignInput, protagonistName, userBookTitle, protagonistGender, protagonistAge, protagonistIdentity, creationMode, volumeConfig, userModifiedVolumeConfig, imitateSearch, imitateData, bookAnalysisResult])
 
   // 给当前 active 草稿补一个持久化 id（首次生成 idea 时），确保刷新后还能定位
   // 🔥 2026-09-03 #120：原条件要求 gd.idea.title 存在才分配 id，导致「idea 之前就中断」的作品
@@ -3885,32 +4762,44 @@ export default function AIGenerateWizard({ onClose, onComplete, initialGenre, is
           // 🔥 用 sendBeacon 替代 fetch：浏览器关闭瞬间会保证投递完成。
           try {
             var _token = localStorage.getItem('token') || ''
+            var _authHeaders: Record<string, string> = { 'Content-Type': 'application/json' }
+            if (_token) _authHeaders['Authorization'] = 'Bearer ' + _token
             var _body: any = {
               novelId: _curId,
               type: 'batch',
+              // 🔥 #199 人物版本号回带（keepalive 兜底保存同样受服务端落后拒收保护）
+              _charsRev: (generatedDataRef.current && Number(generatedDataRef.current._charsRev)) || 0,
+              // 🔥 #201 全环节版本号回带
+              _secRev: (generatedDataRef.current && generatedDataRef.current._secRev && typeof generatedDataRef.current._secRev === 'object') ? generatedDataRef.current._secRev : {},
               worldbuilding: (generatedDataRef.current && generatedDataRef.current.worldbuilding) || {},
               powerSystem: (generatedDataRef.current && generatedDataRef.current.powerSystem) || {},
               characters: (generatedDataRef.current && generatedDataRef.current.characters) || {},
               factions: (generatedDataRef.current && generatedDataRef.current.factions) || {},
               relationships: (generatedDataRef.current && generatedDataRef.current.relationships) || {},
               keyPlots: (generatedDataRef.current && generatedDataRef.current.keyPlots) || {},
-              idea: (generatedDataRef.current && generatedDataRef.current.idea) || {},
+              // 🔥 2026-11-06：卸载兜底保存同样携带输入主题环节交互状态（genre/creationMode/imitate）
+              idea: _buildPersistedIdea(generatedDataRef.current && generatedDataRef.current.idea),
               synopsis: (generatedDataRef.current && generatedDataRef.current.synopsis) || {},
               outline: (generatedDataRef.current && generatedDataRef.current.outline) || {},
               chapters: (generatedDataRef.current && generatedDataRef.current.chapters) || {},
               lastStep: step || '',
             }
+            // 🔥 2026-09-08 #162：sendBeacon 无法携带 Authorization 头 →
+            //   ① settings 落盘改为 keepalive fetch（页面卸载后仍可存活，且带鉴权头）；
+            //   ② novels 记录同步原为 POST（ novels POST 忽略 body.id 永远新建！）→ 匿名身份首次真建了一本
+            //      userId='anonymous' 的垃圾书、此后每次 402。改为 PUT（按 id 更新，归属校验）。
             try {
-              var _bl = new Blob([JSON.stringify(_body)], { type: 'application/json' })
-              navigator.sendBeacon && navigator.sendBeacon('/tuzhong-wenshu/api/settings', _bl)
-            } catch (_sbe) { /* beacon 失败靠 mount 阶段兜底 */ }
+              fetch('/tuzhong-wenshu/api/settings', { method: 'POST', headers: _authHeaders, body: JSON.stringify(_body), keepalive: true }).catch(function () {})
+            } catch (_sbe) { /* 失败靠 mount 阶段兜底 */ }
             try {
-              var _nl = new Blob([JSON.stringify({
+              // 🔥 2026-10-16 书架/草稿箱口径修复：卸载时绝不能把作品状态无条件降级为 'drafting'——
+              //   生成完成的作品在收尾处已 PUT status:'writing'，随后 window.location 跳转触发本 handler，
+              //   旧的 status:'drafting' 会把刚完成的作品重新打回草稿箱（书架消失、草稿箱残留）。
+              //   作品创建时本就以 'drafting' 落库（见 ensureDraftNovel / ContentGen），此处无需再改状态，仅同步标题。
+              fetch('/tuzhong-wenshu/api/novels', { method: 'PUT', headers: _authHeaders, body: JSON.stringify({
                 id: _curId,
-                status: 'drafting',
                 title: ((generatedDataRef.current && generatedDataRef.current.idea && generatedDataRef.current.idea.title) || userBookTitle || '未命名作品'),
-              })], { type: 'application/json' })
-              navigator.sendBeacon && navigator.sendBeacon('/tuzhong-wenshu/api/novels', _nl)
+              }), keepalive: true }).catch(function () {})
             } catch (_snbe) { /* noop */ }
           } catch (_b2) { /* ignore */ }
         }
@@ -3976,8 +4865,20 @@ export default function AIGenerateWizard({ onClose, onComplete, initialGenre, is
   }, [generatedChapters, currentChapterIndex])
   // 🔥 自动保存：当步骤数据变化时，延迟2秒自动保存到服务器
   useEffect(function () {
-    if (Object.keys(generatedData).length > 0) {
-      debouncedSave(generatedData)
+    var _gd: any = generatedData || {}
+    var _prev: any = lastGenSnapshotRef.current
+    var _prevKeys = _prev ? Object.keys(_prev) : []
+    var _curKeys = Object.keys(_gd)
+    // 🔥 #224 自激循环修复：若本次变更「只是服务端 rev 被采纳」（除 _charsRev/_secRev 外所有键引用未变），
+    //   则跳过保存——否则会形成 保存→rev+1→采纳→再保存 的无限循环（每次重写整库 9.8MB，实测停不下来）。
+    var _revOnly = !!_prev && _prevKeys.length === _curKeys.length && _prevKeys.every(function (k) {
+      if (k === '_charsRev' || k === '_secRev') return true
+      return _prev[k] === _gd[k]
+    })
+    lastGenSnapshotRef.current = _gd
+    if (_revOnly) return
+    if (_curKeys.length > 0) {
+      debouncedSave(_gd)
     }
   }, [generatedData, debouncedSave])
   // ---- end
@@ -4052,6 +4953,10 @@ export default function AIGenerateWizard({ onClose, onComplete, initialGenre, is
       totalWords: im?.totalWords || '',
       imitateMode: imitateMode,
       bookAnalysis: im?.bookAnalysis || null,
+      // 🔥 章节级仿写骨架（黄金三章/单章循环/节奏/伏笔/爽点/禁止复制清单）
+      chapterBlueprint: (generatedDataRef.current?.bookAnalysis as any)?.chapterBlueprint
+        || (generatedData?.bookAnalysis as any)?.chapterBlueprint
+        || null,
     }
   }
 
@@ -4096,6 +5001,7 @@ export default function AIGenerateWizard({ onClose, onComplete, initialGenre, is
   var [bookAnalysisJson, setBookAnalysisJson] = useState('')
   var [bookAnalysisResult, setBookAnalysisResult] = useState<any>(null)
   var [bookAnalysisLoading, setBookAnalysisLoading] = useState(false)
+  useEffect(function () { bookAnalysisResultRef.current = bookAnalysisResult }, [bookAnalysisResult])
 
   // 🔥 第二期·自动拆书
   var [autoBookName, setAutoBookName] = useState('')
@@ -4114,6 +5020,9 @@ export default function AIGenerateWizard({ onClose, onComplete, initialGenre, is
   // 🔥 第三期·调度中心 & 真实进度
   var genCancelRef = useRef(false)
   var genPauseRef = useRef(false)
+  // 🔥 2026-09-30 性能优化·当前正在生成的章节实时状态（供 UI 心跳显示「正在生成第 X 章·已用 X 秒」）
+  var genCurrentChapterRef = useRef<{ index: number; startedAt: number; retry: number } | null>(null)
+  var genHeartbeatRef = useRef<number | null>(null)
   var genPauseResolveRef = useRef<(() => void) | null>(null)
   var stepNavRef = useRef<HTMLDivElement | null>(null)
   var [genStatus, setGenStatus] = useState<'idle' | 'running' | 'paused' | 'done' | 'cancelled'>('idle')
@@ -4131,10 +5040,58 @@ export default function AIGenerateWizard({ onClose, onComplete, initialGenre, is
   })
   var [genFailedList, setGenFailedList] = useState<Array<{ index: number; chapter: any; error: string }>>([])
 
+  // 🔥 逐章生成正文·右上角控制面板（字数 / 风格 / 新角色）：
+  //   提升到向导共享 state，发起本章正文生成时随请求体传入 /api/ai-generate（step: 'content'）。
+  //   《永历中兴》目标字数区间 2500-4000，默认 3000（绍宋级口径）。
+  // 🔥 2026-10-25 T2：默认字数口径改为 2000（区间 1800-2200，跟随用户设定；反修复旧 2500 写死）
+  var [genTargetWordCount, setGenTargetWordCount] = useState<number>(2000)
+  var [genStyle, setGenStyle] = useState<string>('正剧')
+  var [genNewCharacters, setGenNewCharacters] = useState<string>('')
+  // 🔥 2026-11-05 批量生成上限：一次性生成 N 章（1-20），0=全部。避免全本长跑中模型漂移导致质量问题；配合断点续生成=分批体验
+  var [genBatchLimit, setGenBatchLimit] = useState<number>(parseInt(typeof localStorage !== 'undefined' ? (localStorage.getItem('tuzhong-batch-limit') || '0') : '0', 10) || 0)
+  var handleGenBatchLimitChange = function (v: number) {
+    setGenBatchLimit(v)
+    try { if (typeof localStorage !== 'undefined') localStorage.setItem('tuzhong-batch-limit', String(v)) } catch (_e) {}
+  }
+
+  // 🔥 控制面板统一更新入口（由 StepGenerating 内调用）：把字数自动夹在 2500-4000 合法区间（绍宋级口径）
+  var handleGenConfigChange = function (patch: { targetWordCount?: number; style?: string; newCharacters?: string }) {
+    if (patch.targetWordCount !== undefined && !isNaN(patch.targetWordCount as number)) {
+      // 🔥 2026-10-26 T9：夹取范围与 UI 滑块一致（1500-4000）——原 2500 下限会把滑块设的 2000/1800 顶回 2500
+      setGenTargetWordCount(Math.min(4000, Math.max(1500, Math.round(patch.targetWordCount as number))))
+    }
+    if (patch.style !== undefined) setGenStyle(patch.style as string)
+    if (patch.newCharacters !== undefined) setGenNewCharacters(patch.newCharacters as string)
+  }
+
+  // 🔥 Bug修复（编辑丢失）：StepGenerating 里手动编辑章节正文后回写父级状态，
+  //   同时更新 generatedChapters 与 generatedData.chapters.generatedContent 两份数据，后续保存流程可将其持久化
+  var handleChapterContentEdit = function (chapterId: string, content: string) {
+    setGeneratedChapters(function (prev: any[]) {
+      return (prev || []).map(function (c: any) {
+        if (String(c && c.id) === String(chapterId)) {
+          // 🔥 T9：前端字数口径与数据层统一为去空白（含标点）字符数（原为 CJK+字母数字）
+          return Object.assign({}, c, { content: content, wordCount: content.replace(/\s/g, '').length, status: c.status === 'generating' ? 'generating' : (c.status || 'completed') })
+        }
+        return c
+      })
+    })
+    setGeneratedData(function (prev: any) {
+      var chaptersObj = (prev && prev.chapters) || {}
+      var gc = chaptersObj.generatedContent
+      var nextGc = Array.isArray(gc)
+        ? gc.map(function (c: any) { return String(c && c.id) === String(chapterId) ? Object.assign({}, c, { content: content, wordCount: content.replace(/\s/g, '').length }) : c })
+        : gc
+      return Object.assign({}, prev, { chapters: Object.assign({}, chaptersObj, { generatedContent: nextGc }) })
+    })
+  }
+
   // 🔥 第四期·爆款终检
   var [finalCheckResult, setFinalCheckResult] = useState<any>(null)
   var [finalCheckLoading, setFinalCheckLoading] = useState(false)
   var [polishLoading, setPolishLoading] = useState(false)
+  // 🔥 #226Q：一键修复全部（全链路）的进度 / 结果状态，回传给 StepFinalCheck→StepChecklistPanel 纯展示
+  var [repairState, setRepairState] = useState<RepairState | null>(null)
 
   // 🔥 每步实际使用模型展示
   var [stepModels, setStepModels] = useState<Record<string, { model: string; provider?: string }>>({})
@@ -4153,6 +5110,73 @@ export default function AIGenerateWizard({ onClose, onComplete, initialGenre, is
         }
       }
     } catch (e) { /* ignore */ }
+  }, [])
+
+  // 🔥 2026-11-05 仿写搜索词恢复：向导重挂载（返回输入环节/刷新）后，搜索框从本地缓存的仿写数据恢复书名
+  useEffect(function() {
+    try {
+      if (typeof window === 'undefined') return
+      if (String(imitateSearch || '').trim()) return
+      var raw = localStorage.getItem('tuzhong-imitate-data')
+      if (!raw) return
+      var parsed = JSON.parse(raw)
+      var t = String((parsed && parsed.title) || '').trim()
+      if (t) {
+        setImitateSearch(t)
+        if (!imitateMode) setImitateMode(true)
+        console.log('[Imitate] 已从本地恢复搜索词:', t)
+      }
+    } catch (_e) {}
+  }, [])
+
+  // 🔥 2026-11-05 后端 powerSystem 同步：向导挂载时强制用服务端金手指覆盖本地快照（快照旧值不再挡新设定）
+  useEffect(function() {
+    try {
+      if (typeof window === 'undefined') return
+      var aid = (typeof localStorage !== 'undefined' ? (localStorage.getItem('tuzhong-active-novel-id') || '') : '')
+      if (!aid || aid === 'temp') return
+      var _hdrs = { 'Authorization': 'Bearer ' + (localStorage.getItem('token') || '') }
+      fetch('/tuzhong-wenshu/api/settings?novelId=' + encodeURIComponent(aid), { headers: _hdrs })
+        .then(function (r) { return r.ok ? r.json() : null })
+        .then(function (j) {
+          // 🔥 后端仿写数据恢复：服务端 idea.imitate 存在且本地无仿写数据 → 恢复仿写模式+搜索词（修「搜索框内容消失」）
+          // 🔥 2026-11-06 修复：原代码引用未定义的 `_s`（本作用域变量是 j.data），ReferenceError 被 .catch 吞掉，
+          //   导致整个「服务端 powerSystem/仿写恢复」effect 静默失效（打开草稿后仿写原作品显示为空的根因之一）。
+          //   同时把仿写恢复提到 powerSystem 守卫之前：无金手指的草稿同样需要恢复仿写数据。
+          var _srvIdea = j && j.data && j.data.idea
+          var _srvIm = _srvIdea && (_srvIdea.imitate || _srvIdea.imitateData)
+          if (_srvIm) {
+            try {
+              var _imObj = typeof _srvIm === 'string' ? JSON.parse(_srvIm) : _srvIm
+              var _imTitle = String((_imObj && _imObj.title) || '').trim()
+              if (_imTitle) {
+                setImitateMode(true)
+                setImitateSearch(function (prev: string) { return prev && prev.trim() ? prev : _imTitle })
+                if (!imitateDataRef.current && (_imObj.analysis || _imObj.title)) { setImitateData(_imObj.analysis || _imObj) }
+                // 🔥 2026-11-06：拆书结果概览（bookAnalysisResult）也一并恢复，修「打开草稿后仿写作品显示为空」
+                if (!bookAnalysisResult && _imObj.bookAnalysis) { setBookAnalysisResult(_imObj.bookAnalysis) }
+                localStorage.setItem('tuzhong-imitate-data', JSON.stringify(_imObj))
+                console.log('[Imitate] 已从服务端恢复仿写数据:', _imTitle)
+              }
+            } catch (_imE) {}
+          }
+          // 仅当本地快照的金手指与服务端不同步时覆盖（服务端赢）
+          var _ps = j && j.data && j.data.powerSystem
+          if (!_ps || typeof _ps !== 'object') return
+          var _pa = _ps.protagonistAbility
+          if (!_pa || !String(_pa.name || '').trim()) return
+          setGeneratedData(function (prev) {
+            var _local = prev && prev.powerSystem && prev.powerSystem.protagonistAbility
+            var _localDesc = _local ? String(_local.description || '') : ''
+            var _srvDesc = String(_pa.description || '')
+            if (_localDesc === _srvDesc) return prev
+            console.log('[PowerSync] 后端金手指与本地快照不同步 → 以服务端为准（', String(_pa.name||''), '）')
+            generatedDataRef.current = Object.assign({}, generatedDataRef.current, { powerSystem: _ps })
+            return Object.assign({}, prev, { powerSystem: _ps })
+          })
+        })
+        .catch(function () {})
+    } catch (_psE) {}
   }, [])
 
   // Initialize LLM config on mount
@@ -4196,7 +5220,6 @@ export default function AIGenerateWizard({ onClose, onComplete, initialGenre, is
   fetchModelsFromApi()
 
   // 🔥 优先级：1. 用户上次选择的模型（tuzhong-llm-config） → 2. localStorage缓存的defaultModel → 3. 内置硅基流动默认配置
-  var _explicitManual = false  // 🔥 仅当用户【显式】选过模型时才为 true；默认模型只是取凭据来源，不应锁死为手动模式
   var savedLlmConfig = localStorage.getItem('tuzhong-llm-config')
   if (savedLlmConfig) {
     try {
@@ -4204,7 +5227,6 @@ export default function AIGenerateWizard({ onClose, onComplete, initialGenre, is
       if (loadedConfig && loadedConfig.provider) {
         loadedConfig.provider = (loadedConfig.provider || '').replace(/\s*\([^)]*\)\s*/g, '').trim()
       }
-      if (loadedConfig && loadedConfig.model) _explicitManual = true
       console.log('[LLM Config] 优先加载用户上次选择的模型:', loadedConfig.provider, loadedConfig.model)
     } catch (e) {
       console.error('[LLM Config] Failed to parse stored user config')
@@ -4261,13 +5283,8 @@ export default function AIGenerateWizard({ onClose, onComplete, initialGenre, is
       }
       if (loadedConfig && loadedConfig.model && loadedConfig.apiKey) {
         setLlmConfig(loadedConfig)
-        if (_explicitManual) {
-          setManualModel(true)
-          console.log('[LLM Config] 恢复用户上次【显式】手动选择的模型:', loadedConfig.provider, loadedConfig.model)
-        } else {
-          // 🔥 默认模型仅作为凭据来源，保持智能推荐模式，让每个环节显示各自的默认配置模型
-          console.log('[LLM Config] 默认模型仅作凭据来源，保持智能推荐模式（每环节按 _STEP_MODEL_MAP 自动选模型）')
-        }
+        // t2(2026-11-07)：去掉显式指定，恒定智能推荐——默认模型仅作凭据来源
+        console.log('[LLM Config] 默认模型仅作凭据来源，保持智能推荐模式（每环节按 _STEP_MODEL_MAP 自动选模型）')
       }
     })
   }, [])
@@ -4328,6 +5345,37 @@ export default function AIGenerateWizard({ onClose, onComplete, initialGenre, is
     '民国', '年代文', '快穿', '玄学', '直播', '美食', '武侠幻想', '东方武侠', '国术',
     '规则怪谈', '无限恐怖', '灵异神怪', '悬疑冒险', '幻想修仙', '都市高武', '星际争霸',
     '玄幻言情', '仙侠言情',
+    // ===== 🔥 2026-09-12 #220：按当前各网文平台（起点/番茄/晋江/飞卢/七猫）热门作品补充 =====
+    // 朝代/历史细分（番茄/飞卢朝代文热点）
+    '三国', '大唐', '大宋', '大明', '大清', '权谋', '枭雄',
+    // 玄幻/仙侠细分（起点热门流派）
+    '凡人流', '剑修', '长生流', '苟道流', '气运流', '诡异修仙', '武道', '神话',
+    // 西幻细分（巫师/领主/学院流）
+    '巫师流', '领主流', '学院流', '奥术',
+    // 都市热点（番茄/飞卢王牌品类）
+    '赘婿', '战神', '神医', '神豪', '鉴宝', '豪门', '总裁', '闪婚', '替嫁', '萌宝', '马甲',
+    // 系统/流派玩法（模拟器/词条/反派/群像等新热）
+    '模拟器', '词条流', '聊天群', '反派', '群像', '脑洞', '爽文', '热血', '轻松', '沙雕', '打脸', '逆袭',
+    // 诡异/惊悚细分
+    '诡异复苏', '惊悚', '恐怖游戏', '都市怪谈',
+    // 科幻/末世细分
+    '机甲', '废土', '丧尸', '天灾流', '第四天灾', '虫族', '太空歌剧',
+    // 游戏细分
+    '网游', '游戏制作', '沙盒',
+    // 御兽/召唤/卡牌（近年热门大类）
+    '御兽', '召唤流', '卡牌', '精灵', '宠物',
+    // 种田/经营细分（基建热）
+    '基建', '经营', '农场',
+    // 女频/言情细分（晋江/番茄女频热门标签）
+    '宫斗', '宅斗', '团宠', '复仇', '追妻', '先婚后爱', '破镜重圆', '青梅竹马', '替身',
+    // 悬疑细分（刑侦/法医/民俗）
+    '刑侦', '法医', '民俗',
+    // 军事细分
+    '抗战', '兵王', '特种兵',
+    // 体育细分
+    '篮球', '足球',
+    // 新媒体热点
+    '带货', '短视频',
   ]
   // 去重，确保每个类型只出现一次
   genres = Array.from(new Set(genres))
@@ -4495,7 +5543,8 @@ export default function AIGenerateWizard({ onClose, onComplete, initialGenre, is
     'chapters': 'glm-4-flash',
     'synopsis': 'glm-4-flash',
     'keyPlots': 'glm-4-flash',
-    'content': 'glm-4-flash',
+    // 🔥 2026-10-17 同步后端：正文环节首选豆包网页版逆向网关（doubao）
+    'content': 'doubao',
     'autoDesignProtagonist': 'glm-4-flash',
     'generateName': 'glm-4-flash',
   }
@@ -4527,6 +5576,38 @@ export default function AIGenerateWizard({ onClose, onComplete, initialGenre, is
     return '智能推荐：' + _disp + '（' + (_isPaid ? '付费' : '免费') + '）'
   }
 
+  // 🔥 2026-09-08 模型显示统一（#164，三处同源：向导头部下拉 / 步骤条标签 / 顶栏徽章）
+  //   原则：手动模式→每环节真实调用的都是手动模型，三处全部显示它；
+  //   自动模式→优先显示本环节「实际调用记录」（后端 _meta.usedModel），无记录才回退智能推荐标签。
+  function getCurrentStepModelInfo(): { model: string; provider: string; isActual: boolean } {
+    if (manualModel && llmConfig && llmConfig.model) {
+      return { model: String(llmConfig.model), provider: String(llmConfig.provider || ''), isActual: true }
+    }
+    var _k = step || 'content'
+    if (_k === 'input') _k = 'idea'
+    else if (_k === 'generating' || _k === 'finalCheck') _k = 'content'
+    var rec = stepModels[_k]
+    if (rec && rec.model) return { model: rec.model, provider: rec.provider || '', isActual: true }
+    return { model: '', provider: '', isActual: false }
+  }
+
+  // 向导头部下拉文案：手动模型 > 本环节实际调用 > 智能推荐
+  function getHeaderModelText(): string {
+    if (manualModel && llmConfig && llmConfig.model) return getModelDisplayName(llmConfig)
+    var _info = getCurrentStepModelInfo()
+    if (_info.model) return '本环节实际调用：' + _info.model.replace(/^.*\//, '')
+    return getRecommendedModelDisplayName()
+  }
+
+  // 🔥 顶栏徽章与当前环节同步：不再显示「最近一次完成调用的模型」（滞后），而是当前环节真实（或即将）调用的模型
+  useEffect(function () {
+    var _info = getCurrentStepModelInfo()
+    if (_info.model) {
+      setActiveModel({ usedModel: _info.model.replace(/^.*\//, ''), usedProvider: _info.provider })
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [step, manualModel, llmConfig, stepModels])
+
   // 记录每步实际使用模型（同时刷新全局 Header 展示）
   function recordStepModel(meta: any) {
     if (!meta || !meta.usedModel) return
@@ -4552,6 +5633,8 @@ export default function AIGenerateWizard({ onClose, onComplete, initialGenre, is
   // 🔥 2026-09-06 任务1：返回某环节在导图上显示的模型标签。
   //    优先用实际调用记录；草稿重开/旧草稿缺失记录时，回退到该环节当前智能推荐的模型，保证导图每环节始终显示大模型。
   function getStepModelLabel(stepKey: string): string {
+    // 🔥 2026-09-08 #164：手动模式下每环节真实调用的都是手动模型，导图标签全部同步显示它
+    if (manualModel && llmConfig && llmConfig.model) return String(llmConfig.model).replace(/^.*\//, '')
     var rec = stepModels[stepKey]
     if (rec && rec.model) return rec.model.replace(/^.*\//, '')
     // 关键环节（input/generating/finalCheck）归一题，与 getRecommendedModelDisplayName 保持一致
@@ -4664,19 +5747,20 @@ export default function AIGenerateWizard({ onClose, onComplete, initialGenre, is
         if (json.success !== false && json.data) {
           var pd = json.data
           // 填充主角字段
-          if (pd.name) setProtagonistName(String(pd.name))
-          if (pd.gender) setProtagonistGender(String(pd.gender))
-          if (pd.age) setProtagonistAge(String(pd.age))
-          if (pd.identity) setProtagonistIdentity(String(pd.identity))
+          // 🔥 2026-11-05 修复：用户已填字段不被覆盖（AI 只补空缺字段；已填字段保留用户设定）
+          if (pd.name && !protagonistName.trim()) setProtagonistName(String(pd.name))
+          if (pd.gender && !protagonistGender.trim()) setProtagonistGender(String(pd.gender))
+          if (pd.age && !protagonistAge.trim()) setProtagonistAge(String(pd.age))
+          if (pd.identity && !protagonistIdentity.trim()) setProtagonistIdentity(String(pd.identity))
           // 同时存储到 generatedData.characters，供后续步骤使用
           var protoChar: any = {
             id: 'char-protagonist-' + Date.now(),
-            name: String(pd.name || protagonistName || ''),
+            name: String(protagonistName.trim() || pd.name || ''),
             role: '主角',
             rolePosition: '主角',
             gender: String(pd.gender || protagonistGender || ''),
             age: pd.age ? (typeof pd.age === 'number' ? pd.age : parseInt(String(pd.age)) || 20) : (protagonistAge ? parseInt(protagonistAge) || 20 : 20),
-            identity: String(pd.identity || protagonistIdentity || ''),
+            identity: String(protagonistIdentity.trim() || pd.identity || ''),
             appearance: String(pd.appearance || ''),
             personality: String(pd.personality || ''),
             background: String(pd.background || ''),
@@ -4841,6 +5925,36 @@ export default function AIGenerateWizard({ onClose, onComplete, initialGenre, is
   var handleGenerateIdea = async function() {
     // Debounce guard
     if (!checkGenDebounce()) return
+    // 🔥 2026-09-07（#147）主题变更守卫：用户在输入主题修改关键词/类型/详细设定/主角设定后，
+    //   旧主题的下游数据（idea~chapters）若残留，会通过 previousData 锚定 LLM 造成"改了主题重新生成还是旧内容"。
+    //   检测到主题快照变化 → 确定性清空全部下游数据 + 本地缓存，强制全链路按新主题重新生成（0漂移保证）。
+    try {
+      var _curTheme = JSON.stringify({ k: keywords, g: genre, d: detailedDesignInput, p: protagonistName, pg: protagonistGender, pa: protagonistAge, pi: protagonistIdentity, cm: creationMode })
+      var _snapRaw = localStorage.getItem('tuzhong-last-idea-theme')
+      if (_snapRaw && _snapRaw !== _curTheme) {
+        var _gd: any = generatedDataRef.current || {}
+        var _hadDownstream = !!( _gd.idea || _gd.worldbuilding || _gd.powerSystem || _gd.characters || _gd.factions || _gd.relationships || _gd.synopsis || _gd.outline || _gd.keyPlots || _gd.chapters )
+        if (_hadDownstream) {
+          generatedDataRef.current = {}
+          setGeneratedData({})
+          setGeneratedChapters([]); generatedChaptersRef.current = []
+          setCurrentChapterIndex(0)
+          setUserModifiedVolumeConfig(false)
+          try {
+            localStorage.removeItem('tuzhong-generated-data')
+            localStorage.removeItem('tuzhong-generated-chapters')
+            localStorage.removeItem('tuzhong-volume-config')
+            localStorage.removeItem('tuzhong-current-chapter-idx')
+          } catch (_le) {}
+          setDraftBoxMsg('🔥 检测到主题/设定已修改，旧环节数据已清空，全链路将按新主题重新生成（保证0漂移）。')
+          setThemeGuardMsg('🔥 检测到主题/设定已修改，旧环节数据已清空，全链路将按新主题重新生成（保证0漂移）。')
+          window.setTimeout(function () { setDraftBoxMsg('') }, 4000)
+          window.setTimeout(function () { setThemeGuardMsg('') }, 8000)
+          console.log('[ThemeGuard] #147 主题变更 → 已清空全部下游数据与本地缓存')
+        }
+      }
+      localStorage.setItem('tuzhong-last-idea-theme', _curTheme)
+    } catch (_tgErr) { console.warn('[ThemeGuard] #147 守卫异常(不阻塞):', _tgErr) }
     // [FIXED]
     setIsLoading(true)
     try {
@@ -4948,6 +6062,10 @@ export default function AIGenerateWizard({ onClose, onComplete, initialGenre, is
         normalizedIdea.protagonistName = (protagonistName || '').trim()
         normalizedIdea.protagonistGender = protagonistGender || ''
         normalizedIdea.protagonistIdentity = (protagonistIdentity || '').trim()
+        // 🔥 #226 缺陷1修复：创作方式并入 idea 一并持久化（服务端落库）。
+        //   此前仅同人文模式才写 creationMode，'custom'/'normal' 落库缺失 → 草稿重开无权威值可恢复。
+        //   此处无条件写入，使后续新作品有权威 creationMode。
+        normalizedIdea.creationMode = creationMode
         // 🔥 保存同人文模式标记，供后续步骤使用
         var _fanMatch2 = keywords.match(/([^\s，,、]+)同人/)
         // 修复 v4 TS18047：增加空值保护
@@ -5377,37 +6495,24 @@ export default function AIGenerateWizard({ onClose, onComplete, initialGenre, is
         chaptersPerVolume = volumeConfig.chaptersPerVolume
         console.log('[InitChaptersFrame] 用户已手动修改卷数配置，使用用户设置:', { volumeCount, chaptersPerVolume })
       } else {
-        // 🔥 P2.11.3 修复：非测试模式强制至少10卷（项目硬约束：10卷×30章=300章起步）
-        // 🔥 核心修复：基于关键剧情节点的卷数动态计算总卷数，目标300章以上
-        // 🔥 优先从keyPlots的volumes获取卷数
-        if (Array.isArray(keyPlotsVolumes) && keyPlotsVolumes.length >= 10) {
-          volumeCount = Math.min(10, keyPlotsVolumes.length)
-          console.log('[InitChaptersFrame] 优先从keyPlots.volumes获取卷数:', volumeCount, '来源:', keyPlotsVolumes.length)
-        } else if (keyPlotsVolumes.length > 0) {
-          // 🔥 P2.11.3 修复：强制至少10卷，不足10卷时补齐
-          volumeCount = Math.max(10, Math.min(10, keyPlotsVolumes.length))
-          if (keyPlotsVolumes.length < 10) {
-            console.log('[InitChaptersFrame] keyPlotsVolumes不足10卷(' + keyPlotsVolumes.length + '卷)，强制扩展为10卷')
-          }
-          console.log('[InitChaptersFrame] 基于keyPlotsVolumes计算卷数:', volumeCount, '来源:', keyPlotsVolumes.length)
+        // 🔥 分卷章节划分修复：卷数以「分卷剧情结构」keyPlots.volumes 的实际卷数为准，不再强制扩到10卷
+        // 只有完全没有分卷结构时才回退到大纲阶段的阶段数
+        if (Array.isArray(keyPlotsVolumes) && keyPlotsVolumes.length > 0) {
+          volumeCount = keyPlotsVolumes.length
+          console.log('[InitChaptersFrame] 以分卷剧情结构卷数为准:', volumeCount, '总卷数(volumes.length):', keyPlotsVolumes.length)
         } else if (outlineStages.length > 0) {
-          // 🔥 P2.11.3 修复：强制至少10卷
-          volumeCount = Math.max(10, Math.min(10, outlineStages.length))
-          if (outlineStages.length < 10) {
-            console.log('[InitChaptersFrame] outlineStages不足10卷(' + outlineStages.length + '阶段)，强制扩展为10卷')
-          }
-          console.log('[InitChaptersFrame] 基于outlineStages计算卷数:', volumeCount, '来源:', outlineStages.length)
+          volumeCount = outlineStages.length
+          console.log('[InitChaptersFrame] 无分卷结构，回退到大纲阶段数:', volumeCount)
         } else {
           var kpCountForInit = Array.isArray(keyPlots) ? keyPlots.length : 0
-          // 🔥 P2.11.3 修复：所有分支强制至少10卷
           if (kpCountForInit >= 30) {
             volumeCount = 10
-          } else if (kpCountForInit >= 20) {
-            volumeCount = 10
           } else if (kpCountForInit >= 10) {
-            volumeCount = 10
+            volumeCount = 8
+          } else if (kpCountForInit >= 3) {
+            volumeCount = 5
           } else {
-            volumeCount = 10
+            volumeCount = 3
           }
           console.log('[InitChaptersFrame] 基于keyPlots数量推断卷数:', volumeCount, 'kpCount:', kpCountForInit)
         }
@@ -5416,19 +6521,19 @@ export default function AIGenerateWizard({ onClose, onComplete, initialGenre, is
         var kpCountForInit2 = Array.isArray(keyPlots) ? keyPlots.length : 0
         if (kpCountForInit2 > 0 && volumeCount > 0) {
           var avgKpPerVolumeForInit = kpCountForInit2 / volumeCount
-          chaptersPerVolume = Math.max(30, Math.min(60, Math.round(avgKpPerVolumeForInit * 10)))
+          chaptersPerVolume = Math.max(20, Math.min(60, Math.round(avgKpPerVolumeForInit * 10)))
           console.log('[InitChaptersFrame] 基于关键剧情密度计算每卷章节数:', chaptersPerVolume, 'avgKpPerVolume:', avgKpPerVolumeForInit.toFixed(1))
-          var _totalCalculatedInit = volumeCount * chaptersPerVolume
-          if (_totalCalculatedInit < 300) {
-            chaptersPerVolume = Math.max(30, Math.ceil(300 / volumeCount))
-            console.log('[InitChaptersFrame] 总章节数不足300，调整每卷章节数为:', chaptersPerVolume, '总章节:', volumeCount * chaptersPerVolume)
-          }
-          if (_totalCalculatedInit > 600) {
-            chaptersPerVolume = Math.max(25, Math.round(600 / volumeCount))
-            console.log('[InitChaptersFrame] 总章节数超600，按比例缩减每卷章节数为:', chaptersPerVolume, '总章节:', volumeCount * chaptersPerVolume)
-          }
         } else {
           chaptersPerVolume = 60
+        }
+        // 🔥 硬约束：总数>=300章（卷数变少时每卷章节数相应调大）
+        if (volumeCount > 0 && volumeCount * chaptersPerVolume < 300) {
+          chaptersPerVolume = Math.ceil(300 / volumeCount)
+          console.log('[InitChaptersFrame] 总章节数不足300，每卷章节数调大为:', chaptersPerVolume, '总计:', volumeCount * chaptersPerVolume)
+        }
+        if (volumeCount > 0 && volumeCount * chaptersPerVolume > 600) {
+          chaptersPerVolume = Math.max(25, Math.round(600 / volumeCount))
+          console.log('[InitChaptersFrame] 总章节数超600，每卷章节数缩减为:', chaptersPerVolume, '总计:', volumeCount * chaptersPerVolume)
         }
       }
 
@@ -5558,11 +6663,20 @@ export default function AIGenerateWizard({ onClose, onComplete, initialGenre, is
               _rvObjective = String(_firstNode.summary).slice(0, 100)
             }
           }
+          // 🔥 分卷章节划分修复：重排时保留/沿用原「分卷剧情结构」每卷已设计的 name/coreObjective/openingNode/climaxNode/endHook/keyEvents，不丢弃重造
+          var _designed = keyPlotsVolumes[_rvIdx] || null
+          var _designedName = _designed && _designed.name ? String(_designed.name).trim() : ''
+          var _designedObjective = _designed && _designed.coreObjective ? String(_designed.coreObjective).trim() : ''
+          var _designedSummary = _designed ? synthVolumeSummaryFromDesign(_designed) : ''
+          var _designedKeyEvents = (_designed && Array.isArray(_designed.keyEvents) && _designed.keyEvents.length > 0) ? _designed.keyEvents : _rvNodes.map(function(n: any) { return n.title || '' }).filter(Boolean)
           _redistributedVolumes.push({
-            name: _rvName,
-            summary: _rvSummary,
-            coreObjective: _rvObjective,
-            keyEvents: _rvNodes.map(function(n: any) { return n.title || '' }).filter(Boolean),
+            name: _designedName || _rvName,
+            summary: _designedSummary || _rvSummary,
+            coreObjective: _designedObjective || _rvObjective,
+            openingNode: (_designed && _designed.openingNode) ? _designed.openingNode : null,
+            climaxNode: (_designed && _designed.climaxNode) ? _designed.climaxNode : null,
+            endHook: (_designed && _designed.endHook) ? _designed.endHook : null,
+            keyEvents: _designedKeyEvents,
             _nodes: _rvNodes
           })
         }
@@ -5592,8 +6706,10 @@ export default function AIGenerateWizard({ onClose, onComplete, initialGenre, is
         allVolumes.push({
           volumeNumber: volNum,
           name: vkp?.name || ('第' + volCn + '卷'),
-          summary: vkp?.summary || '',
-          coreObjective: vkp?.coreObjective || '',
+          // 🔥 分卷章节划分修复：卷摘要优先按「分卷剧情结构」合成（coreObjective+开端+高潮+卷末钩子，去重），不再仅读 vkp.summary（可能缺失）
+          // 🔥 #180b：vkp.summary 本身完整（≥100 字且无「。；」杂讯）时优先直读，synth 只作缺失/过短兜底
+          summary: vkp ? ((String(vkp.summary || '').length >= 100 && !/。；/.test(String(vkp.summary))) ? String(vkp.summary) : (synthVolumeSummaryFromDesign(vkp) || vkp.summary || '')) : '',
+          coreObjective: vkp?.coreObjective || (vkp ? synthVolumeSummaryFromDesign(vkp) : ''),
           chapterCount: chaptersPerVolume,
           chapters: chapters,
           keyPlots: vkp ? [vkp] : []
@@ -5710,37 +6826,24 @@ export default function AIGenerateWizard({ onClose, onComplete, initialGenre, is
         chaptersPerVolume = volumeConfig.chaptersPerVolume
         console.log('[Chapters] 用户已手动修改卷数配置，使用用户设置:', { volumeCount, chaptersPerVolume })
       } else {
-        // 🔥 P2.11.3 修复：非测试模式强制至少10卷（项目硬约束：10卷×30章=300章起步）
-        // 🔥 核心修复：基于关键剧情节点的卷数动态计算总卷数，目标300章以上
-        // 优先使用 keyPlotsVolumes 长度（关键剧情分卷），其次使用 outlineStages
-        if (keyPlotsVolumes.length >= 10) {
-          volumeCount = Math.min(10, keyPlotsVolumes.length)
-          console.log('[Chapters] 基于keyPlotsVolumes计算卷数:', volumeCount, '来源:', keyPlotsVolumes.length)
-        } else if (keyPlotsVolumes.length > 0) {
-          // 🔥 P2.11.3 修复：强制至少10卷
-          volumeCount = Math.max(10, Math.min(10, keyPlotsVolumes.length))
-          if (keyPlotsVolumes.length < 10) {
-            console.log('[Chapters] keyPlotsVolumes不足10卷(' + keyPlotsVolumes.length + '卷)，强制扩展为10卷')
-          }
-          console.log('[Chapters] 基于keyPlotsVolumes计算卷数:', volumeCount, '来源:', keyPlotsVolumes.length)
+        // 🔥 分卷章节划分修复：卷数以「分卷剧情结构」keyPlots.volumes 的实际卷数为准，不再强制扩到10卷
+        // 只有完全没有分卷结构时才回退到大纲阶段的阶段数
+        if (keyPlotsVolumes.length > 0) {
+          volumeCount = keyPlotsVolumes.length
+          console.log('[Chapters] 以分卷剧情结构卷数为准:', volumeCount, '总卷数(volumes.length):', keyPlotsVolumes.length)
         } else if (outlineStages.length > 0) {
-          // 🔥 P2.11.3 修复：强制至少10卷
-          volumeCount = Math.max(10, Math.min(10, outlineStages.length))
-          if (outlineStages.length < 10) {
-            console.log('[Chapters] outlineStages不足10卷(' + outlineStages.length + '阶段)，强制扩展为10卷')
-          }
-          console.log('[Chapters] 基于outlineStages计算卷数:', volumeCount, '来源:', outlineStages.length)
+          volumeCount = outlineStages.length
+          console.log('[Chapters] 无分卷结构，回退到大纲阶段数:', volumeCount)
         } else {
           var kpCount = Array.isArray(keyPlots) ? keyPlots.length : 0
-          // 🔥 P2.11.3 修复：所有分支强制至少10卷
           if (kpCount >= 30) {
             volumeCount = 10
-          } else if (kpCount >= 20) {
-            volumeCount = 10
           } else if (kpCount >= 10) {
-            volumeCount = 10
+            volumeCount = 8
+          } else if (kpCount >= 3) {
+            volumeCount = 5
           } else {
-            volumeCount = 10
+            volumeCount = 3
           }
           console.log('[Chapters] 基于keyPlots数量推断卷数:', volumeCount, 'kpCount:', kpCount)
         }
@@ -5749,19 +6852,19 @@ export default function AIGenerateWizard({ onClose, onComplete, initialGenre, is
         var kpCount2 = Array.isArray(keyPlots) ? keyPlots.length : 0
         if (kpCount2 > 0 && volumeCount > 0) {
           var avgKpPerVolume = kpCount2 / volumeCount
-          chaptersPerVolume = Math.max(30, Math.min(60, Math.round(avgKpPerVolume * 10)))
+          chaptersPerVolume = Math.max(20, Math.min(60, Math.round(avgKpPerVolume * 10)))
           console.log('[Chapters] 基于关键剧情密度计算每卷章节数:', chaptersPerVolume, 'avgKpPerVolume:', avgKpPerVolume.toFixed(1))
-          var _totalCalculated = volumeCount * chaptersPerVolume
-          if (_totalCalculated < 300) {
-            chaptersPerVolume = Math.max(30, Math.ceil(300 / volumeCount))
-            console.log('[Chapters] 总章节数不足300，调整每卷章节数为:', chaptersPerVolume, '总章节:', volumeCount * chaptersPerVolume)
-          }
-          if (_totalCalculated > 600) {
-            chaptersPerVolume = Math.max(25, Math.round(600 / volumeCount))
-            console.log('[Chapters] 总章节数超600，按比例缩减每卷章节数为:', chaptersPerVolume, '总章节:', volumeCount * chaptersPerVolume)
-          }
         } else {
           chaptersPerVolume = 60
+        }
+        // 🔥 硬约束：总数>=300章（卷数变少时每卷章节数相应调大）
+        if (volumeCount > 0 && volumeCount * chaptersPerVolume < 300) {
+          chaptersPerVolume = Math.ceil(300 / volumeCount)
+          console.log('[Chapters] 总章节数不足300，每卷章节数调大为:', chaptersPerVolume, '总计:', volumeCount * chaptersPerVolume)
+        }
+        if (volumeCount > 0 && volumeCount * chaptersPerVolume > 600) {
+          chaptersPerVolume = Math.max(25, Math.round(600 / volumeCount))
+          console.log('[Chapters] 总章节数超600，每卷章节数缩减为:', chaptersPerVolume, '总计:', volumeCount * chaptersPerVolume)
         }
       }
 
@@ -5802,8 +6905,13 @@ export default function AIGenerateWizard({ onClose, onComplete, initialGenre, is
 
       var getVolumeSummaryFallback = function (v: number): string {
         var vkp = keyPlotsVolumes[v - 1]
-        if (vkp?.summary) {
-          return vkp.summary
+        // 🔥 分卷章节划分修复：卷摘要优先按「分卷剧情结构」合成（coreObjective+开端+高潮+卷末钩子，去重），不再只读 vkp.summary（可能缺失/与分卷剧情结构不符）
+        // 🔥 #180b：vkp.summary 本身完整（≥100 字且无「。；」杂讯）时优先直读
+        if (vkp) {
+          if (String(vkp.summary || '').length >= 100 && !/。；/.test(String(vkp.summary))) return String(vkp.summary)
+          var _synthSummary = synthVolumeSummaryFromDesign(vkp)
+          if (_synthSummary) return _synthSummary
+          if (vkp.summary) return vkp.summary
         }
         return ''
       }
@@ -5988,7 +7096,15 @@ export default function AIGenerateWizard({ onClose, onComplete, initialGenre, is
               allVolumes[v - 1].coreObjective = json.data.volumeCoreObjective
             }
             if (json.data?.volumeSummary && allVolumes[v - 1]) {
-              allVolumes[v - 1].summary = json.data.volumeSummary
+              // 🔥 2026-09-06 修复（#130）：卷摘要必须优先沿用「分卷剧情结构」里已设计好的摘要。
+              //    后端 chapters 步会用自己的通用模板重造一份 volumeSummary，若无条件覆盖，
+              //    UI 上看到的就变成"主角在本卷围绕…展开"这类空话，而不是已设计好的卷摘要。
+              //    改为：结构摘要缺失或过短(<30字)时，才用后端摘要补位。
+              var _curVolSum = String(allVolumes[v - 1].summary || '').trim()
+              var _newVolSum = String(json.data.volumeSummary || '').trim()
+              if (!_curVolSum || _curVolSum.length < 30) {
+                allVolumes[v - 1].summary = _newVolSum || _curVolSum
+              }
             }
             // 🔥🔥🔥 Bug修复：持久化后端返回的统一标题字数，供后续批次使用
             var _retTitleCharCount = json.data?.batchInfo?.titleCharCount || json.data?.batchInfo?.unifiedTitleLen
@@ -6030,8 +7146,14 @@ export default function AIGenerateWizard({ onClose, onComplete, initialGenre, is
             for (var ri = 0; ri < returnedChapters.length; ri++) {
               var ch = returnedChapters[ri]
               var localIdx = -1
-              if (ch.chapterNumber && ch.chapterNumber > 0) {
-                localIdx = ch.chapterNumber - 1 - (v - 1) * chaptersInVolume
+              // 🔥 2026-09-06 修复（#130）：后端历史版本只输出 `number`，这里却只认 `chapterNumber`，
+              //    导致该值恒为 undefined → 回落到按 batchStart 推算 → 第 2 卷起 localIdx 恒为负 →
+              //    整卷章节被跳过、标题摘要永久停在占位值。改为两个字段名都认。
+              var _chNo = 0
+              if (typeof ch.chapterNumber === 'number' && ch.chapterNumber > 0) _chNo = ch.chapterNumber
+              else if (typeof ch.number === 'number' && ch.number > 0) _chNo = ch.number
+              if (_chNo > 0) {
+                localIdx = _chNo - 1 - (v - 1) * chaptersInVolume
               }
               if (localIdx < 0 || localIdx >= chaptersInVolume) {
                 localIdx = batchStart - 1 - (v - 1) * chaptersInVolume + ri
@@ -6049,8 +7171,15 @@ export default function AIGenerateWizard({ onClose, onComplete, initialGenre, is
                 }
                 var fullTitle = cleanTitle ? '第' + globalNum + '章 ' + cleanTitle : '第' + globalNum + '章'
 
+                // 🔥 2026-09-06 修复（#130）：原先只挑 5 个字段赋值，后端已补全的
+                //    phase/writingGoal/foreshadowing/turningPoint/characterGrowth/sceneSetting/
+                //    informationGap/estimatedWords 等深度字段被整体丢弃 → UI 深度字段全空。
+                //   改为先整体浅合并后端章节对象，再覆盖需要本地规范化的字段。
                 allVolumes[v - 1].chapters[localIdx] = {
                   ...allVolumes[v - 1].chapters[localIdx],
+                  ...ch,
+                  chapterNumber: globalNum,
+                  number: globalNum,
                   title: fullTitle,
                   summary: ch.summary || allVolumes[v - 1].chapters[localIdx].summary || '',
                   shuangPoints: ch.shuangPoints || [],
@@ -6232,38 +7361,42 @@ export default function AIGenerateWizard({ onClose, onComplete, initialGenre, is
 
   // ============================================================================
   // 🔥 2026-09-01 第13轮：角色「分批快出」生成 + 第17轮：人物阵容预设
-  //   ① 首批 5 个核心角色，目标 30 秒内可见，字段完整、质量优先
-  //   ② 落地后立刻进入「主要人物设定」环节，之后每 30 秒补 5 个，2 分钟内补全 15 个
+  //   🔥 2026-11-06 用户反馈（图四）改造：首批只出 3 个核心角色（男主/女主/反派），尽快可见；
+  //   其余 12 人「逐个生成」——每批 1 人、顺序生成，每落地一个立即显示，直到全部生成完毕
+  //   （不再"攒齐一批一次性显示"）。
   //   ③ 「自己设计 · 详细设定输入区」原文直传角色步（此前该字段从未传入，人物设定无法同步）
-  //   ④ 第17轮：三套阵容预设（单女主/双女主/后宫·多女主），均由 charRomanceMode 驱动，
-  //      每套 15 名、3 批 × 5 人（0/30/60s），每套第 1 批必含主角（主角名全流程同步依赖）。
+  //   ④ 三套阵容预设（单女主/双女主/后宫·多女主），均由 charRomanceMode 驱动，每套 15 名，
+  //      第 1 批必含主角（主角名全流程同步依赖）。
   // ============================================================================
   var CHAR_ROSTER_PRESETS: Record<string, { label: string; plan: string[][] }> = {
     // 单女主：主角1 + 女主1 + 女配2 + 朋友2 + 反派4 + 配角5 = 15
     single: {
       label: '单女主',
       plan: [
-        ['主角', '女主', '反派', '反派', '配角'],   // 第1批：核心班底（≈30s 出）
-        ['反派', '反派', '朋友', '朋友', '配角'],   // 第2批：+30s
-        ['女配', '女配', '配角', '配角', '配角'],   // 第3批：+60s
+        ['主角', '女主', '反派'],   // 第1批：核心三角（男主/女主/反派，尽快可见）
+        ['反派'], ['反派'], ['反派'],
+        ['配角'], ['配角'], ['配角'], ['配角'], ['配角'],
+        ['女配'], ['女配'], ['朋友'], ['朋友'],
       ],
     },
     // 双女主：主角1 + 女主2 + 女配1 + 朋友2 + 反派5 + 配角4 = 15
     dual: {
       label: '双女主',
       plan: [
-        ['主角', '女主', '女主', '反派', '反派'],   // 第1批：核心班底（含双女主）
-        ['反派', '反派', '反派', '朋友', '朋友'],   // 第2批：+30s
-        ['女配', '配角', '配角', '配角', '配角'],   // 第3批：+60s
+        ['主角', '女主', '反派'],   // 第1批：核心三角
+        ['女主'], ['反派'], ['反派'], ['反派'], ['反派'],
+        ['配角'], ['配角'], ['配角'], ['配角'],
+        ['女配'], ['朋友'], ['朋友'],
       ],
     },
     // 后宫·多女主：主角1 + 女主4 + 反派4 + 配角6 = 15
     harem: {
       label: '后宫·多女主',
       plan: [
-        ['主角', '女主', '女主', '女主', '女主'],   // 第1批：核心班底（含四女主）
-        ['反派', '反派', '反派', '反派', '配角'],   // 第2批：+30s
-        ['配角', '配角', '配角', '配角', '配角'],   // 第3批：+60s
+        ['主角', '女主', '反派'],   // 第1批：核心三角
+        ['女主'], ['女主'], ['女主'],
+        ['反派'], ['反派'], ['反派'],
+        ['配角'], ['配角'], ['配角'], ['配角'], ['配角'], ['配角'],
       ],
     },
   }
@@ -6281,14 +7414,113 @@ export default function AIGenerateWizard({ onClose, onComplete, initialGenre, is
     if (Array.isArray(chars.supporting)) chars.supporting.forEach(push)
     return out
   }
+  // 🔥 2026-09-10：按【真实已生成角色数】统计（仅计数有实质姓名的角色），
+  //   用于替代原“假心跳/固定 11/12”的进度显示——真实输出多少就显示多少。
+  var _realCharCount = function (chars: any): number {
+    if (!chars) return 0
+    var n = 0
+    var _hasName = function (c: any) { return !!(c && String(c.name || '').trim()) }
+    if (_hasName(chars.protagonist)) n++
+    if (Array.isArray(chars.femaleLeads)) n += chars.femaleLeads.filter(_hasName).length
+    else if (_hasName(chars.femaleLead)) n++
+    if (Array.isArray(chars.antagonists)) n += chars.antagonists.filter(_hasName).length
+    else if (_hasName(chars.antagonist)) n++
+    if (Array.isArray(chars.supporting)) n += chars.supporting.filter(_hasName).length
+    return n
+  }
+  // 🔥 2026-09-10：按真实已生成角色数刷新两组进度 UI（charGenProgress + 分批进度横幅）。
+  var _refreshCharCountUI = function () {
+    var _gd: any = generatedDataRef.current || {}
+    var _cnt = _realCharCount(_gd.characters)
+    setCharGenProgress({ current: Math.min(_cnt, CHAR_BATCH_TOTAL), total: CHAR_BATCH_TOTAL })
+    setCharBatchUi(function (s: any) { return s.phase === 'idle' ? s : { ...s, completed: Math.min(_cnt, s.total) } })
+  }
 
-  var handleGenerateCharactersBatched = async function (passedPowerSystem?: any, userAppendHints?: string) {
+  // 🔥 2026-11-06（图五修复）：角色生成「中断续生成」基础设施
+  //   · pending 标记按草稿 id 隔离：分批生成启动时写入，角色齐备后清除；
+  //     页面刷新/跳转后若标记仍在且角色未齐 → 挂载 effect 自动续生成缺失角色。
+  var _charPendingKey = function () { return 'tuzhong-char-gen-pending-' + (localStorage.getItem('tuzhong-active-novel-id') || 'default') }
+  var _setCharGenPending = function () { try { localStorage.setItem(_charPendingKey(), String(Date.now())) } catch (_e) {} }
+  var _clearCharGenPending = function () { try { localStorage.removeItem(_charPendingKey()) } catch (_e) {} }
+  var charBatchRunningRef = useRef(false)
+  // 现有角色按槽位归类计数（女配/朋友/配角按 role 字段细分，供 resume 计划对比）
+  var _tallyCharRoles = function (chars: any): Record<string, number> {
+    var t: Record<string, number> = {}
+    var bump = function (c: any) {
+      if (!c || !String(c.name || '').trim()) return
+      var s = String(c.rolePosition || c.role || '')
+      var key = /主角|protagonist/i.test(s) ? '主角'
+        : /女主|femaleLead/i.test(s) ? '女主'
+        : /反派|antagonist|villain/i.test(s) ? '反派'
+        : /女配/i.test(s) ? '女配'
+        : /朋友|伙伴/i.test(s) ? '朋友'
+        : '配角'
+      t[key] = (t[key] || 0) + 1
+    }
+    if (!chars) return t
+    bump(chars.protagonist)
+    if (Array.isArray(chars.femaleLeads)) chars.femaleLeads.forEach(bump)
+    else bump(chars.femaleLead)
+    if (Array.isArray(chars.antagonists)) chars.antagonists.forEach(bump)
+    else bump(chars.antagonist)
+    if (Array.isArray(chars.supporting)) chars.supporting.forEach(bump)
+    return t
+  }
+  // resume 计划：对比 CHAR_BATCH_PLAN 需求与现有角色，缺失核心（主角/女主/反派）合并为首批，其余逐个成批
+  var _buildCharPlanForResume = function (chars: any): string[][] {
+    var required: Record<string, number> = {}
+    CHAR_BATCH_PLAN.forEach(function (b) { b.forEach(function (r) { required[r] = (required[r] || 0) + 1 }) })
+    var have = _tallyCharRoles(chars)
+    var miss: Record<string, number> = {}
+    Object.keys(required).forEach(function (r) { var m = (required[r] || 0) - (have[r] || 0); if (m > 0) miss[r] = m })
+    var plan: string[][] = []
+    var _core: string[] = []
+    if ((miss['主角'] || 0) > 0) { _core.push('主角'); miss['主角']-- }
+    if ((miss['女主'] || 0) > 0) { _core.push('女主'); miss['女主']-- }
+    if ((miss['反派'] || 0) > 0) { _core.push('反派'); miss['反派']-- }
+    if (_core.length) plan.push(_core)
+    Object.keys(miss).forEach(function (r) { for (var i = 0; i < miss[r]; i++) plan.push([r]) })
+    return plan
+  }
+
+  var handleGenerateCharactersBatched = async function (passedPowerSystem?: any, userAppendHints?: string, opts?: { resume?: boolean; force?: boolean }) {
+    var _resumeMode = !!(opts && opts.resume)
+    // 🔥 2026-11-07 修复（线上「重新生成」点击无反应）：force=true 表示用户显式点击「重新生成」，
+    //   必须跳过下方「已存在完整精确角色数据则跳过」的自动守卫，否则已有角色的书永远静默不生成。
+    var _forceMode = !!(opts && opts.force)
     if (passedPowerSystem && (passedPowerSystem.nativeEvent || passedPowerSystem._reactName || passedPowerSystem.target)) {
       passedPowerSystem = undefined
     }
     clearCharBatchTimers()
     // 🔥 本轮批次令牌：重新生成时上一轮在途批次自动作废，避免旧角色串进新结果
     var batchEpoch = ++charBatchEpochRef.current
+    charBatchRunningRef.current = true
+    // 🔥🔥 [直接写入·精确角色守卫] 服务器/运行中已含完整精确角色（主角+配角齐全）→ 跳过 AI 分批自动生成，
+    //    直接保留现有数据并在前端展示，避免自动生成把用户亲自写入的历史角色清空覆盖。
+    var _curCharsForGuard = (generatedDataRef.current && (generatedDataRef.current as any).characters) || {}
+    var _curPGuard = _curCharsForGuard.protagonist
+    var _curPNameGuard = (_curPGuard && String(_curPGuard.name || '').trim()) || ''
+    var _curSupGuard = (Array.isArray(_curCharsForGuard.supporting) ? _curCharsForGuard.supporting : []).filter(Boolean)
+    var _curAntiGuard = (_curCharsForGuard.antagonist && String(_curCharsForGuard.antagonist.name || '').trim()) || ''
+    if (!_resumeMode && !_forceMode && _curPNameGuard && _curPNameGuard !== '主角' && _curPNameGuard !== '待定' && _curSupGuard.length >= 2) {
+      console.log('[handleGenerateCharactersBatched] 已存在完整精确角色数据，跳过自动生成：proto=', _curPNameGuard,
+        '抗=', _curAntiGuard, '配=', _curSupGuard.length)
+      _clearCharGenPending()
+      setIsGeneratingCharacters(false)
+      setIsLoading(false)
+      charBatchRunningRef.current = false
+      return
+    }
+    // 🔥 2026-11-06：续生成模式按缺失槽位构建计划；已齐备则直接收尾
+    var _plan: string[][] = _resumeMode ? _buildCharPlanForResume(_curCharsForGuard) : CHAR_BATCH_PLAN
+    if (_resumeMode && _plan.length === 0) {
+      console.log('[charBatch] resume：角色已齐备，无需续生成')
+      _clearCharGenPending()
+      setIsGeneratingCharacters(false)
+      setIsLoading(false)
+      charBatchRunningRef.current = false
+      return
+    }
     // 🔥 修复：设置生成中标志，让StepCharacters显示加载状态而非空卡片
     setIsGeneratingCharacters(true)
     // 🔥 2026-09-02 修复（问题④⑤）：「主要人物设定」立即跳转（≤5秒显形），先显示进度骨架，
@@ -6304,11 +7536,14 @@ export default function AIGenerateWizard({ onClose, onComplete, initialGenre, is
       ', 详细设定长度=', (typeof detailedDesignInput === 'string' ? detailedDesignInput.length : 0),
       ', 用户追加提示长度=', _userHintStr.length)
 
-    var emptyChars: any = { protagonist: null, femaleLead: null, antagonist: null, supporting: [] }
-    saveStepSnapshot('characters', emptyChars)
-    setGeneratedData(function (prev: any) { return { ...prev, characters: emptyChars } })
-    if (generatedDataRef.current) {
-      generatedDataRef.current = { ...(generatedDataRef.current as any), characters: emptyChars } as any
+    // 🔥 2026-11-06：续生成模式保留已有角色，只补缺失槽位
+    if (!_resumeMode) {
+      var emptyChars: any = { protagonist: null, femaleLead: null, antagonist: null, supporting: [] }
+      saveStepSnapshot('characters', emptyChars)
+      setGeneratedData(function (prev: any) { return { ...prev, characters: emptyChars } })
+      if (generatedDataRef.current) {
+        generatedDataRef.current = { ...(generatedDataRef.current as any), characters: emptyChars } as any
+      }
     }
 
     // ---- 单批请求：向后端声明本轮配额 / 名额 / 已有角色（后端据此压 token 并禁用补齐式兜底）----
@@ -6320,7 +7555,7 @@ export default function AIGenerateWizard({ onClose, onComplete, initialGenre, is
     var fetchCharBatch = async function (needs: string[], existing: string[], phase: 'core' | 'supplement', abortMsOverride?: number): Promise<any> {
       if (charBatchEpochRef.current !== batchEpoch) { console.log('[charBatch] 轮次已作废，跳过 ' + phase + ' 批次'); return null }
       var abortCtrl = new AbortController()
-      var abortMs = abortMsOverride || (phase === 'core' ? 120000 : 120000)
+      var abortMs = abortMsOverride || 600000
       var to = setTimeout(function () { abortCtrl.abort() }, abortMs)
       charBatchTimersRef.current.push(to)
       try {
@@ -6369,7 +7604,6 @@ if (phase === 'core' && _userHintStr) {
               age: (protagonistAge || '').trim(),
               identity: (protagonistIdentity || '').trim(),
             },
-            charBatch: { size: needs.length, needs: needs, existing: existing, phase: phase, parallel: true },
           },
           llmConfig: getStepLlmConfig('characters'),
           enabledSkills: getEnabledSkills(),
@@ -6527,122 +7761,57 @@ if (phase === 'core' && _userHintStr) {
     }
 
     setIsLoading(true)
-    setCharGenProgress({ current: 2, total: 12 })
+    var _initCompleted = _resumeMode ? _realCharCount(_curCharsForGuard) : 0
+    setCharGenProgress({ current: _initCompleted, total: CHAR_BATCH_TOTAL })
     // 🔥 第14轮：批次元数据 UI，让用户看到「第 1 批已出 / 还有 N 批在排队」
-    setCharBatchUi({ phase: 'core', completed: 0, total: CHAR_BATCH_TOTAL, targetBatch: CHAR_BATCH_PLAN.length, currentBatch: 1 })
+    setCharBatchUi({ phase: 'core', completed: _initCompleted, total: CHAR_BATCH_TOTAL, targetBatch: _plan.length, currentBatch: 1 })
+    // 🔥 2026-11-06：写入续生成 pending 标记（页面刷新/跳转后由挂载 effect 自动补全）
+    _setCharGenPending()
+    // 🔥 2026-09-10：心跳改为“按真实已生成角色数刷新”，不再假递增一个 11/12 的假进度。
     var heartbeat = setInterval(function () {
-      setCharGenProgress(function (p: any) {
-        if (!p || p.current >= p.total - 1) return p
-        return { current: p.current + 1, total: p.total }
-      })
+      _refreshCharCountUI()
     }, 4000)
     charBatchTimersRef.current.push(heartbeat)
 
     try {
-      // ===== 第 1 批：核心 5 人，目标 30 秒内可见 =====
-      // 🔥 2026-09-02 修复图一：首批失败时自动重试 1 次（180 秒宽松阈值），双发失败再弹软提示，不再"请检查网络或重试"
-      var first = await fetchCharBatch(CHAR_BATCH_PLAN[0], [], 'core', 120000)
-      if (!first) {
-        console.warn('[charBatch] 🔥 首批超时(120s)，自动重试一次 (180s 宽松阈值)')
-        first = await fetchCharBatch(CHAR_BATCH_PLAN[0], [], 'core', 180000)
+      // 🔥 2026-11-07 推倒重做：单请求全量生成。后端三段式（S1名册蓝图→S2整卡展开→S3确定性终检）
+      //   一次返回 ≥15 人完整名册；旧「首批+逐批补充+补救轮」编排是身份池串味与占位垃圾的源头，全部废弃。
+      var _allNeeds: string[] = []
+      for (var _pli = 0; _pli < _plan.length; _pli++) {
+        for (var _pji = 0; _pji < _plan[_pli].length; _pji++) {
+          if (_allNeeds.indexOf(_plan[_pli][_pji]) === -1) _allNeeds.push(_plan[_pli][_pji])
+        }
       }
-      if (!first) {
-        // 🔥 软提示：明确告知"后台仍在努力跑补充批次"，不再用"请检查网络或重试"误导用户
-        showErrorAlert(null, '⏳ 首批角色生成稍慢（双发超时 120s+180s 已自动用完），系统将继续按 30 秒/批节奏尝试补充批次（每批 5 人），请勿关闭页面。后台跑出首批角色后将自动显示在主要人物设定区。')
-        setCharBatchUi({ phase: 'supplement', completed: 0, total: CHAR_BATCH_TOTAL, targetBatch: CHAR_BATCH_PLAN.length, currentBatch: 1 })
-        setIsLoading(false)
-        setIsGeneratingCharacters(false)
-        // 不 return，让补充批次继续在背景跑
+      var _firstExisting = _resumeMode ? _collectExistingCharNames(_curCharsForGuard) : []
+      var _firstPhase = _resumeMode ? 'supplement' : 'core'
+      var _single = await fetchCharBatch(_allNeeds, _firstExisting, _firstPhase, 900000)
+      if (!_single) {
+        console.warn('[charBatch] 单次全量生成失败/超时，自动重试 1 次')
+        _single = await fetchCharBatch(_allNeeds, _firstExisting, _firstPhase, 900000)
+      }
+      if (!_single) {
+        showErrorAlert(null, '主要人物设定生成失败：模型多次重试未返回有效名册（后端已禁用硬编码兜底）。请点击「重新生成」，或在模型设置切换更强的模型后重试。')
       } else {
-        applyCharBatch(first)
-        setCharGenProgress({ current: 7, total: 12 })
-        // 🔥 首批落地即进入「主要人物设定」环节并解除 loading，用户立刻看到 5 个角色
+        applyCharBatch(_single)
+        _refreshCharCountUI()
         setStep('characters')
-        setIsLoading(false)
-        setIsGeneratingCharacters(false)
-        // 🔥 首批完成：UI 切到 supplement 阶段，1/4 已完成，后续 3 批各 30s 后补充
-        setCharBatchUi({ phase: 'supplement', completed: 5, total: CHAR_BATCH_TOTAL, targetBatch: CHAR_BATCH_PLAN.length, currentBatch: 2 })
       }
+      setIsLoading(false)
+      setIsGeneratingCharacters(false)
 
-      // ===== 后续 3 批：进入环节后每 30 秒补 5 个，2 分钟内补全 20 人 =====
-      var batchPromises: Promise<void>[] = []
-      for (var bi = 1; bi < CHAR_BATCH_PLAN.length; bi++) {
-        (function (idx: number) {
-          var p = new Promise<void>(function (resolve) {
-            var t = setTimeout(async function () {
-              try {
-                if (charBatchEpochRef.current !== batchEpoch) { console.log('[charBatch] 轮次已作废，取消第' + (idx + 1) + '批'); resolve(); return }
-                // 🔥 标注本批开始：让用户看到第 N 批开始跑
-                setCharBatchUi(function (s: any) { return { ...s, currentBatch: idx + 2 } })
-                var gd2: any = generatedDataRef.current || {}
-                var existing = _collectExistingCharNames(gd2.characters)
-                var more = await fetchCharBatch(CHAR_BATCH_PLAN[idx], existing, 'supplement')
-                // 🔥 2026-09-03：补充批失败一次自动重试（120s 阈值），避免"超过 75s 就彻底丢批、2 分钟无新角色"的回归
-                if (!more) {
-                  console.warn('[charBatch] 第' + (idx + 1) + '批补充为空/超时，自动重试 1 次')
-                  more = await fetchCharBatch(CHAR_BATCH_PLAN[idx], existing, 'supplement', 120000)
-                }
-                if (more) {
-                  applyCharBatch(more)
-                  setCharGenProgress(function (pp: any) { return { current: Math.min(pp.total, pp.current + 1), total: pp.total } })
-                  // 🔥 本批完成：累计 completed +5
-                  setCharBatchUi(function (s: any) { return { ...s, completed: s.completed + 5 } })
-                }
-              } catch (be) {
-                console.warn('[charBatch] 第' + (idx + 1) + '批补充异常:', be)
-              }
-              resolve()
-            }, 30000 * idx)
-            charBatchTimersRef.current.push(t)
-          })
-          batchPromises.push(p)
-        })(bi)
-      }
-      // 兜底：最迟 150 秒收尾，避免任一批次挂起把自动流卡死
-      await Promise.race([
-        Promise.all(batchPromises),
-        new Promise<void>(function (resolve) {
-          var t2 = setTimeout(resolve, 150000)
-          charBatchTimersRef.current.push(t2)
-        }),
-      ])
-      setCharGenProgress({ current: 12, total: 12 })
-      // 🔥 2026-09-02 修复（图1/3 女主空值 + 详细设定角色缺失）：
-      //   全部批次落地后做完整性校验——女主（所有模式必备）/主角缺失时，自动追加定向补救批次
-      //   （needs 精确声明缺失槽位，附详细设定输入），最多补 2 轮，杜绝"生成完成但女主卡整卡空值"。
-      ;(async function () {
-        var _remedyRound = 0
-        while (_remedyRound < 2) {
-          if (charBatchEpochRef.current !== batchEpoch) return
-          var _gdR: any = generatedDataRef.current || {}
-          var _charsR: any = _gdR.characters || {}
-          var _missing: string[] = []
-          var _protoOk = _charsR.protagonist && String(_charsR.protagonist.name || '').trim().length >= 2
-          var _flOk = _charsR.femaleLead && String(_charsR.femaleLead.name || '').trim().length >= 2
-          if (!_protoOk) _missing.push('主角')
-          if (!_flOk) _missing.push('女主')
-          if (_missing.length === 0) break
-          _remedyRound++
-          console.log('[charBatch] 🔥 完整性补救第 ' + _remedyRound + ' 轮，缺失槽位: ' + _missing.join('+'))
-          setCharBatchUi({ phase: 'supplement', completed: 0, total: CHAR_BATCH_TOTAL, targetBatch: CHAR_BATCH_PLAN.length, currentBatch: CHAR_BATCH_PLAN.length + _remedyRound })
-          var _existingR = _collectExistingCharNames(_charsR)
-          var _remedy = await fetchCharBatch(_missing, _existingR, 'core', 120000)
-          if (_remedy) applyCharBatch(_remedy)
-          if (!_remedy) break
-        }
-        if (charBatchEpochRef.current === batchEpoch) {
-          setCharBatchUi(function (s: any) { return { ...s, phase: 'done', completed: s.total } })
-        }
-      })()
+      // 🔥 2026-11-07 推倒重做：逐批循环与补救 while 已删除（单请求一次出全量名册）
       // 🔥 所有批次完成：UI 收尾回 idle（让 banner 3 秒后自动消失，给最后一帧让人看清楚）
       setCharBatchUi(function (s: any) { return { ...s, phase: 'done', completed: s.total } })
-      setTimeout(function () { setCharBatchUi({ phase: 'idle', completed: 0, total: CHAR_BATCH_TOTAL, targetBatch: CHAR_BATCH_PLAN.length, currentBatch: 0 }) }, 3000)
+      setTimeout(function () { setCharBatchUi({ phase: 'idle', completed: 0, total: CHAR_BATCH_TOTAL, targetBatch: _plan.length, currentBatch: 0 }) }, 3000)
       console.log('[handleGenerateCharactersBatched] 全部分批完成')
+      // 🔥 2026-11-06：角色已齐备则清除续生成 pending 标记（避免下次打开草稿误触发）
+      var _gdDone: any = generatedDataRef.current || {}
+      if (_realCharCount(_gdDone.characters) >= 15) _clearCharGenPending()
     } catch (err: any) {
       console.error('[handleGenerateCharactersBatched] Error:', err)
       var _bAbort = err && (err.name === 'AbortError') || /abort|超时|timeout/i.test(String(err?.message || ''))
       if (_bAbort) {
-        showErrorAlert(null, '批次调度异常（150 秒兜底已用尽），请刷新页面后重试')
+        showErrorAlert(null, '批次调度异常，重新打开草稿将自动续生成缺失角色，也可点击重新生成')
       } else {
         showErrorAlert(err, '角色批次调度失败，请重试')
       }
@@ -6651,11 +7820,32 @@ if (phase === 'core' && _userHintStr) {
       clearCharBatchTimers()
       setIsLoading(false)
       setIsGeneratingCharacters(false)
+      charBatchRunningRef.current = false
       console.log('[handleGenerateCharactersBatched] 完成，isGeneratingCharacters=false')
     }
   }
 
-  var handleGenerateCharacters = async function (passedPowerSystem?: any) {
+  // 🔥 2026-11-06（图五修复）：页面刷新/跳转后自动续生成——
+  //   挂载后若处于「主要人物设定」步、pending 标记存在、角色未齐且当前无生成任务在跑，
+  //   则自动以 resume 模式续生成缺失角色（不清空已有角色，只补缺失槽位）。
+  var charAutoResumeRef = useRef(false)
+  useEffect(function () {
+    if (charAutoResumeRef.current) return
+    if (step !== 'characters') return
+    if (isGeneratingCharacters || charBatchRunningRef.current) return
+    var _pending = ''
+    try { _pending = localStorage.getItem(_charPendingKey()) || '' } catch (_e) {}
+    if (!_pending) return
+    var _gd: any = generatedDataRef.current || {}
+    var _cnt = _realCharCount(_gd.characters)
+    if (_cnt >= 15) { _clearCharGenPending(); return }
+    charAutoResumeRef.current = true
+    console.log('[charAutoResume] 检测到角色生成中断（' + _cnt + '/' + CHAR_BATCH_TOTAL + '），自动续生成')
+    var _t = setTimeout(function () { void handleGenerateCharactersBatched(undefined, '', { resume: true }) }, 2000)
+    return function () { clearTimeout(_t) }
+  }, [step, isGeneratingCharacters])
+
+  var handleGenerateCharacters = async function (passedPowerSystem?: any, opts?: { force?: boolean }) {
     // Guard: React onClick passes synthetic event as first arg, not power system data
     if (passedPowerSystem && (passedPowerSystem.nativeEvent || passedPowerSystem._reactName || passedPowerSystem.target)) {
       passedPowerSystem = undefined
@@ -6670,7 +7860,7 @@ if (phase === 'core' && _userHintStr) {
     var _userAppendHints = precleanRoleTableInput(appendRoleInput)
     // 立即清空 appendRoleInput，避免批次内存里残留
     if (_userAppendHints) setAppendRoleInput('')
-    return await handleGenerateCharactersBatched(passedPowerSystem, _userAppendHints)
+    return await handleGenerateCharactersBatched(passedPowerSystem, _userAppendHints, opts)
   }
   var handleGenerateRelationships = async function() {
     // Debounce guard
@@ -6963,7 +8153,7 @@ if (phase === 'core' && _userHintStr) {
                 description: '拥有现代历史知识和技术，能预知历史走向并利用现代知识改变世界',
                 abilities: ['历史预知', '技术革新', '权谋分析'],
                 limitations: ['知识有时代局限', '改变历史有风险'],
-                evolution: '初入南明→技术立足→朝堂立足→影响国策→改变历史'
+                evolution: '初入乱世→知识立足→权谋立足→影响格局→改写命运'
               }
             } else if (_genreForAuto.indexOf('都市') !== -1 || _genreForAuto.indexOf('现代') !== -1) {
               normalized.protagonistAbility = {
@@ -7240,7 +8430,9 @@ if (phase === 'core' && _userHintStr) {
     setGenFailedList([])
 
     var MAX_RETRIES = 3
-    var RETRY_BASE_DELAY = 1500 // 1.5s base, exponential backoff
+    // 🔥 2026-09-30 性能优化：重试退避从 1.5s base 降到 0.6s base（1.5s/3s/6s → 0.6s/1.2s/2.4s）
+    //   总重试等待最坏从 10.5s 缩到 4.2s，且免费模型限流恢复通常在 1-2s 内，短退避成功率更高
+    var RETRY_BASE_DELAY = 600
 
     try {
       // 🔥 前置数据检查与自动补全：确保生成正文前所有必要数据存在
@@ -7304,6 +8496,12 @@ if (phase === 'core' && _userHintStr) {
       // 再次检查章节数据
       _latestData = generatedDataRef.current
       var allChapters = _latestData.chapters?.chapters || []
+      // 🔥 2026-11-05 批量上限：一次性生成 N 章（1-20），0=全部。切片在断点续跑过滤之前——每次点生成都只跑前 N 个未完成章
+      var _batchLimit = parseInt(typeof localStorage !== 'undefined' ? (localStorage.getItem('tuzhong-batch-limit') || '0') : '0', 10) || 0
+      if (_batchLimit > 0 && allChapters.length > _batchLimit) {
+        allChapters = allChapters.slice(0, _batchLimit)
+        console.log('[ContentGen] 批量上限：本次只生成前 ' + _batchLimit + ' 章（共 ' + (_latestData.chapters?.chapters || []).length + ' 章规划）')
+      }
       var totalChapters = allChapters.length
 
       if (totalChapters === 0) {
@@ -7361,7 +8559,7 @@ if (phase === 'core' && _userHintStr) {
 
       totalChapters = allChapters.length
       if (totalChapters === 0 && _totalPlanned > 0) {
-        console.log('[ContentGen] #3 所有章节已完成，无需续写'); setGenStatus('completed'); setIsLoading(false); return
+        console.log('[ContentGen] #3 所有章节已完成，无需续写'); setGenStatus('done'); setIsLoading(false); return
       }
       var startTime = Date.now()
       setGenStats({
@@ -7391,8 +8589,11 @@ if (phase === 'core' && _userHintStr) {
       // 🔥 修复Bug3：改为顺序生成章节（并发=1），避免上下文竞态条件，保证章节连贯，降低内存压力
       // 原因：下一章需要上一章结尾作为上下文，并发会导致章节顺序混乱、剧情不连贯，且高并发容易导致浏览器内存崩溃
       var concurrency = 1
-      // 🔥 P2.12.1 修复：支持批量生成（5章/批），批内顺序生成保证连贯，批间串行，每批完成后保存
-      var CONTENT_BATCH_SIZE = 5
+      // 🔥 2026-09-17 #226O 修复：改为严格逐章顺序生成（批大小=1）。
+      //   原因：① 用户明确要求"每章逐章生成、保证逻辑衔接严谨"——并行批内各章共用同一份 prevChapterEnding
+      //       会导致章间互不衔接；② 串行把并发 API 请求从 5 降到 1，大幅降低免费模型限流(429)概率，
+      //       从根上减少正文生成失败（此前 105/142 失败主要源于限流）。每章生成后立即落库，断点续生成/暂停恢复也基于此。
+      var CONTENT_BATCH_SIZE = 1
       var chapterQueue = allChapters.map(function(ch: any, i: number) { return { chapter: ch, index: i } })
 
       // 按章节号排序，确保顺序生成
@@ -7413,12 +8614,16 @@ if (phase === 'core' && _userHintStr) {
         var chStartTime = Date.now()
         var retry = 0
         var success = false
+        // 🔥 2026-09-30 性能优化·当前章实时状态（供 UI 心跳显示「正在生成第 X 章·已用 X 秒」）
+        genCurrentChapterRef.current = { index: i + 1, startedAt: chStartTime, retry: 0 }
 
         while (retry <= MAX_RETRIES && !success) {
           // Check cancel during retry
           if (genCancelRef.current) return
 
           try {
+            // 🔥 2026-09-30 性能优化·把本章重试次数同步到 ref，让心跳 UI 能显示「重试 X/3」
+            if (genCurrentChapterRef.current) genCurrentChapterRef.current.retry = retry
             if (retry > 0) {
               var delay = RETRY_BASE_DELAY * Math.pow(2, retry - 1)
               console.log('[ContentGen] Retry ' + retry + '/' + MAX_RETRIES + ' for chapter ' + (i + 1) + ', delay ' + delay + 'ms')
@@ -7433,6 +8638,10 @@ if (phase === 'core' && _userHintStr) {
                 input: { title: chapter.title, summary: chapter.summary, genre },
                 genre,
                 novelId: 'temp',
+                // 🔥 逐章生成正文·右上角控制面板：把字数 / 风格 / 新角色随本章请求传入后端提示词
+                targetWordCount: genTargetWordCount,
+                style: genStyle,
+                newCharacters: genNewCharacters,
                 previousData: {
                   // 🔥 2026-09-01 第13轮：「自己设计·详细设定输入区」原文直传，确保用户设定同步到本环节
                   detailedDesignInput: detailedDesignInput,
@@ -7453,6 +8662,9 @@ if (phase === 'core' && _userHintStr) {
                   prevEnding: prevChapterEnding,
                   bookAnalysis: _latestData.bookAnalysis,
                 },
+                enabledSkills: getEnabledSkills(),
+                activeStyle: getActiveStyle(),
+                bestsellerPrefs: getBestsellerPrefs(),
                 llmConfig: contentLlmConfig,
               }),
             })
@@ -7480,7 +8692,8 @@ if (phase === 'core' && _userHintStr) {
                 return m ? m.length : 0
               }
               var zhWordCount = countZhChars(content)
-              var wordCount = content.length
+              // 🔥 T9：口径统一为去空白（含标点）字符数
+              var wordCount = content.replace(/\s/g, '').length
               // 🔥 修复标题重复bug：清理title中已有的"第X章"前缀，避免显示"第1章第1章"
               var cleanTitle = (chapter.title || '').trim()
                 .replace(/^(?:第[0-9〇零一二三四五六七八九十百千]+章[\s·、：:_\-]?)*/g, '').trim()
@@ -7507,33 +8720,54 @@ if (phase === 'core' && _userHintStr) {
               }
               var fullTitle = cleanTitle ? '第' + globalNum + '章 ' + cleanTitle : '第' + globalNum + '章'
 
-              // Check for empty/minimal content OR insufficient word count
-              // 🔥 字数硬标准：汉字数不足2000视为不合格，重试
-              if (!content || content.length < 100 || zhWordCount < 2000) {
+              // 🔥 与后端对齐的字数口径（2026-10-16 绍宋级口径统一）：后端正文目标 2500-4000 汉字（默认 3000）、硬截断上限 4000 字总长、
+              //   质量门最低 2500 字（≈2900 字总长，见 route.ts _targetMinWords / 硬截断）。前端接受 content.length >= 2900
+              //   （已含标点，≈2500 汉字下限），避免与后端口径不一致导致每章被强制 3 次重生成
+              //   （4×API 负载→触发限流 429→大量 HTTP/网络失败）。
+              //   后端在模型全失败时返回失败占位符「本章内容生成失败…」，必须识别为失败而非误判"已完成"——
+              //   此前占位符因长度>100 被当成正文"已完成"静默入库，是失败率被低估、成品掺假的根因之一。
+              // 🔥 2026-10-15 绍宋级口径：总长下限 2900（≈2500汉字），与后端 _targetMinWords 对齐，
+              //   避免两端口径不一致导致每章被强制重生成（4×API 负载→限流 429→大量失败）。
+              var _isFailPlaceholder = content.indexOf('本章内容生成失败') >= 0
+              var _tooShort = !content || content.length < 2900
+              if (_isFailPlaceholder || _tooShort) {
                 if (retry < MAX_RETRIES) {
                   retry++
-                  console.log('[ContentGen] Chapter ' + (i + 1) + ' 字数不足(汉字' + zhWordCount + '个)，重试 ' + retry + '/' + MAX_RETRIES)
+                  console.log('[ContentGen] Chapter ' + (i + 1) + (_isFailPlaceholder ? ' 后端返回失败占位符' : ' 字数不足(汉字' + zhWordCount + '/总长' + content.length + ')') + '，重试 ' + retry + '/' + MAX_RETRIES)
                   continue
                 }
-                // 最后一次重试仍然不足，也接受（API层已做续写补全）
-                console.warn('[ContentGen] Chapter ' + (i + 1) + ' 最终汉字数: ' + zhWordCount + ' (低于2500目标)')
+                // 已用尽重试：记为真实失败，进入 failedList，绝不把占位符/空内容误标为"已完成"
+                console.warn('[ContentGen] Chapter ' + (i + 1) + ' 最终仍' + (_isFailPlaceholder ? '为失败占位符' : '字数不足(汉字' + zhWordCount + '/总长' + content.length + ')') + '，标记为失败')
+                genChapters.push({
+                  id: chapter.id || String(Date.now() + i),
+                  title: fullTitle,
+                  chapterNumber: globalNum,
+                  volume: _volNum !== undefined ? _volNum : chapter.volume,
+                  volumeIndex: _volIdx !== undefined ? _volIdx : chapter.volumeIndex,
+                  content: '',
+                  wordCount: 0,
+                  status: 'draft',
+                })
+                success = false
+                failedCount++
+                failedList.push({ index: i, chapter: chapter, error: _isFailPlaceholder ? '后端生成失败占位符' : '字数不足/空内容(汉字' + zhWordCount + '/总长' + content.length + ')' })
+              } else {
+                genChapters.push({
+                  id: chapter.id || String(Date.now() + i),
+                  title: fullTitle,
+                  content: content,
+                  wordCount: wordCount,
+                  chapterNumber: globalNum,
+                  volume: _volNum !== undefined ? _volNum : chapter.volume,
+                  volumeIndex: _volIdx !== undefined ? _volIdx : chapter.volumeIndex,
+                  status: 'completed',
+                })
+                success = true
+                completedCount++
+                totalWords += wordCount
               }
-
-              genChapters.push({
-                id: chapter.id || String(Date.now() + i),
-                title: fullTitle,
-                content: content,
-                wordCount: wordCount,
-                chapterNumber: globalNum,
-                volume: _volNum !== undefined ? _volNum : chapter.volume,
-                volumeIndex: _volIdx !== undefined ? _volIdx : chapter.volumeIndex,
-                status: content && content.length > 100 ? 'completed' : 'draft',
-              })
-              success = true
-              completedCount++
-              totalWords += wordCount
-              // Update prevChapterEnding for continuity
-              if (content && content.length > 50) {
+              // 🔥 仅当本章成功才用其结尾续接下一章；失败/占位符章绝不污染上下文（下一章沿用上一章真实结尾）
+              if (success && content && content.length > 50) {
                 prevChapterEnding = content.substring(Math.max(0, content.length - 200))
               }
             } else {
@@ -7618,6 +8852,35 @@ if (phase === 'core' && _userHintStr) {
         }
       }
 
+      // 🔥 2026-09-30 性能优化·心跳定时器：每 1.5s 刷新「统计面板 + 进度条 + 当前章耗时」，
+      //   解决用户看到"生成中一直不动"的体感卡死问题。仅刷新统计类字段，不动章节列表，无渲染卡顿。
+      if (genHeartbeatRef.current) { clearInterval(genHeartbeatRef.current); genHeartbeatRef.current = null }
+      genHeartbeatRef.current = setInterval(function () {
+        if (genCancelRef.current) return
+        var _elapsedNow = Date.now() - startTime
+        var _doneNow = completedCount + failedCount
+        var _avgNow = _elapsedNow / Math.max(1, _doneNow)
+        var _remainNow = Math.max(0, totalChapters - _doneNow)
+        var _etaNow = _avgNow * _remainNow
+        var _tpNow = _elapsedNow > 0 ? Math.round((totalWords / _elapsedNow) * 60000) : 0
+        var _pctNow = Math.max(0, Math.min(100, Math.round((_doneNow / Math.max(1, totalChapters)) * 100)))
+        // 当前章已用秒数（用于 UI 显示「正在生成第 X 章·已用 X 秒」）
+        var _curSec = genCurrentChapterRef.current ? Math.round((Date.now() - genCurrentChapterRef.current.startedAt) / 1000) : 0
+        setGenStats({
+          startTime: startTime,
+          totalWords: totalWords,
+          completedChapters: completedCount,
+          failedChapters: failedCount,
+          totalChapters: totalChapters,
+          elapsedMs: _elapsedNow,
+          etaMs: _etaNow,
+          throughput: _tpNow,
+          chapterTimings: timings,
+          currentChapter: genCurrentChapterRef.current ? { ...genCurrentChapterRef.current, elapsedSec: _curSec } : null,
+        } as any)
+        setProgress(_pctNow)
+      }, 1500)
+
       // 🔥 P2.12.1 修复：批量生成（5章/批），批内顺序生成保证连贯，批间串行，每批完成后保存
       // 批内顺序生成：下一章使用上一章结尾作为上下文，保证剧情连贯
       // 批间串行：每批完成后保存到后端，避免数据丢失
@@ -7638,8 +8901,8 @@ if (phase === 'core' && _userHintStr) {
         if (autoMode) {
           setAutoGenLog(function (prev) { return [...prev, '⏳ 正文批次' + _batchNum + ' 生成中（第' + (qi + 1) + '-' + _batchEnd + '章）...'] })
         }
-        // 🔥 图一方案A：批内【并行】生成——同批各章依据【大纲+前情概要+人物状态+keyPlots】并发创作，速度约提升批大小倍；
-        //   章间连贯性由 outline/keyPlots/prevChaptersSummary 保证，不再依赖上一章原文结尾（并行时无法串行取结尾）。
+        // 🔥 2026-09-17 #226O：CONTENT_BATCH_SIZE=1 → 批内即为单章，真正"逐章顺序生成"。
+        //   每章用上一章真实结尾(prevChapterEnding)续接，保证章间逻辑衔接；每章生成后立即落库，降低丢失风险。
         var _batchItems = chapterQueue.slice(qi, _batchEnd)
         await Promise.all(_batchItems.map(function (it: any) { return processChapter(it) }))
         // 每批完成后保存到后端，避免数据丢失
@@ -7701,6 +8964,9 @@ if (phase === 'core' && _userHintStr) {
       showErrorAlert(err, 'AI generation error')
       setGenStatus('idle')
     } finally {
+      // 🔥 2026-09-30 性能优化·清理心跳定时器与当前章引用，避免内存泄漏与取消后的僵尸刷新
+      if (genHeartbeatRef.current) { clearInterval(genHeartbeatRef.current); genHeartbeatRef.current = null }
+      genCurrentChapterRef.current = null
       setIsLoading(false)
     }
   }
@@ -7797,6 +9063,7 @@ if (phase === 'core' && _userHintStr) {
                 prevEnding: prevChapterEnding,
                 bookAnalysis: _retryLatestData.bookAnalysis,
               },
+              enabledSkills: getEnabledSkills(),
               llmConfig: contentLlmConfig,
             }),
           })
@@ -7933,25 +9200,53 @@ if (phase === 'core' && _userHintStr) {
     }
   }
 
-  // 🔥 第四期·一键润色
+  // 🔥 第四期·一键润色（#226Q 安全化）
+  //   铁律：正文是全书最贵资产。禁止任何「首章整段覆盖」写法（旧实现曾对 genChapters 的下标 0 全量赋值）；
+  //   应用目标为「当前选中章」且应用前必须同源校验，长度差异 > 50% 拒绝（防串章覆盖）。
   var handlePolish = async function() {
     if (!finalCheckResult?.polish?.polishedText) {
       showErrorAlert(null, '没有可用的润色结果')
       return
     }
+    var polishedText = finalCheckResult.polish.polishedText
+    var _baseData: any = generatedDataRef.current || generatedData || {}
+    var genChapters = (_baseData && _baseData.chapters && _baseData.chapters.generatedContent) || []
+    // 无正文 → 不得凭空创建章节
+    if (!Array.isArray(genChapters) || genChapters.length === 0) {
+      showErrorAlert(null, '尚无正文，润色结果未应用')
+      return
+    }
     setPolishLoading(true)
     try {
-      // 将润色后的文本替换到章节内容中
-      var polishedText = finalCheckResult.polish.polishedText
-      var genChapters = generatedData.chapters?.generatedContent || []
-      if (genChapters.length > 0) {
-        genChapters[0] = { ...genChapters[0], content: polishedText, wordCount: polishedText.length }
-        setGeneratedData(function(prev) {
-          return { ...prev, chapters: { ...prev.chapters, generatedContent: [...genChapters] } as any }
-        })
-        setGeneratedChapters([...genChapters])
+      // 应用目标 = 当前选中章（越界时回退第 1 章，但绝不越界新建数组外元素）
+      var _idx = Number(currentChapterIndex)
+      if (!(_idx >= 0 && _idx < genChapters.length)) _idx = 0
+      var _target: any = genChapters[_idx] || {}
+      var _orig = typeof _target.content === 'string' ? _target.content : ''
+      if (!_orig) {
+        showErrorAlert(null, '当前选中章尚无正文，润色结果未应用')
+        return
       }
-      // 更新终检结果
+      // 同源校验：润色文本与当前章原文长度差异 > 50% 视为串章，拒绝覆盖
+      var _lenDiff = Math.abs(polishedText.length - _orig.length) / Math.max(1, _orig.length)
+      if (_lenDiff > 0.5) {
+        showErrorAlert(null, '润色文本与当前章正文长度差异过大（' + Math.round(_lenDiff * 100) + '%），已拒绝覆盖以免串章')
+        return
+      }
+      // 只替换当前选中章的 content，其余章节原样保留
+      var _nextGC = genChapters.map(function (c: any, i: number) {
+        if (i !== _idx) return c
+        return { ...c, content: polishedText, wordCount: polishedText.length }
+      })
+      var _nextData: any = Object.assign({}, _baseData, {
+        chapters: Object.assign({}, _baseData.chapters || {}, { generatedContent: _nextGC }),
+      })
+      generatedDataRef.current = _nextData
+      setGeneratedData(_nextData)
+      setGeneratedChapters([..._nextGC] as any)
+      // 复用既有落盘链路（含 chapters 元数据），不新建写路径
+      try { await persistDraftProgress() } catch (_pe) { console.warn('[Polish] 落盘失败:', _pe) }
+      // 更新终检结果（result.polish 展示区 UI 保持不变）
       setFinalCheckResult(function(prev: any) {
         return {
           ...prev,
@@ -7962,7 +9257,7 @@ if (phase === 'core' && _userHintStr) {
           },
         }
       })
-      console.log('[Polish] Applied polished text, new AI rate:', finalCheckResult?.polish?.afterAiRate)
+      console.log('[Polish] Applied polished text to chapter #' + (_idx + 1) + ', new AI rate:', finalCheckResult?.polish?.afterAiRate)
     } catch (err) {
       console.error('[Polish] Error:', err)
       showErrorAlert(err, '润色应用失败')
@@ -7971,11 +9266,229 @@ if (phase === 'core' && _userHintStr) {
     }
   }
 
+  // 🔥 #226Q·全链路「一键修复全部」（分批 + 断点续跑 + 超时保护 + 进度回传）
+  //   契约见 _recon/SPEC_226Q_repair_all.md §1.5/§2/§3：
+  //   A 类走 mode='deterministic'（零 LLM），B 类按 batchSize=20 循环 mode='llm'；每批独立请求 + 落盘。
+  var REPAIR_ALL_ENDPOINT = '/tuzhong-wenshu/api/ai/repair-all'
+  var REPAIR_BATCH_SIZE = 20
+
+  /** 展平 runPitfallCheck 的未通过项（passed === false）为请求 items 形状。 */
+  var _collectFailedPitfall = function (res: any): Array<{ id: string; group: string; path: string; title: string; detail: string }> {
+    var out: Array<{ id: string; group: string; path: string; title: string; detail: string }> = []
+    var _groups = (res && Array.isArray(res.groups)) ? res.groups : []
+    _groups.forEach(function (g: any) {
+      var _items = (g && Array.isArray(g.items)) ? g.items : []
+      _items.forEach(function (it: any) {
+        if (it && it.passed === false) {
+          out.push({
+            id: String(it.id),
+            group: String((g && g.key) || ''),
+            path: String(it.path || ''),
+            title: String(it.title || ''),
+            detail: String(it.detail || ''),
+          })
+        }
+      })
+    })
+    return out
+  }
+
+  // context 由共享模块 buildRepairContext 构造（端到端一致的「裁剪子集」：
+  //   只保留 A/B 类修复所需最小字段，剔除正文与重量级深度字段，严禁回传整包 ~1.4MB）。
+
+  /** 发一批修复请求（单批 ≤ REPAIR_BATCH_SIZE 条），返回服务端 patches / failed。 */
+  var _postRepairBatch = async function (mode: 'deterministic' | 'llm', items: any[], token: string): Promise<{ patches: any[]; failed: Array<{ id: string; reason: string }> }> {
+    var _headers: Record<string, string> = { 'Content-Type': 'application/json' }
+    if (token) _headers['Authorization'] = 'Bearer ' + token
+    var _resp = await fetch(REPAIR_ALL_ENDPOINT, {
+      method: 'POST',
+      headers: _headers,
+      body: JSON.stringify({
+        mode: mode,
+        items: (items || []).map(function (it: any) {
+          return { id: it.id, group: it.group, path: it.path, title: it.title, detail: it.detail }
+        }),
+        context: buildRepairContext(generatedDataRef.current || generatedData || {}, { slim: true, items: items || [] }),
+      }),
+    })
+    if (!_resp.ok) {
+      var _et = ''
+      try {
+        var _ej = await _resp.json()
+        _et = (_ej && (_ej.error || _ej.message)) || JSON.stringify(_ej)
+      } catch (_e) { _et = 'HTTP ' + _resp.status }
+      throw new Error('HTTP ' + _resp.status + ' ' + _et)
+    }
+    var _j = await _resp.json()
+    var _d = (_j && _j.data) || {}
+    return {
+      patches: Array.isArray(_d.patches) ? _d.patches : [],
+      failed: Array.isArray(_d.failed) ? _d.failed : [],
+    }
+  }
+
+  /** 把一批 patches 应用到 generatedData 的深拷贝，逐批 setGeneratedData 并复用既有落盘链路。 */
+  var _applyRepairPatches = async function (patches: any[]): Promise<void> {
+    if (!Array.isArray(patches) || patches.length === 0) return
+    var _cur: any = generatedDataRef.current || generatedData || {}
+    // applyPatches 内部深拷贝，不修改入参（禁止就地改 ref）
+    var _next: any = applyPatches(_cur, patches)
+    generatedDataRef.current = _next
+    setGeneratedData(_next)
+    var _touchesProse = patches.some(function (p: any) { return String((p && p.path) || '').indexOf('generatedContent') !== -1 })
+    if (_touchesProse) {
+      try {
+        var _gc = _next && _next.chapters && _next.chapters.generatedContent
+        if (Array.isArray(_gc)) setGeneratedChapters([..._gc] as any)
+      } catch (_e) {}
+    }
+    // 复用既有 saveSettings/autosave 链路（persistDraftProgress 走同一 settings batch，含 chapters 元数据）
+    try { await persistDraftProgress() } catch (_pe) { console.warn('[RepairAll] 落盘失败:', _pe) }
+  }
+
+  var handleRepairAll = async function () {
+    if (repairState && repairState.running) return
+    try {
+      var _data: any = generatedDataRef.current || generatedData || {}
+      // 1) 先跑一次判定，取未通过项
+      var _pre = runPitfallCheck(_data)
+      var _failedPre = _collectFailedPitfall(_pre)
+
+      // 2) 0 项 → 置「全部通过，无需修复」并直接 return，不发任何请求
+      if (_failedPre.length === 0) {
+        setRepairState({ running: false, done: 0, total: 0, failed: 0, phase: 'done', message: '全部通过，无需修复' })
+        return
+      }
+
+      // 3) 分级：A 类 deterministic（纯客户端直算，零网络）/ B 类 llm（走服务端）
+      var _plan = buildRepairPlan(_data)
+      var _allAuto = (_plan && Array.isArray(_plan.auto)) ? _plan.auto : []
+      var _allLlm = (_plan && Array.isArray(_plan.llm)) ? _plan.llm : []
+
+      // 🔥 #226Q ⑤ 正文类项预判：正文体由 /api/chapters 自管、不经 settings batch，且 context 不携带正文
+      //   → 一律不发请求，直接归入 failures（reason 明确提示去正文页处理），并在结果里单独计数。
+      var _isProseItem = function (it: any) { return String((it && it.path) || '').indexOf('generatedContent') !== -1 }
+      var _proseItems = _allAuto.filter(_isProseItem).concat(_allLlm.filter(_isProseItem))
+      var _auto = _allAuto.filter(function (it: any) { return !_isProseItem(it) })
+      var _llm = _allLlm.filter(function (it: any) { return !_isProseItem(it) })
+      var _proseCount = _proseItems.length
+      var _total = _auto.length + _llm.length + _proseCount
+
+      var _titleById: Record<string, string> = {}
+      _allAuto.concat(_allLlm).forEach(function (it: any) { if (it && it.id) _titleById[String(it.id)] = String(it.title || it.id) })
+      _failedPre.forEach(function (it) { if (it.id && !_titleById[it.id]) _titleById[it.id] = it.title || it.id })
+
+      var _failures: Array<{ id: string; title: string; reason: string }> = []
+      var _addFailures = function (list: Array<{ id: string; reason: string }>) {
+        ;(list || []).forEach(function (f: any) {
+          if (!f || !f.id) return
+          _failures.push({ id: String(f.id), title: _titleById[String(f.id)] || String(f.id), reason: String(f.reason || '未知原因') })
+        })
+      }
+      // 正文类项直接落 failures（不发请求）
+      _proseItems.forEach(function (it: any) {
+        _failures.push({ id: String(it.id), title: _titleById[String(it.id)] || String(it.id), reason: '正文需到正文页处理' })
+      })
+
+      // 兜底：buildRepairPlan 覆盖全部未通过项；若未分级则作为失败项明确列出，杜绝静默吞掉
+      if (_total === 0) {
+        var _pf = runPitfallCheck(_data)
+        var _pfx = (_pf.summary && typeof _pf.summary.failed === 'number') ? _pf.summary.failed : _failedPre.length
+        _failedPre.forEach(function (it) { _failures.push({ id: it.id, title: it.title || it.id, reason: 'no-repair-plan' }) })
+        setRepairState({ running: false, done: 0, total: 0, failed: _failures.length, phase: 'done', message: '修复完成：未通过 ' + _pfx + ' → ' + _pfx + '（无可用的自动修复方案）', failures: _failures.slice() })
+        return
+      }
+
+      var _token = localStorage.getItem('token') || ''
+      var _done = 0
+      var _progress = function (phase: 'deterministic' | 'llm') {
+        setRepairState({ running: true, done: _done, total: _total, failed: _failures.length, phase: phase, message: '正在修复 ' + _done + '/' + _total + '…', failures: _failures.slice() })
+      }
+
+      setRepairState({ running: true, done: 0, total: _total, failed: _failures.length, phase: 'checking', message: '正在修复 0/' + _total + '…', failures: _failures.slice() })
+
+      // 4) A 类：确定性修复 —— 纯客户端本地直算（零网络 / 零 LLM），杜绝公网回传 context
+      var _autoRes: any = { patches: [], failed: [] }
+      try {
+        _autoRes = applyDeterministicRepairs(_data, _auto)
+        if (_autoRes && Array.isArray(_autoRes.patches) && _autoRes.patches.length) await _applyRepairPatches(_autoRes.patches)
+        _addFailures((_autoRes && Array.isArray(_autoRes.failed)) ? _autoRes.failed : [])
+      } catch (_aErr) {
+        console.warn('[RepairAll] A 类本地直算异常:', _aErr)
+        _addFailures(_auto.map(function (it: any) { return { id: it.id, reason: 'client-deterministic-error' } }))
+      }
+      // 硬校验：A 类每一项都必须被 patches 或 failed 覆盖；缺口以 client-plan-gap 明列，杜绝静默吞掉
+      try {
+        var _coveredIds: Record<string, boolean> = {}
+        ;((_autoRes && _autoRes.patches) || []).forEach(function (p: any) { if (p && p.id) _coveredIds[String(p.id)] = true })
+        ;((_autoRes && _autoRes.failed) || []).forEach(function (f: any) { if (f && f.id) _coveredIds[String(f.id)] = true })
+        _auto.forEach(function (it: any) {
+          if (it && it.id && !_coveredIds[String(it.id)]) {
+            _failures.push({ id: String(it.id), title: _titleById[String(it.id)] || String(it.id), reason: 'client-plan-gap' })
+          }
+        })
+      } catch (_gapErr) { console.warn('[RepairAll] A 类覆盖校验异常:', _gapErr) }
+      _done += _auto.length
+      _progress('deterministic')
+
+      // 5) B 类：LLM 修复，按 20 条分批循环；基准由 _postRepairBatch/_applyRepairPatches 内部
+      //    重新读取 generatedDataRef.current（A 类已落盘，避免用陈旧快照叠加）
+      for (var _li = 0; _li < _llm.length; _li += REPAIR_BATCH_SIZE) {
+        var _lBatch = _llm.slice(_li, _li + REPAIR_BATCH_SIZE)
+        try {
+          var _lRes = await _postRepairBatch('llm', _lBatch, _token)
+          await _applyRepairPatches(_lRes.patches)
+          _addFailures(_lRes.failed)
+        } catch (_lErr) {
+          console.warn('[RepairAll] LLM 批次失败:', _lErr)
+          _addFailures(_lBatch.map(function (it: any) { return { id: it.id, reason: 'batch-request-failed' } }))
+        }
+        _done += _lBatch.length
+        _progress('llm')
+      }
+
+      // 🔥 #226Q 收口：正文类项已计入 _total，但未纳入 _done 累加 → 进度条永不达 100%。
+      //    此处补上，使 _done 在结束时恒等于 _total（失败项已在 _failures 单独呈现）。
+      _done += _proseCount
+
+      // 6) 全部结束后重新判定，报告「修复前 X 项未通过 → 修复后 Y 项未通过」
+      var _post = runPitfallCheck(generatedDataRef.current || _data)
+      var _x = (_pre.summary && typeof _pre.summary.failed === 'number') ? _pre.summary.failed : _failedPre.length
+      var _y = (_post.summary && typeof _post.summary.failed === 'number') ? _post.summary.failed : 0
+      setRepairState({
+        running: false,
+        done: _total,
+        total: _total,
+        failed: _failures.length,
+        phase: 'done',
+        message: '修复完成：未通过 ' + _x + ' → ' + _y + (_failures.length > 0
+          ? '（' + _failures.length + ' 项未能自动修复' + (_proseCount > 0 ? '，其中 ' + _proseCount + ' 项为正文类需到正文页处理' : '') + '）'
+          : ''),
+        failures: _failures.slice(),
+      })
+      console.log('[RepairAll] 完成：修复前 ' + _x + ' 项未通过 → 修复后 ' + _y + ' 项未通过；失败 ' + _failures.length + ' 项（含正文类 ' + _proseCount + ' 项）')
+    } catch (err) {
+      console.error('[RepairAll] Error:', err)
+      setRepairState(function (prev: RepairState | null) {
+        return {
+          running: false,
+          done: prev ? (prev.done || 0) : 0,
+          total: prev ? (prev.total || 0) : 0,
+          failed: prev ? (prev.failed || 0) : 0,
+          phase: 'error',
+          message: '一键修复失败：' + ((err && (err as any).message) || String(err)),
+          failures: prev && prev.failures ? prev.failures : [],
+        }
+      })
+      showErrorAlert(err, '一键修复失败')
+    }
+  }
+
   var stepOrder: Record<string, number> = {
     'input': 0, 'idea': 1, 'worldbuilding': 2, 'powerSystem': 3,
     'characters': 4, 'factions': 5, 'relationships': 6, 'synopsis': 7,
     'outline': 8, 'keyPlots': 9, 'chapters': 10, 'generating': 11,
-    'checklist': 12, 'finalCheck': 13, 'cover': 14, 'complete': 15,
+    'finalCheck': 13, 'cover': 14, 'complete': 15,
   }
   var stepKeysByOrder = ['input', 'idea', 'worldbuilding', 'powerSystem', 'characters', 'factions', 'relationships', 'synopsis', 'outline', 'keyPlots', 'chapters', 'generating', 'finalCheck', 'cover', 'complete']
   var stepToGeneratedDataKey: Record<string, string> = {
@@ -7997,7 +9510,7 @@ if (phase === 'core' && _userHintStr) {
         // 🔥 修复：立即设置loading状态，防止跳转时长时间无反应
         setIsLoading(true)
         setIsGeneratingCharacters(true)
-        setCharGenProgress({ current: 1, total: 12 })
+        setCharGenProgress({ current: 0, total: CHAR_BATCH_TOTAL })
         handleGenerateCharacters(powerCheck.cleanedData)
         break
       }
@@ -8101,13 +9614,26 @@ if (phase === 'core' && _userHintStr) {
           activeStyle: getActiveStyle(),
           bestsellerPrefs: getBestsellerPrefs(),
           regeneratePrompt: regeneratePrompt || '',
+          // 🔒 字段级重生成：携带当前步骤全量快照，服务端据此逐字冻结其余字段
+          frozen: fieldName ? JSON.parse(JSON.stringify((generatedDataRef.current as any)[stepName] || {})) : undefined,
         }),
       })
       if (res.ok) {
         var json = await res.json(); if (json && json._meta && json._meta.usedModel) recordStepModel(json._meta)
 
         if (fieldName) {
-          var fieldValue = json.data[fieldName] || json.data
+          // 🔒 字段级硬校验：服务端未返回目标字段、或返回空值时，绝不覆盖已有数据，防止整步漂移
+          var _rawFieldValue = (json && json.data && typeof json.data === 'object') ? json.data[fieldName] : undefined
+          var _isFieldValueEmpty = _rawFieldValue === undefined || _rawFieldValue === null
+            || (typeof _rawFieldValue === 'string' && _rawFieldValue.trim() === '')
+            || (Array.isArray(_rawFieldValue) && _rawFieldValue.length === 0)
+            || (typeof _rawFieldValue === 'object' && !Array.isArray(_rawFieldValue) && Object.keys(_rawFieldValue).length === 0)
+          if (_isFieldValueEmpty) {
+            console.warn('[handleRegenerate] 字段级返回为空，已保留原值:', stepName, fieldName, json)
+            showErrorAlert(json && (json.error || json.success === false) ? json : null, '字段重新生成未返回有效内容，已保留原值（防止设定漂移）')
+            return
+          }
+          var fieldValue = _rawFieldValue
           if (stepName === 'worldbuilding' && ['era', 'geography', 'history', 'powerSystem', 'socialStructure', 'technology'].includes(fieldName)) {
             fieldValue = cleanPlaceholders(normalizeToString(fieldValue))
           }
@@ -8246,7 +9772,7 @@ if (phase === 'core' && _userHintStr) {
                     description: '拥有现代历史知识和技术，能预知历史走向并利用现代知识改变世界',
                     abilities: ['历史预知', '技术革新', '权谋分析'],
                     limitations: ['知识有时代局限', '改变历史有风险'],
-                    evolution: '初入南明→技术立足→朝堂立足→影响国策→改变历史'
+                    evolution: '初入乱世→知识立足→权谋立足→影响格局→改写命运'
                   }
                 } else if (_genreForAuto2.indexOf('都市') !== -1 || _genreForAuto2.indexOf('现代') !== -1) {
                   normalizedPS.protagonistAbility = {
@@ -8335,6 +9861,58 @@ if (phase === 'core' && _userHintStr) {
     }
   }
 
+  // 🔥 QA-8 卷摘要叙事重组（前端版）：四字段清洗→去重→短句并入→连接词按卷号轮换，杜绝「。；」乱标点与「灭族满清。」式碎句
+  var _wizardCleanSumPart = function(raw: any): string {
+    var s = String(raw == null ? '' : raw).trim()
+    s = s.replace(/^[。；;，,、！？\s·]+/, '').replace(/[。；;，,、！？\s·]+$/, '')
+    s = s.replace(/[；;]/g, '，').replace(/\s+/g, '')
+    return s
+  }
+  var _wizardComposeVolSummary = function(kp: any, volNum: number): string {
+    if (!kp) return ''
+    var _rawParts: string[] = []
+    if (kp.coreObjective) _rawParts.push(String(kp.coreObjective))
+    if (kp.openingNode && kp.openingNode.event) _rawParts.push(String(kp.openingNode.event))
+    if (kp.climaxNode && kp.climaxNode.event) _rawParts.push(String(kp.climaxNode.event))
+    if (kp.endHook && kp.endHook.content) _rawParts.push(String(kp.endHook.content))
+    var _kept: string[] = []
+    for (var _pi = 0; _pi < _rawParts.length; _pi++) {
+      var p = _wizardCleanSumPart(_rawParts[_pi])
+      if (p.length < 4) continue
+      var _isDupP = false
+      for (var _qi = 0; _qi < _kept.length; _qi++) {
+        var q = _kept[_qi]
+        if (q.indexOf(p) !== -1 || p.indexOf(q) !== -1) { _isDupP = true; break }
+        var _shared = 0
+        for (var _gi = 0; _gi <= p.length - 4; _gi++) {
+          if (q.indexOf(p.substring(_gi, _gi + 4)) !== -1) { _shared++; _gi += 3 }
+        }
+        if (p.length >= 8 && _shared >= Math.max(2, Math.floor((p.length - 4) / 3))) { _isDupP = true; break }
+      }
+      if (!_isDupP) _kept.push(p)
+    }
+    if (_kept.length === 0) return ''
+    var _merged: string[] = []
+    for (var _mi = 0; _mi < _kept.length; _mi++) {
+      if (_kept[_mi].length < 10 && _merged.length > 0) _merged[_merged.length - 1] += '，' + _kept[_mi]
+      else _merged.push(_kept[_mi])
+    }
+    if (_merged.length > 1 && _merged[0].length < 10) {
+      _merged[1] = '为' + _merged[0] + '，' + _merged[1]
+      _merged.shift()
+    }
+    var _ocIdx = (volNum - 1) % 3
+    var _openConns = ['本卷开篇，', '卷首，', '一开卷，']
+    var _climaxConns = ['随着局势推进，', '中段，', '剧情走向深处，']
+    var _hookConns = ['卷末，', '至卷终，', '收卷之际，']
+    var _out = _merged[0]
+    if (_merged.length > 1) _out += '。' + _openConns[_ocIdx] + _merged[1]
+    if (_merged.length > 2) _out += '。' + _climaxConns[_ocIdx] + _merged[2]
+    if (_merged.length > 3) _out += '。' + _hookConns[_ocIdx] + _merged[3]
+    for (var _ei = 4; _ei < _merged.length; _ei++) _out += '。' + _merged[_ei]
+    return _out + '。'
+  }
+
   var handleVolumeConfigChange = function(field: 'volumeCount' | 'chaptersPerVolume', value: number) {
     var newValue = Math.max(1, Math.min(field === 'volumeCount' ? 20 : 200, value))
     var newConfig = { ...volumeConfig, [field]: newValue }
@@ -8374,13 +9952,8 @@ if (phase === 'core' && _userHintStr) {
           if (vkp?.summary && String(vkp.summary).length > 20) {
             newVolSummary = String(vkp.summary)
           } else {
-            // 基于核心目标+开篇节点+高潮节点+卷末钩子组合生成卷摘要
-            var volSumParts: string[] = []
-            if (vkp?.coreObjective && String(vkp.coreObjective).length > 5) volSumParts.push(String(vkp.coreObjective))
-            if (vkp?.openingNode?.event && String(vkp.openingNode.event).length > 5 && volSumParts.indexOf(String(vkp.openingNode.event)) === -1) volSumParts.push(String(vkp.openingNode.event))
-            if (vkp?.climaxNode?.event && String(vkp.climaxNode.event).length > 5 && volSumParts.indexOf(String(vkp.climaxNode.event)) === -1) volSumParts.push(String(vkp.climaxNode.event))
-            if (vkp?.endHook?.content && String(vkp.endHook.content).length > 5 && volSumParts.indexOf(String(vkp.endHook.content)) === -1) volSumParts.push(String(vkp.endHook.content))
-            if (volSumParts.length > 0) newVolSummary = volSumParts.join('。') + '。'
+            // 🔥 QA-8：基于核心目标+开篇节点+高潮节点+卷末钩子叙事重组（清洗+去重+短句并入+连接词）
+            newVolSummary = _wizardComposeVolSummary(vkp, v)
           }
           adjustedVolumes.push({
             name: newVolName,
@@ -8582,6 +10155,23 @@ if (phase === 'core' && _userHintStr) {
     )
   }
 
+  // 🔒 字段级重新生成入口条：仅替换目标字段，其余字段由服务端按 frozen 快照逐字保留
+  function FieldRegenBar({ step, fields }: { step: string; fields: Array<{ key: string; label: string }> }) {
+    return (
+      <div className="mb-3 flex flex-wrap items-center gap-2 rounded-lg border border-stone-200 bg-stone-50 px-3 py-2">
+        <span className="text-xs font-medium text-stone-500">字段级重新生成（仅替换该字段，其余设定逐字保留）：</span>
+        {fields.map(function (f) {
+          return (
+            <span key={f.key} className="inline-flex items-center gap-1.5 text-xs text-stone-600">
+              <span>{f.label}</span>
+              <RegenButton step={step} field={f.key} label={f.label} />
+            </span>
+          )
+        })}
+      </div>
+    )
+  }
+
   var handleImitateSearch = async function() {
     if (!imitateSearch.trim() || imitateLoading) return
     setImitateLoading(true)
@@ -8658,7 +10248,19 @@ if (phase === 'core' && _userHintStr) {
           } catch (_baErr) {
             console.warn('[ImitateSearch] auto-book-analysis 异常（不影响主流程）:', _baErr instanceof Error ? _baErr.message : String(_baErr))
           }
-          if (apiResult.genre) setGenre(apiResult.genre)
+          // 🔥 2026-11-05 修复：仿写拆书後 genre 合并而非覆盖（用户多选的类型标签不被冲掉）
+          if (apiResult.genre) {
+            var _srvGenre = String(apiResult.genre || '').trim()
+            var _curGenre = String(genreRef.current || '').trim()
+            if (_srvGenre && !_curGenre) { setGenre(_srvGenre) }
+            else if (_srvGenre) {
+              var _gSeen: Record<string, boolean> = {}
+              var _gMerged: string[] = []
+              String(_curGenre).split(',').forEach(function (s: string) { var t = s.trim(); if (t && !_gSeen[t]) { _gSeen[t] = true; _gMerged.push(t) } })
+              String(_srvGenre).split(',').forEach(function (s: string) { var t = s.trim(); if (t && !_gSeen[t]) { _gSeen[t] = true; _gMerged.push(t) } })
+              setGenre(_gMerged.join(','))
+            }
+          }
           if (apiResult.tags && Array.isArray(apiResult.tags) && apiResult.tags.length > 0) {
             var existingKeywords = keywords.split(/[,，、\s]+/).filter(Boolean)
             var imitatedTags = apiResult.tags.filter(function(t: string) { return t && t.trim() })
@@ -8827,7 +10429,40 @@ if (phase === 'core' && _userHintStr) {
         // 🔥🔥🔥 2026-09-03 #125R2：仅当已是【服务端真实 id】时短路返回。
         //   此前 draft-<ts>-<r> 本地占位 id（L2940 分配）长度>8 也会短路 → 服务端草稿永不创建，
         //   中断作品永远进不了书架草稿箱（用户实锤缺陷 #1 的根因）。
-        if (_curId && _curId !== 'temp' && String(_curId).indexOf('draft-') !== 0 && String(_curId).length > 8) return _curId
+        var _isRealId = !!(_curId && _curId !== 'temp' && String(_curId).indexOf('draft-') !== 0 && String(_curId).length > 8)
+        // 🔥🔥🔥 2026-09-10 #120R：真实 id 短路前做一次「书架自愈」——校验该 id 是否确实属于
+        //   当前登录用户；若孤儿/错属（数据在 settings.json 但 novels.json 记录缺失或 userId 不匹配，
+        //   草稿箱列表过滤后永远看不到，用户实锤缺陷 #2 的根因），则 PUT 重绑定到当前用户。
+        //   每会话每个 id 仅校验一次；刷新页面缓存清零可重试。
+        if (_isRealId && _selfHealCheckedId !== _curId) {
+          _selfHealCheckedId = _curId
+          try {
+            var _myUid = (function () {
+              try {
+                var _t0 = localStorage.getItem('token') || ''
+                if (!_t0) return ''
+                return (JSON.parse(atob(_t0.split('.')[1])) || {}).userId || ''
+              } catch (_e0) { return '' }
+            })()
+            var _lr = await fetch('/tuzhong-wenshu/api/novels', { headers: _headers })
+            var _lj = await _lr.json().catch(function () { return {} })
+            var _inList = (_lj.data || []).some(function (_b: any) { return String(_b && _b.id) === _curId })
+            if (!_inList && _myUid) {
+              // 孤儿/错属 → 重绑定 userId（PUT 允许 admin 修改任意作品，普通用户仅能改自己的）
+              var _ur = await fetch('/tuzhong-wenshu/api/novels', {
+                method: 'PUT',
+                headers: _headers,
+                body: JSON.stringify({ id: _curId, userId: _myUid, status: 'drafting' }),
+              })
+              if (_ur.ok) {
+                console.log('[Draft] #120R 自愈重绑定孤儿作品', _curId, '->', _myUid)
+              } else {
+                console.warn('[Draft] #120R 自愈重绑定失败', _curId, 'uid=' + _myUid, _ur.status)
+              }
+            }
+          } catch (_he) { console.warn('[Draft] #120R 自愈校验异常:', _he) }
+        }
+        if (_isRealId) return _curId
         var _d: any = generatedDataRef.current || {}
         var _idea: any = _d.idea || {}
         var _syn: any = _d.synopsis || {}
@@ -8872,14 +10507,46 @@ if (phase === 'core' && _userHintStr) {
       }
       if (!_id) return
       var _d: any = generatedDataRef.current || {}
+      // 🔥 2026-09-08 #160 空数据回写防护：wizard 空挂载（localStorage 被清/恢复未完成/服务端被覆盖）
+      //   时 generatedData 各环节全空，若照常 POST batch 会把服务端已有数据整体冲掉（实测曾把《永历中兴》
+      //   idea 清成 {}）。这里先检测是否有任一环节存在有效内容，全空则只更新 novel 状态、不落 settings。
+      var _stepKeys = ['idea', 'synopsis', 'characters', 'factions', 'relationships', 'keyPlots', 'outline', 'chapters', 'worldbuilding', 'powerSystem']
+      var _hasAnyData = false
+      for (var _si = 0; _si < _stepKeys.length; _si++) {
+        var _sv = _d[_stepKeys[_si]]
+        if (!_sv || typeof _sv !== 'object') continue
+        var _subKeys = Object.keys(_sv)
+        for (var _sj = 0; _sj < _subKeys.length; _sj++) {
+          var _vv = _sv[_subKeys[_sj]]
+          if (Array.isArray(_vv) ? _vv.length > 0 : (typeof _vv === 'string' ? !!String(_vv).trim() : !!_vv)) { _hasAnyData = true; break }
+        }
+        if (_hasAnyData) break
+      }
       var _syn: any = _d.synopsis || {}
       var _token = localStorage.getItem('token') || ''
       var _headers: Record<string, string> = { 'Content-Type': 'application/json' }
       if (_token) _headers['Authorization'] = 'Bearer ' + _token
+      if (!_hasAnyData) {
+        // 仅更新 novel 记录状态，不写 settings（防止空数据覆盖服务端权威数据）
+        try {
+          await fetch('/tuzhong-wenshu/api/novels', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json', Authorization: _token ? 'Bearer ' + _token : '' },
+            body: JSON.stringify({ id: _id, status: (opts && opts.status) ? opts.status : 'drafting' }),
+          })
+        } catch (_e0) {}
+        console.warn('[Draft] #160 空数据防护：跳过 settings 落盘（避免覆盖服务端已有生成数据）', _id)
+        return
+      }
       var _novelBody: any = {
         id: _id,
         status: (opts && opts.status) ? opts.status : 'drafting',
       }
+      // 🔥 2026-11-06：同步最新作品类型（多选逗号串）到小说记录。
+      //   此前 genre 只在 ensureDraftNovel 创建时写一次，之后用户改选类型不会落库，
+      //   导致 backfillGenreFromServer 回填的是创建瞬间的旧值（图2「作品类型没恢复对」根因之一）。
+      var _gNow = String(genreRef.current || '').trim()
+      if (_gNow) _novelBody.genre = _gNow
       var _t = String((_d.idea && _d.idea.title) || userBookTitle || '').trim()
       if (_t) _novelBody.title = _t
       var _desc = _syn.longIntro || _syn.fullIntro || _syn.shortIntro || ''
@@ -8895,10 +10562,14 @@ if (phase === 'core' && _userHintStr) {
         body: JSON.stringify({
           novelId: _id,
           type: 'batch',
+          // 🔥 #199 人物版本号回带：服务端据此拒绝旧快照整体回写
+          _charsRev: Number(_d._charsRev) || 0,
+          // 🔥 #201 全环节版本号回带
+          _secRev: (_d._secRev && typeof _d._secRev === 'object') ? _d._secRev : {},
           worldbuilding: _d.worldbuilding || {}, powerSystem: _d.powerSystem || {},
           characters: _d.characters || {}, factions: _d.factions || {},
           relationships: _d.relationships || {}, keyPlots: _d.keyPlots || {},
-          idea: _d.idea || {}, synopsis: _d.synopsis || {}, outline: _d.outline || {},
+          idea: _buildPersistedIdea(_d.idea), synopsis: _d.synopsis || {}, outline: _d.outline || {},
           chapters: _d.chapters || {},
           // 🔥 2026-09-03 #120：记录中断时所处环节，草稿箱「继续创作」可直接回到该步骤（而非一律跳到章节）
           lastStep: step || '',
@@ -8938,7 +10609,8 @@ if (phase === 'core' && _userHintStr) {
       { step: 'idea', name: '灵感创作', handler: handleGenerateIdea, critical: true, timeout: 300000 },
       { step: 'worldbuilding', name: '世界观设定', handler: handleGenerateWorldbuilding, critical: true, timeout: 600000 },
       { step: 'powerSystem', name: '金手指设定', handler: handleGeneratePowerSystem, critical: false, timeout: 300000 },
-      { step: 'characters', name: '主要人物设定', handler: handleGenerateCharacters, critical: true, timeout: 600000 },
+      // 注：characters 后端为 S1 名册多轮 + S2 分块并发展开，实测 6–11 分钟，故与后端 maxDuration=900s 对齐。
+      { step: 'characters', name: '主要人物设定', handler: handleGenerateCharacters, critical: true, timeout: 900000 },
       { step: 'factions', name: '势力设定', handler: handleGenerateFactions, critical: false, timeout: 300000 },
       { step: 'relationships', name: '人物关系图谱', handler: handleGenerateRelationships, critical: false, timeout: 300000 },
       { step: 'synopsis', name: '简介卖点', handler: handleGenerateSynopsis, critical: true, timeout: 300000 },
@@ -9261,7 +10933,8 @@ if (phase === 'core' && _userHintStr) {
     if (isGeneratingCharacters) return
     // 🔥 2026-09-01 第17轮：改用分批快出路径，使「重新生成全部」同样尊重当前人物阵容模式（CHAR_ROSTER_PRESETS）。
     //   原 handleRegenerate('characters','all') 走老单次调用，不会把预设 needs 传给后端，无法按单/双/后宫阵容产出。
-    await handleGenerateCharacters()
+    // 🔥 2026-11-07 修复（线上「重新生成」点击无反应）：显式重生成必须 force，绕过「已有角色则跳过」守卫
+    await handleGenerateCharacters(undefined, { force: true })
   }
 
   var componentCreateEmptyCharacter = function(roleType: string): any {
@@ -9289,6 +10962,51 @@ if (phase === 'core' && _userHintStr) {
       _latestData = generatedDataRef.current
       existingVolumes = _latestData.chapters?.volumes || []
     }
+    // 🔥🔥🔥 Bug#11④ 修复（第2-10卷永远 0 章、点多少次「按此配置生成章节」都补不出来）：
+    //   根因——卷框架（volumes）存在但后续卷的 chapters 数组为空，而 executeChapterGeneration 的
+    //   批次循环 `for (batch = 0; batch < volChapters.length; ...)` 只遍历「已存在的章节」，
+    //   空数组 ⇒ 零批次 ⇒ 这些卷永远生成不出章节；且 existingVolumes.length > 0 导致
+    //   handleGenerateChapters（唯一会建骨架的地方）不会被调用，形成死锁。
+    //   修复：此处按统一配置为「章节数不足」的卷补齐空骨架（只增不删，绝不动已有章节）。
+    var _perVol = (volumeConfig && volumeConfig.chaptersPerVolume) || 0
+    if (!(_perVol > 0)) {
+      _perVol = existingVolumes.reduce(function (m, v) { return Math.max(m, (v && Array.isArray(v.chapters)) ? v.chapters.length : 0) }, 0) || 60
+    }
+    var _hydrated = false
+    existingVolumes.forEach(function (_v, _vi) {
+      if (!_v) return
+      if (!Array.isArray(_v.chapters)) _v.chapters = []
+      if (_v.chapters.length >= _perVol) return
+      for (var _ci = _v.chapters.length; _ci < _perVol; _ci++) {
+        var _cnum = _vi * _perVol + _ci + 1
+        _v.chapters.push({
+          id: 'ch-v' + (_vi + 1) + '-c' + _cnum + '-' + Date.now() + '-' + _ci,
+          title: '第' + _cnum + '章',
+          summary: '',
+          shuangPoints: [],
+          hook: '',
+          volume: _vi + 1,
+          chapterNumber: _cnum,
+          number: _cnum,
+          wordCount: 3000,
+          status: 'pending',
+        })
+      }
+      _hydrated = true
+    })
+    if (_hydrated) {
+      var _hydSnap = {
+        volumes: existingVolumes.slice(),
+        chapters: existingVolumes.flatMap(function (v) { return v.chapters || [] }),
+        chapterCount: existingVolumes.reduce(function (s, v) { return s + ((v && v.chapters) ? v.chapters.length : 0) }, 0),
+        totalWordCount: existingVolumes.reduce(function (s, v) { return s + ((v && v.chapters) ? v.chapters.length : 0) * 3000 }, 0),
+      }
+      setGeneratedData(function (prev) { var _u = { ...prev, chapters: _hydSnap }; generatedDataRef.current = _u; return _u })
+      _latestData = generatedDataRef.current
+      existingVolumes = (_latestData.chapters && _latestData.chapters.volumes) || []
+      console.log('[GenerateFromConfig] 🔥 Bug#11④ 已补齐缺失的卷章节骨架（每卷 ' + _perVol + ' 章），现总计 ' + _hydSnap.chapterCount + ' 章')
+    }
+
     // 🔥🔥🔥 问题6修复：如果用户修改了卷数配置，必须重新初始化卷框架（基于keyPlots重新分配）
     // 根因：handleVolumeConfigChange已经调整了volumes数组长度，但卷标题/摘要可能使用占位符
     // 必须重新调用handleInitChaptersFrame，让keyPlots节点均匀分配到新卷中
@@ -9341,7 +11059,7 @@ if (phase === 'core' && _userHintStr) {
               <h2 className="text-sm font-semibold">{getCurrentStepLabel()}</h2>
               {/* 🔥 2026-09-02 修复图二：草稿箱·断点续创作按钮，点击打开草稿箱列出所有进行中的草稿 */}
               <button
-                onClick={function () { setShowDraftBox(true) }}
+                onClick={function () { setDraftsIndex(filterInProgressDrafts(readLocalDraftsIndex())); mergeServerDraftsIntoIndex(); setShowDraftBox(true) }}
                 className="text-sm text-white/90 bg-white/10 hover:bg-white/20 px-3 py-1 rounded-lg flex items-center gap-1 transition-colors font-semibold"
                 title="草稿箱：所有未完成的创作都在这里，点开即可从中断步骤继续往下创作"
               >
@@ -9356,7 +11074,7 @@ if (phase === 'core' && _userHintStr) {
                   className="text-sm text-white/90 bg-white/10 hover:bg-white/20 px-3 py-1 rounded-lg flex items-center gap-1 transition-colors font-semibold"
                   title={manualModel ? '当前为手动模式，每环节都使用此模型' : '当前为智能推荐模式，每环节自动选择最适合模型'}
                 >
-                  {manualModel && llmConfig?.model ? getModelDisplayName(llmConfig) : getRecommendedModelDisplayName()}
+                  {getHeaderModelText()}
                   <span className="ml-1">▼</span>
                 </button>
                 {showModelSelector && availableModels.length > 0 && (
@@ -9375,32 +11093,6 @@ if (phase === 'core' && _userHintStr) {
                     >
                       <div>🤖 智能推荐（每环节自动选择最佳模型）</div>
                     </button>
-                    {availableModels.map(function (model: any, idx: number) {
-                      var isCurrent = manualModel && llmConfig?.model === model.model && llmConfig?.provider === model.provider
-                      return (
-                        <button
-                          key={idx}
-                          onClick={function () {
-                            var newConfig = {
-                              provider: model.provider.replace(/\s*\([^)]*\)\s*/g, '').trim(),
-                              apiKey: model.apiKey || '',
-                              baseUrl: (model.baseUrl || '').replace(/[`'"]/g, '').trim(),
-                              model: model.model,
-                            }
-                            setLlmConfig(newConfig)
-                            setManualModel(true)
-                            try { localStorage.setItem('tuzhong-llm-config', JSON.stringify(newConfig)) } catch (e) {}
-                            setShowModelSelector(false)
-                          }}
-                          className={'w-full text-left px-3 py-2 text-sm border-b ' + (isCurrent ? 'font-medium' : 'hover:bg-stone-50')}
-                          style={isCurrent
-                            ? { background: 'rgba(200, 54, 77, 0.08)', color: '#c8364d', borderColor: '#e7e1d8' }
-                            : { background: '#ffffff', color: '#3d3d3d', borderColor: '#f0ebe2' }}
-                        >
-                          <div>{model.name || model.title || (model.provider + ' - ' + model.model)}</div>
-                        </button>
-                      )
-                    })}
                   </div>
                 )}
               </div>
@@ -9438,12 +11130,8 @@ if (phase === 'core' && _userHintStr) {
                       >
                         <IconComp className="w-5 h-5 flex-shrink-0" />
                         <span className="text-xs whitespace-nowrap leading-none mt-0.5 font-medium">{shortLabel}</span>
-                        {(stepModels[s.key] && stepModels[s.key].model) ? (
-                          <span className="text-[9px] leading-none text-amber-600 whitespace-nowrap mt-0.5" title={(stepModels[s.key].provider || '') + ' ' + stepModels[s.key].model}>
-                            {stepModels[s.key].model.replace(/^.*\//, '')}
-                          </span>
-                        ) : getStepModelLabel(s.key) ? (
-                          <span className="text-[9px] leading-none text-emerald-600 whitespace-nowrap mt-0.5" title="该环节配置调用的大模型">
+                        {getStepModelLabel(s.key) ? (
+                          <span className={'text-[9px] leading-none whitespace-nowrap mt-0.5 ' + ((stepModels[s.key] && stepModels[s.key].model) ? 'text-amber-600' : 'text-emerald-600')} title={(stepModels[s.key] && stepModels[s.key].provider ? stepModels[s.key].provider + ' ' : '') + getStepModelLabel(s.key)}>
                             {getStepModelLabel(s.key)}
                           </span>
                         ) : null}
@@ -9461,6 +11149,12 @@ if (phase === 'core' && _userHintStr) {
           </div>
 
           <div className="flex-1 overflow-y-auto p-8">
+            {/* 🔥 2026-09-07（#147）主题变更守卫横幅：主体区域常显（草稿箱 Modal 关闭后也能看到） */}
+            {themeGuardMsg && (
+              <div className="mb-4 rounded-lg bg-amber-50 px-4 py-3 text-sm text-amber-800 ring-1 ring-amber-300" role="alert">
+                {themeGuardMsg}
+              </div>
+            )}
             {/* 🔥 第二期·一键自动生成进度面板 */}
             {autoGenRunning && (
               <div className="mb-6 bg-gradient-to-r from-stone-50 to-stone-50 rounded-xl p-5 border border-stone-200">
@@ -9579,6 +11273,9 @@ if (phase === 'core' && _userHintStr) {
               </Suspense>
             )}
             {step === 'characters' && (
+              <FieldRegenBar step="characters" fields={[{ key: 'protagonist', label: '主角' }, { key: 'femaleLead', label: '女主' }, { key: 'antagonists', label: '反派' }, { key: 'supporting', label: '配角' }]} />
+            )}
+            {step === 'characters' && (
               <Suspense fallback={suspenseFallback}>
                 <StepCharacters detailedDesignInput={detailedDesignInput} genre={genre} keywords={keywords} data={generatedData.characters} onChange={function (updated) { 
                   setGeneratedData(function (prev) { 
@@ -9677,15 +11374,23 @@ if (phase === 'core' && _userHintStr) {
                       }
                     }
                     generatedDataRef.current = next
-                    return next 
-                  }) 
+                    return next
+                  })
+                  // 🔥 修复3：characters 变更立即落盘，防止服务端权威覆盖把校正结果打回
+                  persistCharactersChange(updated)
                 }} onRegenerate={handleRegenerate} onGenerate={handleNextStep} onRegenerateAll={handleRegenerateCharactersAll} isLoading={isLoading} isGenerating={isGeneratingCharacters} genProgress={charGenProgress} regeneratePrompt={regeneratePrompt} setRegeneratePrompt={setRegeneratePrompt} RegenButton={RegenButton} regeneratingField={regeneratingField} stepName="characters" createEmptyCharacter={createEmptyCharacter} appendRoleInput={appendRoleInput} setAppendRoleInput={setAppendRoleInput} />
               </Suspense>
+            )}
+            {step === 'factions' && (
+              <FieldRegenBar step="factions" fields={[{ key: 'factions', label: '势力列表' }]} />
             )}
             {step === 'factions' && (
               <Suspense fallback={suspenseFallback}>
                 <StepFactions genre={genre} keywords={keywords} data={generatedData.factions} onChange={function (updated) { setGeneratedData(function (prev) { return ({ ...prev, factions: updated })})}} onRegenerate={handleRegenerate} onGenerate={handleNextStep} isLoading={isLoading} regeneratePrompt={regeneratePrompt} setRegeneratePrompt={setRegeneratePrompt} RegenButton={RegenButton} regeneratingField={regeneratingField} stepName="factions" />
               </Suspense>
+            )}
+            {step === 'relationships' && (
+              <FieldRegenBar step="relationships" fields={[{ key: 'relationships', label: '人物关系' }]} />
             )}
             {step === 'relationships' && (
               <Suspense fallback={suspenseFallback}>
@@ -9703,6 +11408,9 @@ if (phase === 'core' && _userHintStr) {
               </Suspense>
             )}
             {step === 'keyPlots' && (
+              <FieldRegenBar step="keyPlots" fields={[{ key: 'turningPoints', label: '关键转折点' }, { key: 'climax', label: '高潮' }, { key: 'ending', label: '结局' }]} />
+            )}
+            {step === 'keyPlots' && (
               <Suspense fallback={suspenseFallback}>
                 <StepKeyPlots data={generatedData.keyPlots} onChange={function (updated) { setGeneratedData(function (prev) { return ({ ...prev, keyPlots: updated })})}} onRegenerate={handleRegenerate} onGenerate={handleNextStep} isLoading={isLoading} regeneratePrompt={regeneratePrompt} setRegeneratePrompt={setRegeneratePrompt} RegenButton={RegenButton} regeneratingField={regeneratingField} stepName="keyPlots" />
               </Suspense>
@@ -9714,17 +11422,12 @@ if (phase === 'core' && _userHintStr) {
             )}
             {step === 'generating' && (
               <Suspense fallback={suspenseFallback}>
-                <StepGenerating currentChapterIndex={currentChapterIndex} progress={progress} generatedChaptersCount={generatedChapters.filter(function (gc: any) { return gc?.content; }).length || (generatedData.chapters?.generatedContent?.filter(function (gc: any) { return gc?.content; }).length || 0)} generatedChapters={generatedChapters.length > 0 ? generatedChapters : (generatedData.chapters?.generatedContent || [])} totalChapters={generatedData.chapters?.volumes?.flatMap(function (v: any) { return v.chapters || []; }).length || generatedData.chapters?.chapters?.length || 0} volumes={generatedData.chapters?.volumes} genStatus={genStatus} genStats={genStats} genConcurrency={genConcurrency} genFailedList={genFailedList} onPause={handlePauseGen} onResume={handleResumeGen} onCancel={handleCancelGen} onRetryFailed={handleRetryFailed} />
-              </Suspense>
-            )}
-            {step === 'checklist' && (
-              <Suspense fallback={suspenseFallback}>
-                <StepSignatureChecklist generatedChapters={generatedChapters.length > 0 ? generatedChapters : (generatedData.chapters?.generatedContent || [])} onComplete={function () { setStep('cover') }} />
+                <StepGenerating currentChapterIndex={currentChapterIndex} progress={progress} generatedChaptersCount={generatedChapters.filter(function (gc: any) { return gc?.content; }).length || (generatedData.chapters?.generatedContent?.filter(function (gc: any) { return gc?.content; }).length || 0)} generatedChapters={generatedChapters.length > 0 ? generatedChapters : (generatedData.chapters?.generatedContent || [])} totalChapters={generatedData.chapters?.volumes?.flatMap(function (v: any) { return v.chapters || []; }).length || generatedData.chapters?.chapters?.length || 0} volumes={generatedData.chapters?.volumes} genStatus={genStatus} genStats={genStats} genConcurrency={genConcurrency} genFailedList={genFailedList} onPause={handlePauseGen} onResume={handleResumeGen} onCancel={handleCancelGen} onRetryFailed={handleRetryFailed} onStartGen={function() { if (genStatus === 'running' || genStatus === 'paused') return; handleStartGenerating(false) }} genTargetWordCount={genTargetWordCount} genStyle={genStyle} genNewCharacters={genNewCharacters} genBatchLimit={genBatchLimit} onGenBatchLimitChange={handleGenBatchLimitChange} onGenConfigChange={handleGenConfigChange} onChapterContentChange={handleChapterContentEdit} />
               </Suspense>
             )}
             {step === 'finalCheck' && (
               <Suspense fallback={suspenseFallback}>
-                <StepFinalCheck result={finalCheckResult} loading={finalCheckLoading} onCheck={handleFinalCheck} onPolish={handlePolish} onRetry={handleFinalCheck} />
+                <StepFinalCheck result={finalCheckResult} loading={finalCheckLoading} onCheck={handleFinalCheck} onPolish={handlePolish} onRetry={handleFinalCheck} generatedData={generatedData} onRepairAll={handleRepairAll} repairState={repairState ?? undefined} />
               </Suspense>
             )}
             {step === 'cover' && (
@@ -9762,7 +11465,7 @@ if (phase === 'core' && _userHintStr) {
             )}
             {step !== 'input' && step !== 'complete' && (
               <div className="flex items-center gap-3">
-                {(step === 'checklist' || step === 'cover') && (
+                {step === 'cover' && (
                   <button onClick={handleFinalCheck} disabled={finalCheckLoading} className="flex items-center space-x-2 px-6 py-2 bg-gradient-to-r from-stone-800 to-stone-700 text-white rounded-lg hover:from-stone-800 hover:to-stone-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed text-sm">
                     {finalCheckLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Shield className="w-4 h-4" />}<span>爆款终检</span>
                   </button>
@@ -9808,7 +11511,7 @@ if (phase === 'core' && _userHintStr) {
                 <h2 className="text-sm font-semibold font-serif-wenshu tracking-wide wenshu-model-btn px-3 py-1.5 rounded-lg">{getCurrentStepLabel()}</h2>
                 {/* 🔥 2026-09-02 修复图二：草稿箱·断点续创作按钮（embedded 模式） */}
                 <button
-                  onClick={function () { setShowDraftBox(true) }}
+                  onClick={function () { setDraftsIndex(filterInProgressDrafts(readLocalDraftsIndex())); mergeServerDraftsIntoIndex(); setShowDraftBox(true) }}
                   className="text-sm font-medium wenshu-model-btn px-3 py-1.5 rounded-lg flex items-center gap-1.5"
                   title="草稿箱：所有未完成的创作都在这里，点开即可从中断步骤继续往下创作"
                 >
@@ -9820,7 +11523,7 @@ if (phase === 'core' && _userHintStr) {
                 <div className="relative">
                   <button onClick={function () { setShowModelSelector(!showModelSelector) }} className="text-sm text-white/90 bg-white/10 hover:bg-white/20 px-3 py-1 rounded-lg flex items-center gap-1 transition-colors font-semibold"
                     title={manualModel ? '当前为手动模式，每环节都使用此模型' : '当前为智能推荐模式，每环节自动选择最适合模型'}>
-                    {manualModel && llmConfig?.model ? getModelDisplayName(llmConfig) : getRecommendedModelDisplayName()}<span className="ml-1">▼</span>
+                    {getHeaderModelText()}<span className="ml-1">▼</span>
                   </button>
                   {showModelSelector && availableModels.length > 0 && (
                     <div className="absolute top-full right-0 mt-1 w-72 rounded-lg shadow-xl overflow-hidden z-50 max-h-60 overflow-y-auto wenshu-card">
@@ -9838,32 +11541,6 @@ if (phase === 'core' && _userHintStr) {
                       >
                         <div>🤖 智能推荐（每环节自动选择最佳模型）</div>
                       </button>
-                      {availableModels.map(function (model: any, idx: number) {
-                        var isCurrent = manualModel && llmConfig?.model === model.model && llmConfig?.provider === model.provider
-                        return (
-                          <button
-                            key={idx}
-                            onClick={function () {
-                              var newConfig = {
-                                provider: model.provider.replace(/\s*\([^)]*\)\s*/g, '').trim(),
-                                apiKey: model.apiKey || '',
-                                baseUrl: (model.baseUrl || '').replace(/[`'"]/g, '').trim(),
-                                model: model.model,
-                              }
-                              setLlmConfig(newConfig)
-                              setManualModel(true)
-                              try { localStorage.setItem('tuzhong-llm-config', JSON.stringify(newConfig)) } catch (e) {}
-                              setShowModelSelector(false)
-                            }}
-                            className={'w-full text-left px-3 py-2 text-sm border-b ' + (isCurrent ? 'font-medium' : 'hover:bg-stone-50')}
-                            style={isCurrent
-                              ? { background: 'rgba(200, 54, 77, 0.08)', color: '#c8364d', borderColor: '#e7e1d8' }
-                              : { background: '#ffffff', color: '#3d3d3d', borderColor: '#f0ebe2' }}
-                          >
-                            <div>{model.name || model.title || (model.provider + ' - ' + model.model)}</div>
-                          </button>
-                        )
-                      })}
                     </div>
                   )}
                 </div>
@@ -9893,12 +11570,16 @@ if (phase === 'core' && _userHintStr) {
                         <div key={s.key} className="flex items-center flex-1 justify-center min-w-0">
                           <button
                             data-step-key={s.key}
-                            onClick={async function() { 
-                              if (!isCompleted) return 
-                              if (step !== s.key) {
-                                await saveSettings(generatedData)
-                              }
-                              setStep(s.key as Step) 
+                            onClick={function() {
+                              if (!isCompleted) return
+                              // 🔥 #224 性能修复：全流程节点点击只做「本地跳转」，禁止 await 大体积 settings 保存。
+                              //   原实现 await saveSettings(generatedData) 会在跳转前同步等待一次
+                              //   POST /api/settings 往返（带 1.45MB 响应，公网实测单次 4~10s），
+                              //   导致①点击后长时间无反应、②连点排队后「跳到上一个点过的节点」的错乱、
+                              //   ③多次重请求被打断触发 ERR_INCOMPLETE_CHUNKED_ENCODING → 错误页。
+                              //   持久化无需在此处兜底：generatedData 变化已有 2s 防抖自动保存（见 auto-save effect），
+                              //   字段级修改也各自触发 onChange 落盘，切换步骤不应阻塞在网络上。
+                              setStep(s.key as Step)
                             }}
                             disabled={isPending}
                             title={isPending ? '请先完成前置环节' : isCompleted ? '点击查看「' + shortLabel + '」' : '当前环节'}
@@ -9906,12 +11587,8 @@ if (phase === 'core' && _userHintStr) {
                           >
                             <IconComp className="w-5 h-5 flex-shrink-0" />
                             <span className="text-xs whitespace-nowrap leading-none mt-0.5 font-medium">{shortLabel}</span>
-                            {(stepModels[s.key] && stepModels[s.key].model) ? (
-                              <span className="text-[9px] leading-none text-amber-600 whitespace-nowrap mt-0.5" title={(stepModels[s.key].provider || '') + ' ' + stepModels[s.key].model}>
-                                {stepModels[s.key].model.replace(/^.*\//, '')}
-                              </span>
-                            ) : getStepModelLabel(s.key) ? (
-                              <span className="text-[9px] leading-none text-emerald-600 whitespace-nowrap mt-0.5" title="该环节配置调用的大模型">
+                            {getStepModelLabel(s.key) ? (
+                              <span className={'text-[9px] leading-none whitespace-nowrap mt-0.5 ' + ((stepModels[s.key] && stepModels[s.key].model) ? 'text-amber-600' : 'text-emerald-600')} title={(stepModels[s.key] && stepModels[s.key].provider ? stepModels[s.key].provider + ' ' : '') + getStepModelLabel(s.key)}>
                                 {getStepModelLabel(s.key)}
                               </span>
                             ) : null}
@@ -9929,6 +11606,12 @@ if (phase === 'core' && _userHintStr) {
           </div>
 
           <div className="p-6 overflow-x-hidden min-w-0">
+            {/* 🔥 2026-09-07（#147）主题变更守卫横幅：embedded 树同样常显 */}
+            {themeGuardMsg && (
+              <div className="mb-4 rounded-lg bg-amber-50 px-4 py-3 text-sm text-amber-800 ring-1 ring-amber-300" role="alert">
+                {themeGuardMsg}
+              </div>
+            )}
             {step === 'input' && (
               <Suspense fallback={suspenseFallback}>
                 <StepInputDirect keywords={keywords} setKeywords={setKeywords} detailedDesignInput={detailedDesignInput} setDetailedDesignInput={setDetailedDesignInput} genre={genre} setGenre={setGenre} genres={genres} creationMode={creationMode} setCreationMode={setCreationMode} imitateMode={imitateMode} setImitateMode={setImitateMode} imitateSearch={imitateSearch} setImitateSearch={setImitateSearch} imitateResult={imitateResult} setImitateResult={setImitateResult} imitateLoading={imitateLoading} setImitateLoading={setImitateLoading} imitateEditing={imitateEditing} setImitateEditing={setImitateEditing} imitateSearchPhase={imitateSearchPhase} setImitateSearchPhase={setImitateSearchPhase} imitateData={imitateData} setImitateData={setImitateData} protagonistName={protagonistName} setProtagonistName={setProtagonistName} userBookTitle={userBookTitle} setUserBookTitle={setUserBookTitle} protagonistGender={protagonistGender} setProtagonistGender={setProtagonistGender} protagonistAge={protagonistAge} setProtagonistAge={setProtagonistAge} protagonistIdentity={protagonistIdentity} setProtagonistIdentity={setProtagonistIdentity} protagonistDesignLoading={protagonistDesignLoading} onAutoDesignProtagonist={handleAutoDesignProtagonist} nameLoading={nameLoading} onGenerateName={handleGenerateProtagonistName} bookAnalysisMode={bookAnalysisMode} setBookAnalysisMode={setBookAnalysisMode} bookAnalysisJson={bookAnalysisJson} setBookAnalysisJson={setBookAnalysisJson} bookAnalysisResult={bookAnalysisResult} setBookAnalysisResult={setBookAnalysisResult} bookAnalysisLoading={bookAnalysisLoading} setBookAnalysisLoading={setBookAnalysisLoading} onImportBookAnalysis={handleImportBookAnalysis} autoBookName={autoBookName} setAutoBookName={setAutoBookName} autoBookLoading={autoBookLoading} onAutoBookAnalysis={handleAutoBookAnalysis} onGenerate={handleNextStep} onImitateSearch={handleImitateSearch} isLoading={isLoading} />
@@ -9937,6 +11620,7 @@ if (phase === 'core' && _userHintStr) {
             {step === 'idea' && (<Suspense fallback={suspenseFallback}><StepIdea data={generatedData.idea} onChange={function (updated) { setGeneratedData(function (prev) { return ({ ...prev, idea: updated })})}} onRegenerate={handleRegenerate} onGenerate={handleNextStep} isLoading={isLoading} regeneratePrompt={regeneratePrompt} setRegeneratePrompt={setRegeneratePrompt} RegenButton={RegenButton} regeneratingField={regeneratingField} stepName="idea" /></Suspense>)}
             {step === 'worldbuilding' && (<Suspense fallback={suspenseFallback}><StepWorldbuilding data={generatedData.worldbuilding} onChange={function (updated) { setGeneratedData(function (prev) { return ({ ...prev, worldbuilding: updated })})}} onRegenerate={handleRegenerate} onGenerate={handleNextStep} isLoading={isLoading} regeneratePrompt={regeneratePrompt} setRegeneratePrompt={setRegeneratePrompt} RegenButton={RegenButton} regeneratingField={regeneratingField} stepName="worldbuilding" /></Suspense>)}
             {step === 'powerSystem' && (<Suspense fallback={suspenseFallback}><StepPowerSystem data={generatedData.powerSystem} worldbuildingText={typeof (generatedData.worldbuilding?.powerSystem) === 'string' ? (generatedData.worldbuilding.powerSystem as string) : ''} onChange={function (updated) { setGeneratedData(function (prev) { var next = { ...prev, powerSystem: updated }; generatedDataRef.current = next; return next }) }} onRegenerate={handleRegenerate} onGenerate={handleNextStep} isLoading={isLoading} regeneratePrompt={regeneratePrompt} setRegeneratePrompt={setRegeneratePrompt} RegenButton={RegenButton} regeneratingField={regeneratingField} stepName="powerSystem" /></Suspense>)}
+            {step === 'characters' && (<FieldRegenBar step="characters" fields={[{ key: 'protagonist', label: '主角' }, { key: 'femaleLead', label: '女主' }, { key: 'antagonists', label: '反派' }, { key: 'supporting', label: '配角' }]} />)}
             {step === 'characters' && (<Suspense fallback={suspenseFallback}><StepCharacters detailedDesignInput={detailedDesignInput} genre={genre} keywords={keywords} data={generatedData.characters} showPowerLevel={/修仙|仙侠|洪荒|玄幻|西幻|魔法|科幻|末世|异能|进化|武道/.test((genre || '') + (keywords || ''))} onChange={function (updated) { 
               setGeneratedData(function (prev) { 
                 var next = { ...prev, characters: updated }
@@ -9948,18 +11632,22 @@ if (phase === 'core' && _userHintStr) {
                   }
                 }
                 generatedDataRef.current = next
-                return next 
-              }) 
+                return next
+              })
+              // 🔥 修复3：characters 变更立即落盘，防止服务端权威覆盖把校正结果打回
+              persistCharactersChange(updated)
             }} onRegenerate={handleRegenerate} onGenerate={handleNextStep} onRegenerateAll={handleRegenerateCharactersAll} isLoading={isLoading} isGenerating={isGeneratingCharacters} genProgress={charGenProgress} regeneratePrompt={regeneratePrompt} setRegeneratePrompt={setRegeneratePrompt} RegenButton={RegenButton} regeneratingField={regeneratingField} stepName="characters" createEmptyCharacter={createEmptyCharacter} appendRoleInput={appendRoleInput} setAppendRoleInput={setAppendRoleInput} /></Suspense>)}
+            {step === 'factions' && (<FieldRegenBar step="factions" fields={[{ key: 'factions', label: '势力列表' }]} />)}
             {step === 'factions' && (<Suspense fallback={suspenseFallback}><StepFactions genre={genre} keywords={keywords} data={generatedData.factions} onChange={function (updated) { setGeneratedData(function (prev) { return ({ ...prev, factions: updated })})}} onRegenerate={handleRegenerate} onGenerate={handleNextStep} isLoading={isLoading} regeneratePrompt={regeneratePrompt} setRegeneratePrompt={setRegeneratePrompt} RegenButton={RegenButton} regeneratingField={regeneratingField} stepName="factions" /></Suspense>)}
+            {step === 'relationships' && (<FieldRegenBar step="relationships" fields={[{ key: 'relationships', label: '人物关系' }]} />)}
             {step === 'relationships' && (<Suspense fallback={suspenseFallback}><StepRelationships data={generatedData.relationships} characters={generatedData.characters} onChange={function (updated) { setGeneratedData(function (prev) { return ({ ...prev, relationships: updated })})}} onRegenerate={handleRegenerate} onGenerate={handleGenerateRelationships} isLoading={isLoading} regeneratePrompt={regeneratePrompt} setRegeneratePrompt={setRegeneratePrompt} RegenButton={RegenButton} regeneratingField={regeneratingField} stepName="relationships" appendGraphInput={appendGraphInput} setAppendGraphInput={setAppendGraphInput} /></Suspense>)}
             {step === 'synopsis' && (<Suspense fallback={suspenseFallback}><StepSynopsis data={generatedData.synopsis} onChange={function (updated) { setGeneratedData(function (prev) { return ({ ...prev, synopsis: updated })})}} onRegenerate={handleRegenerate} onGenerate={handleNextStep} isLoading={isLoading} regeneratePrompt={regeneratePrompt} setRegeneratePrompt={setRegeneratePrompt} RegenButton={RegenButton} regeneratingField={regeneratingField} stepName="synopsis" /></Suspense>)}
             {step === 'outline' && (<Suspense fallback={suspenseFallback}><StepOutline data={generatedData.outline} onChange={function (updated) { setGeneratedData(function (prev) { return ({ ...prev, outline: updated })})}} onRegenerate={handleRegenerate} onGenerate={handleNextStep} isLoading={isLoading} regeneratePrompt={regeneratePrompt} setRegeneratePrompt={setRegeneratePrompt} RegenButton={RegenButton} regeneratingField={regeneratingField} stepName="outline" /></Suspense>)}
+            {step === 'keyPlots' && (<FieldRegenBar step="keyPlots" fields={[{ key: 'turningPoints', label: '关键转折点' }, { key: 'climax', label: '高潮' }, { key: 'ending', label: '结局' }]} />)}
             {step === 'keyPlots' && (<Suspense fallback={suspenseFallback}><StepKeyPlots data={generatedData.keyPlots} onChange={function (updated) { setGeneratedData(function (prev) { return ({ ...prev, keyPlots: updated })})}} onRegenerate={handleRegenerate} onGenerate={handleNextStep} isLoading={isLoading} regeneratePrompt={regeneratePrompt} setRegeneratePrompt={setRegeneratePrompt} RegenButton={RegenButton} regeneratingField={regeneratingField} stepName="keyPlots" /></Suspense>)}
             {step === 'chapters' && (<Suspense fallback={suspenseFallback}><StepChapters data={generatedData.chapters} onChange={function (updated) { setGeneratedData(function (prev) { return ({ ...prev, chapters: updated })})}} onRegenerate={handleRegenerate} onGenerate={handleGenerateChapters} onGenerateFromConfig={generateChaptersFromConfig} isLoading={isLoading} regeneratePrompt={regeneratePrompt} setRegeneratePrompt={setRegeneratePrompt} RegenButton={RegenButton} regeneratingField={regeneratingField} stepName="chapters" volumeConfig={volumeConfig} onVolumeConfigChange={handleVolumeConfigChange} chapterLoadingProgress={chapterLoadingProgress as any} /></Suspense>)}
-            {step === 'generating' && (<Suspense fallback={suspenseFallback}><StepGenerating currentChapterIndex={currentChapterIndex} progress={progress} generatedChaptersCount={generatedChapters.filter(function (gc: any) { return gc?.content; }).length || (generatedData.chapters?.generatedContent?.filter(function (gc: any) { return gc?.content; }).length || 0)} generatedChapters={generatedChapters.length > 0 ? generatedChapters : (generatedData.chapters?.generatedContent || [])} totalChapters={generatedData.chapters?.volumes?.flatMap(function (v: any) { return v.chapters || []; }).length || generatedData.chapters?.chapters?.length || 0} volumes={generatedData.chapters?.volumes} genStatus={genStatus} genStats={genStats} genConcurrency={genConcurrency} genFailedList={genFailedList} onPause={handlePauseGen} onResume={handleResumeGen} onCancel={handleCancelGen} onRetryFailed={handleRetryFailed} /></Suspense>)}
-            {step === 'checklist' && (<Suspense fallback={suspenseFallback}><StepSignatureChecklist generatedChapters={generatedChapters.length > 0 ? generatedChapters : (generatedData.chapters?.generatedContent || [])} onComplete={function () { setStep('cover') }} /></Suspense>)}
-            {step === 'finalCheck' && (<Suspense fallback={suspenseFallback}><StepFinalCheck result={finalCheckResult} loading={finalCheckLoading} onCheck={handleFinalCheck} onPolish={handlePolish} onRetry={handleFinalCheck} /></Suspense>)}
+            {step === 'generating' && (<Suspense fallback={suspenseFallback}><StepGenerating currentChapterIndex={currentChapterIndex} progress={progress} generatedChaptersCount={generatedChapters.filter(function (gc: any) { return gc?.content; }).length || (generatedData.chapters?.generatedContent?.filter(function (gc: any) { return gc?.content; }).length || 0)} generatedChapters={generatedChapters.length > 0 ? generatedChapters : (generatedData.chapters?.generatedContent || [])} totalChapters={generatedData.chapters?.volumes?.flatMap(function (v: any) { return v.chapters || []; }).length || generatedData.chapters?.chapters?.length || 0} volumes={generatedData.chapters?.volumes} genStatus={genStatus} genStats={genStats} genConcurrency={genConcurrency} genFailedList={genFailedList} onPause={handlePauseGen} onResume={handleResumeGen} onCancel={handleCancelGen} onRetryFailed={handleRetryFailed} onStartGen={function() { if (genStatus === 'running' || genStatus === 'paused') return; handleStartGenerating(false) }} genTargetWordCount={genTargetWordCount} genStyle={genStyle} genNewCharacters={genNewCharacters} genBatchLimit={genBatchLimit} onGenBatchLimitChange={handleGenBatchLimitChange} onGenConfigChange={handleGenConfigChange} onChapterContentChange={handleChapterContentEdit} /></Suspense>)}
+            {step === 'finalCheck' && (<Suspense fallback={suspenseFallback}><StepFinalCheck result={finalCheckResult} loading={finalCheckLoading} onCheck={handleFinalCheck} onPolish={handlePolish} onRetry={handleFinalCheck} generatedData={generatedData} onRepairAll={handleRepairAll} repairState={repairState ?? undefined} /></Suspense>)}
             {step === 'cover' && (<Suspense fallback={suspenseFallback}><StepCover data={generatedData as any} generatedData={generatedData} onCoverGenerated={function (url: string) { setGeneratedData(function(prev: any) { return { ...prev, coverUrl: url || prev.coverUrl } }); localStorage.setItem('tuzhong-author-name', (document.querySelector('input[placeholder="输入作者名"]') as HTMLInputElement)?.value || '') }} isLoading={isLoading} setIsLoading={setIsLoading} /></Suspense>)}
             {step === 'complete' && (
               <div className="flex items-center justify-center py-16">
@@ -9991,7 +11679,7 @@ if (phase === 'core' && _userHintStr) {
             )}
             {step !== 'input' && step !== 'complete' && (
               <div className="flex items-center gap-3">
-                {(step === 'checklist' || step === 'cover') && (
+                {step === 'cover' && (
                   <button onClick={handleFinalCheck} disabled={finalCheckLoading} className="flex items-center space-x-2 px-6 py-2 bg-gradient-to-r from-stone-800 to-stone-700 text-white rounded-lg hover:from-stone-800 hover:to-stone-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed text-sm">
                     {finalCheckLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Shield className="w-4 h-4" />}<span>爆款终检</span>
                   </button>
@@ -10066,7 +11754,7 @@ if (phase === 'core' && _userHintStr) {
               )}
             </div>
             <div className="border-t border-stone-200 px-6 py-3 text-xs text-stone-400">
-              点开草稿将从对应环节继续创作；进行中的草稿会随创作进度自动保存到本地。
+              点开草稿将从对应环节继续创作；草稿已与服务端同步，换浏览器、换设备都能续写，删除也会与书架草稿箱同步。
             </div>
           </div>
         </div>
