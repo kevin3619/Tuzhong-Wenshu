@@ -30114,7 +30114,12 @@ ${charConfigStr}
             if (!/主角/.test(_rl168) && !/女主/.test(_rl168)) {
               var _camp168 = String(c.camp || c.faction || '').trim()
               var _idHead168 = String(c.identity || '').split(/[，,。；;]/)[0]
-              var _enemyCamp = /清朝|清军|清廷|后金|满清|伪清|摄政王|大西|农民军|流寇/.test(_camp168) || /^(清朝|清军|后金|满清|大西皇帝|农民军|流寇)/.test(_idHead168)
+              // 🔥 2026-11-07 补丁：实测第 9 轮多尔衮 faction="清"、identity="清摄政王…" 未被判为敌方——
+              //   旧写法 camp 只认「清朝/清军/清廷」，identity 又用 ^ 锚定，导致单字「清」与「清摄政王」双双漏判。
+              //   这里 camp 增加精确单字「清」判定（用 ^清$ 避免误伤「清流」），identity 改为非锚定、补「清摄政王/清将/清兵」。
+              var _enemyCamp = /^(清|清朝|清军|清廷|后金|满清|伪清|大西|农民军|流寇|摄政王)$/.test(_camp168)
+                || /清朝|清军|清廷|后金|满清|伪清|摄政王|大西|农民军|流寇/.test(_camp168)
+                || /清朝|清军|清廷|清摄政王|后金|满清|伪清|大西|农民军|流寇|清廷鹰犬/.test(_idHead168)
               var _ownSide168 = /南明|永历|明廷|归明|抗清|反正|大明/.test(_idHead168 + ' ' + _camp168)
               if (_enemyCamp && !_ownSide168) { _rl168 = '反派'; c.role = '反派'; c.rolePosition = '反派' }
             }
@@ -31472,6 +31477,15 @@ ${charConfigStr}
             var _idH168 = String(c.identity || '').split(/[，,。；;]/)[0].trim()
             var _ttl168 = _idH168.replace(/^.*?(封|任|官至|授|拜)/, '').trim().slice(0, 8)
             c.title = (_ttl168 && _ttl168.length >= 2) ? _ttl168 : String(c.rolePosition || c.role || '关键人物')
+          }
+          if (!String(c.motivation || '').trim() || String(c.motivation).trim().length < 8) {
+            // 🔥 2026-11-07 补：实测第 9 轮李香君/郑成功 motivation 为空（前端动机字段空白），此处按定位确定性补全
+            var _mId168 = String(c.identity || '').split(/[，,。；;]/)[0].trim()
+            var _mRl168 = String(c.rolePosition || c.role || '').trim()
+            var _mProto168 = String((structuredResult.protagonist && structuredResult.protagonist.name) || '主角')
+            if (/女主/.test(_mRl168)) c.motivation = '与' + _mProto168 + '患难相守，在乱世中守住心中情义与家国大义'
+            else if (/反派/.test(_mRl168)) c.motivation = '攫取更大权柄与利益，不择手段打压对手，最终摧毁主角所守护的一切'
+            else c.motivation = (_mId168 ? '身为' + _mId168 + '，' : '') + '竭力在乱世中守住自身立场与所托之人，谋求安身立命、不负平生志向'
           }
           if (!String(c.weaknesses || '').trim() && !(Array.isArray(c.weaknesses) && c.weaknesses.length)) {
             var _mo168 = String(c.motivation || c.goal || c.personality || '').trim()
@@ -37870,6 +37884,15 @@ export async function POST(request: Request) {
             var _oh168 = String(c.identity || '').split(/[，,。；;]/)[0].trim()
             var _ot168 = _oh168.replace(/^.*?(封|任|官至|授|拜)/, '').trim().slice(0, 8)
             c.title = (_ot168 && _ot168.length >= 2) ? _ot168 : String(c.rolePosition || c.role || '关键人物')
+          }
+          if (!String(c.motivation || '').trim() || String(c.motivation).trim().length < 8) {
+            // 🔥 2026-11-07 出口补：motivation 为空时按定位确定性补全，避免前端动机列空白
+            var _moId168 = String(c.identity || '').split(/[，,。；;]/)[0].trim()
+            var _moRl168 = String(c.rolePosition || c.role || '').trim()
+            var _moProto168 = String((result.protagonist && result.protagonist.name) || '主角')
+            if (/女主/.test(_moRl168)) c.motivation = '与' + _moProto168 + '患难相守，在乱世中守住心中情义与家国大义'
+            else if (/反派/.test(_moRl168)) c.motivation = '攫取更大权柄与利益，不择手段打压对手，最终摧毁主角所守护的一切'
+            else c.motivation = (_moId168 ? '身为' + _moId168 + '，' : '') + '竭力在乱世中守住自身立场与所托之人，谋求安身立命、不负平生志向'
           }
           if (!String(c.weaknesses || '').trim() && !(Array.isArray(c.weaknesses) && c.weaknesses.length)) {
             var _om168 = String(c.motivation || c.goal || c.personality || '').trim()
