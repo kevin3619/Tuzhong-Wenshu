@@ -38,6 +38,11 @@ function LoginPage() {
   const isRealWechat = _isRealWechat[0]
   const setIsRealWechat = _isRealWechat[1]
 
+  // Bug#2 修复：仅当服务器明确反馈"未配置"才显示配置横幅（与网络失败区分）
+  const _wxConfigMissing = useState(false)
+  const wxConfigMissing = _wxConfigMissing[0]
+  const setWxConfigMissing = _wxConfigMissing[1]
+
   const _wxCountdown = useState(300)
   const wxCountdown = _wxCountdown[0]
   const setWxCountdown = _wxCountdown[1]
@@ -120,7 +125,7 @@ function LoginPage() {
           setLogoUrl(respBody.data.brandLogo)
         }
       })
-      .catch(function () {})
+      .catch(function (err) { console.error('[login] 加载品牌Logo失败:', err) })
 
     // 初始生成微信二维码
     if (loginMode === 'qr') {
@@ -158,12 +163,27 @@ function LoginPage() {
     return '/'
   }
 
+  // 用 token 换取服务端 HttpOnly cookie。
+  // 浏览器规范：document.cookie 无法覆盖/删除已存在的 HttpOnly 同名 cookie，
+  // 若只靠前端写 cookie，旧的失效 token 会一直生效 → 401 → 被 SessionGuard 弹回登录页（闪退）。
+  async function ensureServerSessionCookie(token: string) {
+    try {
+      await fetch('/tuzhong-wenshu/api/auth/session', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer ' + token },
+      })
+    } catch (err) {
+      console.error('[login] 写入服务端会话失败:', err)
+    }
+  }
+
   // 处理微信回调登录
-  function processWxCallbackLogin(token: string) {
+  async function processWxCallbackLogin(token: string) {
     localStorage.setItem('token', token)
     // 修复 v4 C4：Cookie 增加 SameSite/Secure 属性
     const _isProdEnv1 = typeof window !== 'undefined' && window.location.protocol === 'https:'
     document.cookie = 'token=' + token + '; path=/; max-age=604800; SameSite=Lax' + (_isProdEnv1 ? '; Secure' : '')
+    await ensureServerSessionCookie(token)
     fetch('/tuzhong-wenshu/api/auth/me', {
       headers: { Authorization: 'Bearer ' + token },
     })
@@ -173,16 +193,17 @@ function LoginPage() {
           localStorage.setItem('user', JSON.stringify(userBody.data))
         }
       })
-      .catch(function () {})
+      .catch(function (err) { console.error('[login] 拉取用户信息失败:', err) })
     safeRedirect(getRedirectTarget())
   }
 
   // 完成登录
-  function finishLoginFlow(token: string) {
+  async function finishLoginFlow(token: string) {
     localStorage.setItem('token', token)
     // 修复 v4 C4：Cookie 增加 SameSite/Secure 属性
     const _isProdEnv2 = typeof window !== 'undefined' && window.location.protocol === 'https:'
     document.cookie = 'token=' + token + '; path=/; max-age=604800; SameSite=Lax' + (_isProdEnv2 ? '; Secure' : '')
+    await ensureServerSessionCookie(token)
     fetch('/tuzhong-wenshu/api/auth/me', {
       headers: { Authorization: 'Bearer ' + token },
     })
@@ -192,7 +213,7 @@ function LoginPage() {
           localStorage.setItem('user', JSON.stringify(userBody.data))
         }
       })
-      .catch(function () {})
+      .catch(function (err) { console.error('[login] 拉取用户信息失败:', err) })
     safeRedirect(getRedirectTarget())
   }
 
@@ -200,6 +221,7 @@ function LoginPage() {
   function buildWxLoginQrCode() {
     setWxQrLoadFlag(true)
     setErrorMsg('')
+    setWxConfigMissing(false)
     setWxQrCodeUrl('')
     setWxScanStatus('pending')
     setWxCountdown(300)
@@ -215,16 +237,22 @@ function LoginPage() {
           wxLoginTokenKeyRef.current = respBody.data.state
           setWxQrCodeUrl(respBody.data.qrcodeUrl)
           setIsRealWechat(true)
+          setWxConfigMissing(false)
           setWxScanStatus('pending')
           beginWxScanPolling()
         } else {
-          // 未配置微信开放平台：显示明确配置提示，不再回退模拟模式
-          setErrorMsg(respBody.message || '微信开放平台配置不完整，请联系管理员在后台配置AppID和AppSecret')
+          // 仅当服务器明确判断"未配置"时才显示配置横幅；
+          // 其余失败（网络抖动/500）按"加载失败"处理，避免误报配置不完整
+          const serverMsg = String(respBody.message || '')
+          const missingCfg = serverMsg.indexOf('配置不完整') >= 0 || serverMsg.indexOf('请配置') >= 0
+          setWxConfigMissing(missingCfg)
+          setErrorMsg(missingCfg ? (serverMsg || '微信开放平台配置不完整，请联系管理员在后台配置AppID和AppSecret') : '二维码加载失败，请点击重试')
           setWxQrCodeUrl('')
           setIsRealWechat(false)
         }
       })
       .catch(function () {
+        setWxConfigMissing(false)
         setErrorMsg('生成二维码失败，请刷新重试')
         setWxQrCodeUrl('')
       })
@@ -279,7 +307,7 @@ function LoginPage() {
             }
           }
         })
-        .catch(function () {})
+        .catch(function (err) { console.error('[login] 微信扫码登录轮询失败:', err) })
     }, 2000)
 
     // 5分钟后过期
@@ -517,8 +545,8 @@ function LoginPage() {
                 <p className="text-xs text-[#86909C] mb-4">
                   扫码后自动获取微信信息，直接完成登录
                 </p>
-                {/* 未配置微信开放平台时显示配置提示 */}
-                {!isRealWechat && !wxQrCodeUrl && (
+                {/* Bug#2 修复：只有服务器明确"未配置"才显示该横幅 */}
+                {wxConfigMissing && !wxQrCodeUrl && (
                   <div className="mb-4 p-3 bg-red-50 border border-red-200 rounded-lg">
                     <p className="text-xs text-red-700">
                       微信开放平台配置不完整，请联系管理员在后台-系统设置-基本设置中配置AppID和AppSecret

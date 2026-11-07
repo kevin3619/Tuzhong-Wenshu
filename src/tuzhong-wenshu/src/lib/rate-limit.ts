@@ -53,14 +53,23 @@ export function checkRateLimit(
 }
 
 /**
+ * 登录成功后重置对应 key 的限流计数（防 NAT 出口合法登录累计误封）
+ */
+export function resetRateLimit(key: string): void {
+  _limitStore.delete(key)
+}
+
+/**
  * 从请求中提取客户端 IP（用于限流键）
+ * 🔥 安全权衡：生产部署在 nginx 反代后（XFF 由 nginx 设置），信任 XFF；
+ *   但属内网/本地地址的伪造值会被拒绝（直连 3001 时 nginx 不存在）。
  */
 export function getClientIpFromRequest(request: Request): string {
   const headers = request.headers
   const xff = headers.get('x-forwarded-for')
   if (xff) {
     const first = xff.split(',')[0].trim()
-    if (first) return first
+    if (first && !/^(10\.|127\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(first)) return first
   }
   const xri = headers.get('x-real-ip')
   if (xri) return xri.trim()

@@ -1,6 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { fetchWxLoginToken } from '@/lib/wechat'
 
+function isHttpsRequest(request: NextRequest): boolean {
+  const proto = request.headers.get('x-forwarded-proto') || (request.nextUrl && request.nextUrl.protocol) || 'http:'
+  return proto.indexOf('https') === 0
+}
+
 // 轮询检查微信扫码状态
 export async function POST(request: NextRequest) {
   try {
@@ -22,7 +27,7 @@ export async function POST(request: NextRequest) {
     }
 
     if (loginEntry.scanStatus === 'confirmed' && loginEntry.jwtToken) {
-      return NextResponse.json({
+      const res = NextResponse.json({
         code: 200,
         data: {
           status: 'confirmed',
@@ -31,6 +36,16 @@ export async function POST(request: NextRequest) {
         },
         message: '登录成功',
       })
+      // 关键修复：由服务端下发 HttpOnly cookie。
+      // 前端 document.cookie 无法覆盖已存在的 HttpOnly 同名 cookie，旧 token 会一直生效并导致 401 闪退。
+      res.cookies.set('token', loginEntry.jwtToken, {
+        httpOnly: true,
+        secure: isHttpsRequest(request),
+        sameSite: 'lax',
+        path: '/',
+        maxAge: 7 * 24 * 3600,
+      })
+      return res
     }
 
     let statusMsg = '等待扫码'

@@ -24,7 +24,7 @@ export default function AuthCookieBridge() {
         } else {
           document.cookie = 'token=; path=/; max-age=0; SameSite=Lax' + (isSecure ? '; Secure' : '')
         }
-      } catch (_e) { /* ignore */ }
+      } catch (_e) { console.error('[auth-cookie-bridge] 写入/清除 token cookie 失败:', _e) }
     }
     sync()
     // 顶部同步：处理同 tab 登录/登出（localStorage 变更）

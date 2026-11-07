@@ -1,15 +1,17 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { prisma } from '@/lib/prisma'
 import { verifyToken } from '@/lib/auth'
+import { extractTokenFromRequest } from '@/lib/permissions'
 
 export async function GET(request: NextRequest) {
   try {
-    const authHeader = request.headers.get('authorization')
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    // 与 middleware 保持一致：同时支持 Authorization 头与 HttpOnly cookie。
+    // 旧实现只认 Authorization，仅带 cookie 的请求会被判 401，触发 SessionGuard 清态跳登录（闪退）。
+    const token = extractTokenFromRequest(request)
+    if (!token) {
       return NextResponse.json({ code: 401, message: '未登录' }, { status: 401 })
     }
 
-    const token = authHeader.split(' ')[1]
     const payload = await verifyToken(token)
     if (!payload) {
       return NextResponse.json({ code: 401, message: '登录已过期' }, { status: 401 })

@@ -16,20 +16,21 @@ const EFFECTIVE_SECRET = RAW_JWT_SECRET && RAW_JWT_SECRET.length >= 32
 const JWT_SECRET = new TextEncoder().encode(EFFECTIVE_SECRET)
 
 // 不需要登录的公开路径（同时兼容 basePath=/tuzhong-wenshu 和无前缀两种情况）
+const BASE_PATH = '/tuzhong-wenshu'
 const PUBLIC_PATHS = [
   '/api/auth/login',
   '/api/auth/register',
   '/api/auth/reset-password',
+  // 登出必须是 public：token 过期/黑名单后也允许清 cookie（幂等）
+  '/api/auth/logout',
   '/api/wechat/',
   '/api/auth/qr-scan',
   '/api/config/public',
   '/api/brand-logo',
-  '/api/novels/cover',
   '/tuzhong-wenshu/api/auth/login',
   '/tuzhong-wenshu/api/auth/register',
   '/tuzhong-wenshu/api/auth/reset-password',
   '/tuzhong-wenshu/api/brand-logo',
-  '/tuzhong-wenshu/api/novels/cover',
   '/login',
   '/forgot-password',
   '/reset-password',
@@ -43,10 +44,14 @@ const PUBLIC_PATHS = [
 ]
 
 // 管理员路径前缀
-const ADMIN_PATHS = ['/api/admin/', '/admin', '/tuzhong-wenshu/api/admin/', '/tuzhong-wenshu/admin']
+const ADMIN_PATHS = ['/api/admin/', '/admin']
 
 export async function middleware(request: NextRequest) {
-  const { pathname, searchParams } = request.nextUrl
+  const { pathname: rawPath, searchParams } = request.nextUrl
+  // 🔥 修复：basePath 是否出现在 nextUrl.pathname 上取决于 Next 版本，旧清单靠「两种前缀都写」
+  //   来兜底，结果一半条目是死代码、且一旦行为翻转就会误放行敏感路径。统一先归一成裸路径。
+  const pathname = rawPath.startsWith(BASE_PATH) ? (rawPath.slice(BASE_PATH.length) || '/') : rawPath
+  const isAdminPath = ADMIN_PATHS.some(p => pathname.startsWith(p))
 
   // 修复 basePath 后带斜杠访问 404：/tuzhong-wenshu/ -> /tuzhong-wenshu
   const rawUrl = request.url
@@ -55,7 +60,9 @@ export async function middleware(request: NextRequest) {
   }
 
   // React Server Components 内部请求直接放行
-  if (searchParams.has('_rsc')) {
+  // 🔥 修复：旧实现把所有带 _rsc 的请求在鉴权之前放行（等于任意接口加个查询参数即绕过中间件）。
+  //   现只对页面路由放行，API 与后台一律继续走鉴权。
+  if (searchParams.has('_rsc') && !pathname.startsWith('/api/') && !isAdminPath) {
     return NextResponse.next()
   }
 
@@ -70,26 +77,43 @@ export async function middleware(request: NextRequest) {
   }
 
   // 提取 token：支持 cookie 与 Authorization header（v4 Q2：统一来源）
-  const token =
+  // 🔥 修复登录闪退最后一环：旧实现把 cookie 和 Authorization 用 || 串成单一 token，
+  //   一旦浏览器里残留一个失效的 HttpOnly cookie（JS 无法覆盖/删除它），
+  //   新签发的 token（Authorization 头）就会被旧 cookie 完全掩盖，
+  //   所有接口 401 → 前端 SessionGuard 清态跳回登录页 = “闪退”。
+  //   现改为「候选集逐一验签」：cookie 验签失败时回退到 Authorization。
+  const cookieToken =
     request.cookies.get('token')?.value ||
     request.cookies.get('auth_token')?.value ||
-    request.headers.get('authorization')?.split(' ')[1] ||
     null
+  const headerToken = request.headers.get('authorization')?.split(' ')[1] || null
+  const tokenCandidates = [cookieToken, headerToken].filter(
+    (t): t is string => !!t
+  )
+  const token = tokenCandidates[0] || null
 
   // API 请求无 token 返回 401
   if (pathname.startsWith('/api/')) {
     if (!token) {
       return NextResponse.json({ code: 401, message: '未登录，请先登录' }, { status: 401 })
     }
-    let payload: JWTPayload
-    try {
-      ({ payload } = await jwtVerify(token, JWT_SECRET))
-    } catch {
+    // 依次验签 cookie → Authorization，任一通过即放行（容忍失效的旧 cookie）
+    let payload: JWTPayload | null = null
+    for (const candidate of tokenCandidates) {
+      try {
+        const verified = await jwtVerify(candidate, JWT_SECRET)
+        payload = verified.payload
+        break
+      } catch {
+        // 该候选失效，继续尝试下一个
+      }
+    }
+    if (!payload) {
       return NextResponse.json({ code: 401, message: '登录已过期，请重新登录' }, { status: 401 })
     }
 
     // v4 M3：对 /api/admin/* 路径增加 isAdmin 兜底校验
-    if (ADMIN_PATHS.some(p => pathname.startsWith(p))) {
+    if (isAdminPath) {
       if (!payload.isAdmin) {
         return NextResponse.json({ code: 403, message: '无管理员权限' }, { status: 403 })
       }
