@@ -4,25 +4,9 @@ import { verifyAdmin } from '@/lib/permissions'
 import { loadFsNovels } from '@/lib/novel-storage'
 import { existsSync, readdirSync } from 'fs'
 import { join } from 'path'
+import { resolveDataDirB } from '@/lib/data-dir'
 
-function resolveDataDir(): string {
-  const candidates = [
-    join(process.cwd(), '.tuzhong-data'),
-    join(process.cwd(), 'src', 'tuzhong-wenshu', '.tuzhong-data'),
-    join(process.cwd(), '..', '.tuzhong-data'),
-    '/www/wwwroot/tuzhong-wenshu/.tuzhong-data',
-  ]
-  for (const p of candidates) {
-    try {
-      if (existsSync(p)) return p
-    } catch {
-      // 继续尝试
-    }
-  }
-  return join(process.cwd(), '.tuzhong-data')
-}
-
-const LOCAL_DATA_DIR = resolveDataDir()
+const LOCAL_DATA_DIR = resolveDataDirB()
 const CHAPTERS_DIR = join(LOCAL_DATA_DIR, 'chapters')
 
 function countSubEntries(novelId: string, prefix: string): number {

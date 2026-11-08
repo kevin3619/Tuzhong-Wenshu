@@ -5,26 +5,13 @@ import crypto from 'crypto'
 import { verifyToken } from '@/lib/auth'
 import { prisma } from '@/lib/prisma'
 import { isAdminOnlyNovel, extractTokenFromRequest, getRequestActor } from '@/lib/permissions'
+import { resolveDataDirB } from '@/lib/data-dir'
+import { atomicWriteJson, runExclusive } from '@/lib/file-lock'
+import { resolveInsideBase } from '@/lib/safe-path'
 
-// 途中文枢作品存储路径 - 动态解析支持 PM2 环境
-function resolveDataDir(): string {
-  const candidates = [
-    join(process.cwd(), '.tuzhong-data'),
-    join(process.cwd(), 'src', 'tuzhong-wenshu', '.tuzhong-data'),
-    join(process.cwd(), '..', '.tuzhong-data'),
-    '/www/wwwroot/tuzhong-wenshu/.tuzhong-data',
-  ]
-  for (const p of candidates) {
-    try {
-      if (existsSync(p)) return p
-    } catch {
-      // 继续尝试
-    }
-  }
-  return join(process.cwd(), '.tuzhong-data')
-}
+// 途中文枢作品存储路径 - 动态解析支持 PM2 环境（B 家族：4 候选、无 mkdir 兜底）
 
-const LOCAL_DATA_DIR = resolveDataDir()
+const LOCAL_DATA_DIR = resolveDataDirB()
 const NOVEL_BOOK_FILE = join(LOCAL_DATA_DIR, 'novels.json')
 const CHAPTERS_DIR = join(LOCAL_DATA_DIR, 'chapters')
 
@@ -58,7 +45,7 @@ function loadSettingsMeta(): Record<string, { characterCount: number; aiTitle?: 
       const ideaTitle = (entry as any).idea && typeof (entry as any).idea === 'object' ? ((entry as any).idea.title || '') : ''
       metaMap[nid] = { characterCount: cc, aiTitle: ideaTitle || undefined }
     }
-  } catch { /* ignore */ }
+  } catch (e) { console.error('[novels] 解析 settings.json 统计元数据失败:', e) }
   return metaMap
 }
 
@@ -71,14 +58,14 @@ function loadCountData() {
       const raw = JSON.parse(readFileSync(charsFile, 'utf-8'))
       if (raw && typeof raw === 'object') chars = raw
     }
-  } catch { /* ignore */ }
+  } catch (e) { console.error('[novels] 读取 characters.json 失败:', e) }
   try {
     const volsFile = join(LOCAL_DATA_DIR, 'volumes.json')
     if (existsSync(volsFile)) {
       const raw = JSON.parse(readFileSync(volsFile, 'utf-8'))
       if (raw && typeof raw === 'object') vols = raw
     }
-  } catch { /* ignore */ }
+  } catch (e) { console.error('[novels] 读取 volumes.json 失败:', e) }
   return { chars, vols }
 }
 
@@ -129,7 +116,25 @@ function loadNovelBooks() {
 
 function saveNovelBooks(allBooks: unknown[]) {
   ensureDataFolder()
-  writeFileSync(NOVEL_BOOK_FILE, JSON.stringify(allBooks, null, 2), 'utf-8')
+  // 🔥 修复（P0 丢数据）：改为「临时文件 + fsync + rename」原子写，并在写前检测
+  //   目标文件是否已被写坏（解析失败则拒绝覆盖并保留现场），避免
+  //   「解析失败 → 当成空数组 → 整体覆盖」把作品库清空。
+  atomicWriteJson(NOVEL_BOOK_FILE, allBooks)
+}
+
+/**
+ * cover/coverUrl 取值校验：允许空串、data:image/…(≤6MB)、http(s)://…、容器内相对路径；
+ * 其余（绝对路径、盘符、.. 逃逸、后端回吐的展示 URL）视为「不修改」。
+ */
+function sanitizeCoverInput(value: unknown): string | null {
+  if (value === undefined) return null
+  if (typeof value !== 'string') return null
+  const raw = value.trim()
+  if (raw === '') return ''
+  if (raw.indexOf('/api/novels/cover') !== -1) return null
+  if (/^https?:\/\//i.test(raw)) return raw
+  if (raw.startsWith('data:image/')) return raw.length <= 6 * 1024 * 1024 ? raw : null
+  return resolveInsideBase(LOCAL_DATA_DIR, raw) ? raw : null
 }
 
 // 作品条目结构
@@ -187,7 +192,7 @@ export async function GET(request: NextRequest) {
         }
       })
     } catch (_e) {
-      /* DB 读取失败时静默降级，仅使用 FS */
+      console.error('[novels] 读取 Prisma DB 作品列表失败，降级仅用 FS:', _e)
     }
 
     // 合并 FS 和 DB 作品，FS 优先覆盖 DB（保持原有行为）
@@ -366,7 +371,8 @@ export async function POST(request: NextRequest) {
         userVipTier = dbUser.subscriptionTier || 'free'
 
         // VIP过期检查（仅对限时会员生效，永久会员不会过期）
-        const isTimeLimited = userVipTier === 'pro' || userVipTier === 'monthly' || userVipTier === 'quarterly' || userVipTier === 'annual'
+        // 🔥 Bug修复：此前缺 yearly/lifetime（管理端可写入这两个 tier），过期 yearly 被永远当 VIP
+        const isTimeLimited = userVipTier === 'pro' || userVipTier === 'monthly' || userVipTier === 'quarterly' || userVipTier === 'annual' || userVipTier === 'yearly'
         if (isTimeLimited && dbUser.subscriptionExpiresAt) {
           const nowTime = new Date()
           const expireTime = new Date(dbUser.subscriptionExpiresAt)
@@ -433,9 +439,11 @@ export async function POST(request: NextRequest) {
     cover: reqBody.coverUrl || undefined
   }
 
-  const allBooks = loadNovelBooks()
-  allBooks.unshift(newBook)
-  saveNovelBooks(allBooks)
+  await runExclusive(NOVEL_BOOK_FILE, async () => {
+    const allBooks = loadNovelBooks()
+    allBooks.unshift(newBook)
+    saveNovelBooks(allBooks)
+  })
 
   // 🔥 保存章节文件：若有AI生成的章节则保存，否则不创建默认占位章节（由 PATCH /api/chapters 后续补全）
   try {
@@ -556,38 +564,56 @@ export async function PUT(request: NextRequest) {
     return NextResponse.json({ error: '请先登录' }, { status: 401 })
   }
 
-  const allBooks = loadNovelBooks()
+  return await runExclusive(NOVEL_BOOK_FILE, async () => {
+    const allBooks = loadNovelBooks()
 
-  let foundIdx = -1
-  for (let i = 0; i < allBooks.length; i++) {
-    if (allBooks[i].id === reqBody.id) {
-      foundIdx = i
-      break
+    let foundIdx = -1
+    for (let i = 0; i < allBooks.length; i++) {
+      if (allBooks[i].id === reqBody.id) {
+        foundIdx = i
+        break
+      }
     }
-  }
 
-  if (foundIdx === -1) {
-    return NextResponse.json({ error: '作品不存在' }, { status: 404 })
-  }
-
-  // 仅作品所有者或管理员可修改（管理员专属知名小说禁止普通用户修改）
-  const bookEntry: NovelBookEntry & { userId?: string } = allBooks[foundIdx]
-  if (!actor.isAdmin) {
-    if (isAdminOnlyNovel(String(bookEntry.id))) {
-      return NextResponse.json({ error: '无权修改此作品' }, { status: 403 })
+    if (foundIdx === -1) {
+      return NextResponse.json({ error: '作品不存在' }, { status: 404 })
     }
-    if (bookEntry.userId && String(bookEntry.userId) !== String(actor.userId)) {
-      return NextResponse.json({ error: '无权修改他人作品' }, { status: 403 })
+
+    // 仅作品所有者或管理员可修改（管理员专属知名小说禁止普通用户修改）
+    const bookEntry: NovelBookEntry & { userId?: string } = allBooks[foundIdx]
+    if (!actor.isAdmin) {
+      if (isAdminOnlyNovel(String(bookEntry.id))) {
+        return NextResponse.json({ error: '无权修改此作品' }, { status: 403 })
+      }
+      if (bookEntry.userId && String(bookEntry.userId) !== String(actor.userId)) {
+        return NextResponse.json({ error: '无权修改他人作品' }, { status: 403 })
+      }
     }
-  }
 
-  if (reqBody.cover !== undefined || reqBody.coverUrl !== undefined) {
-    reqBody.coverUpdatedAt = Date.now()
-  }
-  allBooks[foundIdx] = Object.assign({}, allBooks[foundIdx], reqBody)
-  saveNovelBooks(allBooks)
+    if (reqBody.cover !== undefined || reqBody.coverUrl !== undefined) {
+      reqBody.coverUpdatedAt = Date.now()
+    }
+    // 🔥 修复（P0）：Object.assign(目标, reqBody) 无字段约束，任何登录用户可
+    //   ① 改写 id/userId 等归属字段越权，② 把 cover 写成绝对路径借封面接口读服务器文件。
+    const FORBIDDEN_PATCH = ['id', 'userId', 'user_id', 'ownerId', 'isAdmin', 'isAdminOnly', 'role', 'password', 'created_at', 'createdAt']
+    const patchBody: Record<string, unknown> = {}
+    Object.keys(reqBody).forEach(function (k) {
+      if (FORBIDDEN_PATCH.indexOf(k) !== -1) return
+      patchBody[k] = (reqBody as Record<string, unknown>)[k]
+    })
+    const cleanedCover = sanitizeCoverInput(patchBody.cover)
+    if (cleanedCover === null) delete patchBody.cover
+    else patchBody.cover = cleanedCover
+    if (patchBody.coverUrl !== undefined) {
+      const cleanedUrl = sanitizeCoverInput(patchBody.coverUrl)
+      if (cleanedUrl === null) delete patchBody.coverUrl
+      else patchBody.coverUrl = cleanedUrl
+    }
+    allBooks[foundIdx] = Object.assign({}, allBooks[foundIdx], patchBody)
+    saveNovelBooks(allBooks)
 
-  return NextResponse.json({ data: allBooks[foundIdx] })
+    return NextResponse.json({ data: allBooks[foundIdx] })
+  })
 }
 
 // 删除作品及其章节（修复 v4 C7：补充权限校验，仅作品所有者或管理员可删除）
@@ -605,34 +631,87 @@ export async function DELETE(request: NextRequest) {
     return NextResponse.json({ error: '请先登录' }, { status: 401 })
   }
 
-  const allBooks = loadNovelBooks()
+  return await runExclusive(NOVEL_BOOK_FILE, async () => {
+    const allBooks = loadNovelBooks()
 
-  // 先找到作品校验权限
-  const targetBook: (NovelBookEntry & { userId?: string }) | undefined = (allBooks as Array<NovelBookEntry & { userId?: string }>).find((b) => b.id === bookId)
-  if (!targetBook) {
-    return NextResponse.json({ error: '作品不存在' }, { status: 404 })
-  }
-  if (!actor.isAdmin) {
-    if (isAdminOnlyNovel(String(bookId))) {
-      return NextResponse.json({ error: '无权删除此作品' }, { status: 403 })
+    // 先找到作品校验权限
+    const targetBook: (NovelBookEntry & { userId?: string }) | undefined = (allBooks as Array<NovelBookEntry & { userId?: string }>).find((b) => b.id === bookId)
+    if (!targetBook) {
+      return NextResponse.json({ error: '作品不存在' }, { status: 404 })
     }
-    if (targetBook.userId && String(targetBook.userId) !== String(actor.userId)) {
-      return NextResponse.json({ error: '无权删除他人作品' }, { status: 403 })
+    if (!actor.isAdmin) {
+      if (isAdminOnlyNovel(String(bookId))) {
+        return NextResponse.json({ error: '无权删除此作品' }, { status: 403 })
+      }
+      if (targetBook.userId && String(targetBook.userId) !== String(actor.userId)) {
+        return NextResponse.json({ error: '无权删除他人作品' }, { status: 403 })
+      }
     }
-  }
 
-  const keptBooks = []
-  for (let i = 0; i < allBooks.length; i++) {
-    if (allBooks[i].id !== bookId) {
-      keptBooks.push(allBooks[i])
+    const keptBooks = []
+    for (let i = 0; i < allBooks.length; i++) {
+      if (allBooks[i].id !== bookId) {
+        keptBooks.push(allBooks[i])
+      }
     }
-  }
-  saveNovelBooks(keptBooks)
+    // 捕获封面本地路径（删除前），用于清理孤儿封面文件
+    const _coverVal = (targetBook as Record<string, unknown>).cover || (targetBook as Record<string, unknown>).coverUrl || ''
+    const _coverStr = typeof _coverVal === 'string' ? _coverVal : ''
 
-  const chapterDir = join(LOCAL_DATA_DIR, 'chapters', bookId + '.json')
-  if (existsSync(chapterDir)) {
-    unlinkSync(chapterDir)
-  }
+    saveNovelBooks(keptBooks)
 
-  return NextResponse.json({ runCheckTag: true })
+    // 2) 删除章节文件
+    const chapterDir = join(LOCAL_DATA_DIR, 'chapters', bookId + '.json')
+    if (existsSync(chapterDir)) {
+      try { unlinkSync(chapterDir) } catch (_e) { /* 忽略 */ }
+    }
+
+    // 3) 删除 settings.json 中该作品的设定数据
+    const settingsFile = join(LOCAL_DATA_DIR, 'settings.json')
+    if (existsSync(settingsFile)) {
+      try {
+        const allSettings = JSON.parse(readFileSync(settingsFile, 'utf-8'))
+        if (allSettings && typeof allSettings === 'object' && allSettings[bookId]) {
+          delete allSettings[bookId]
+          atomicWriteJson(settingsFile, allSettings)
+        }
+      } catch (_e) { /* 忽略 */ }
+    }
+
+    // 4) 删除 volumes.json 中该作品的卷数据
+    const volumesFile = join(LOCAL_DATA_DIR, 'volumes.json')
+    if (existsSync(volumesFile)) {
+      try {
+        const allVolumes = JSON.parse(readFileSync(volumesFile, 'utf-8'))
+        if (allVolumes && typeof allVolumes === 'object' && allVolumes[bookId]) {
+          delete allVolumes[bookId]
+          atomicWriteJson(volumesFile, allVolumes)
+        }
+      } catch (_e) { /* 忽略 */ }
+    }
+
+    // 5) 删除 characters.json 中该作品的人物数据
+    const charactersFile = join(LOCAL_DATA_DIR, 'characters.json')
+    if (existsSync(charactersFile)) {
+      try {
+        const allChars = JSON.parse(readFileSync(charactersFile, 'utf-8'))
+        if (allChars && typeof allChars === 'object' && allChars[bookId]) {
+          delete allChars[bookId]
+          atomicWriteJson(charactersFile, allChars)
+        }
+      } catch (_e) { /* 忽略 */ }
+    }
+
+    // 6) 清理孤儿封面文件（仅当封面是容器内本地相对路径时）
+    if (_coverStr && !_coverStr.startsWith('data:') && !/^https?:\/\//i.test(_coverStr)) {
+      try {
+        const coverAbs = resolveInsideBase(LOCAL_DATA_DIR, _coverStr)
+        if (coverAbs && existsSync(coverAbs)) {
+          unlinkSync(coverAbs)
+        }
+      } catch (_e) { /* 忽略 */ }
+    }
+
+    return NextResponse.json({ success: true, runCheckTag: true })
+  })
 }

@@ -143,8 +143,9 @@ export default function ReferencePage() {
 
   // 筛选作品
   const filteredNovels = userNovels.filter((n) => {
-    const matchesSearch = n.title.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      n.genre.toLowerCase().includes(searchQuery.toLowerCase())
+    // 🔥 修复：genre 在库里可为 null，旧写法会让整页抛 TypeError 白屏
+    const matchesSearch = String(n.title || '').toLowerCase().includes(searchQuery.toLowerCase()) ||
+      String(n.genre || '').toLowerCase().includes(searchQuery.toLowerCase())
     return matchesSearch
   })
 

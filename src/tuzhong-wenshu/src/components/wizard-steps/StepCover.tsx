@@ -92,14 +92,29 @@ export default function StepCover({
           if (genre.indexOf('武侠') >= 0) candidates.push('江湖路远，剑指天涯')
           candidates.push('热血开局，逆天改命')
         }
-        const orig = (synopsis.coreGoldenQuote || idea.tagline || hook || '').toString().replace(/[。！？!?…—-\s"''""（）()【】\[\]]/g, '').slice(0, 18)
-        if (orig.length >= 8) candidates.unshift(orig)
+        // 🔥 QA-封面修复：副标题必须是「宣传金句」，不再盲目截取 tagline/hook 前 18 字
+        //   （旧逻辑曾把详细设定长句截断当金句：「现代程序员雨田诺魂穿1645年二月，」）
+        //   取值优先级：简介金句字段 → 灵感金句字段 → 通过「金句体检」的短 tagline/hook → 按题材合成 → 默认
+        var _cleanSlogan = function(v: unknown): string { return String(v || '').replace(/[。！？!?…—\s"''""（）()【】\[\]《》<>]/g, '') }
+        var _sloganBad = /魂穿|穿越|重生|附身|转世|借尸|穿到|回到|公元|现代|程序员|社畜|打工人|开局.*[0-9一二三四五六七八九十]+年/
+        var _quoteOk = function(v: unknown): boolean {
+          var s = _cleanSlogan(v)
+          return s.length >= 6 && s.length <= 18 && !_sloganBad.test(s)
+        }
+        const quoteMain = _cleanSlogan(synopsis.coreGoldenQuote || (idea as Record<string, unknown>).coreGoldenQuote || '')
+        const tagCand = _cleanSlogan(idea.tagline || '')
+        const hookCand = _cleanSlogan(hook)
+        if (quoteMain.length >= 6) candidates.unshift(quoteMain.length <= 24 ? quoteMain : quoteMain.slice(0, 18))
+        else {
+          if (_quoteOk(tagCand)) candidates.unshift(tagCand)
+          if (_quoteOk(hookCand)) candidates.unshift(hookCand)
+        }
         for (let ci = 0; ci < candidates.length; ci++) {
           let s = String(candidates[ci] || '')
           s = s.replace(/[\s"'""（）()【】\[\]《》<>]/g, '').slice(0, 18)
           if (s.length >= 6) { gq = s; break }
         }
-        if (!gq && hook) gq = String(hook).replace(/[。！？!?…—\s"'""（）()【】\[\]《》<>]/g, '').slice(0, 18)
+        if (!gq && hook && !_sloganBad.test(_cleanSlogan(hook))) gq = _cleanSlogan(hook).slice(0, 18)
         if (!gq) gq = '热血逆袭，一战封神'
       } catch (_se) {
         gq = (synopsis.coreGoldenQuote || idea.hook || idea.tagline || '热血逆袭，一战封神').toString()
@@ -509,11 +524,15 @@ export default function StepCover({
         {showCustomDesign && (
           <div className="mt-4 space-y-4">
             <div>
-              <label className="block text-sm font-medium text-stone-600 mb-2">自定义封面描述</label>
+              <label className="block text-sm font-medium text-stone-600 mb-2">自定义封面描述 <span className="text-xs text-stone-400">（留空则按下方本书元素自动构建）</span></label>
               <textarea
                 value={customPrompt}
                 onChange={(e) => setCustomPrompt(e.target.value)}
-                placeholder="基于本作主角设定/世界观/金手指描述你想要的封面画面（主角外貌+核心道具+场景氛围）"
+                placeholder={'例：' + [
+                  (characters?.protagonist?.name || '主角') + '立于',
+                  String(worldbuilding.mainLocation || worldbuilding.era || '关键场景'),
+                  '之巅，' + String((generatedData as Record<string, unknown>)?.goldenfinger && ((generatedData as Record<string, unknown>).goldenfinger as Record<string, unknown>)?.name || '金手指') + '光华笼罩四方',
+                ].join('') + '（可自由改写画面构成）'}
                 rows={3}
                 className="w-full px-3 py-2 border border-stone-300 rounded-lg focus:ring-2 focus:ring-stone-400 focus:border-stone-400 resize-none"
               />
@@ -679,12 +698,19 @@ function buildCoverPrompt(genre: string, title: string, era: string, protagonist
   else genrePrompt = 'fantasy world, dramatic cinematic composition, awe inspiring central element, volumetric god rays, legendary atmosphere, movie poster quality'
 
   let protagonistDetail = ''
-  if (protagonistName) {
+  // 🔥 QA-封面修复：不再「总是出现人物因素」——按书名哈希轮换 人物主视觉/场景主视觉 两种构图；
+  //   历史/玄幻/仙侠/科幻等场景型题材固定场景主视觉（番茄爆款封面以大场景+氛围为主，人物非必需）。
+  const _sceneFirstGenres = ['历史', '王朝', '争霸', '军事', '战争', '科幻', '星际', '末世', '末日', '种田', '经营']
+  const _isSceneFirstGenre = _sceneFirstGenres.some(function (gk) { return g.indexOf(gk) >= 0 })
+  let _personHash = 0
+  for (let _phi = 0; _phi < (title || '').length; _phi++) { _personHash = (_personHash * 31 + (title || '').charCodeAt(_phi)) >>> 0 }
+  const _includePerson = !_isSceneFirstGenre && (_personHash % 2 === 1)
+  if (protagonistName && _includePerson) {
     let protoGender = 'male'
     try {
       const gnList = ['雪','月','柔','婉','婷','怡','欣','妍','嫣','妤','萱','瑶','诗','涵','薇','晴','梦','兰','凤','姬','嫣','绫','纱','芸','若','双','儿','灵','珊','珠','翠','柳','桃','荷','莲','菊','桂','芝','玉','华','秀','娟','英','慧','敏']
       for (let _gi = 0; _gi < gnList.length; _gi++) { if (protagonistName.indexOf(gnList[_gi]) >= 0) { protoGender = 'female'; break } }
-    } catch (_e) {}
+    } catch (_e) { console.error('[StepCover] 主角性别推断失败:', _e) }
     if (g.indexOf('玄幻') >= 0 || g.indexOf('仙侠') >= 0) {
       protagonistDetail = protoGender === 'female'
         ? ', heroic female cultivator protagonist in center, holding a glowing spirit sword, celestial silk robe flowing, eyes sharp with determined intent, long hair dancing in spirit wind'
@@ -704,6 +730,9 @@ function buildCoverPrompt(genre: string, title: string, era: string, protagonist
     } else {
       protagonistDetail = ', protagonist figure in center with compelling stance, eyes conveying core emotion of the story'
     }
+  } else if (protagonistName && !_includePerson) {
+    // 场景主视觉：明确告知生图模型不要以人物为中心
+    protagonistDetail = ', no prominent human figures, epic scene-focused composition, atmosphere and world-building as the true protagonist of the artwork'
   }
 
   const mainColor = colorScheme.colors?.[0] || '#d4a017'

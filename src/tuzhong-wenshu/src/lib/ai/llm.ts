@@ -4,6 +4,8 @@
 //       百川智能、零一万物、MiniMax、阶跃星辰、腾讯混元、字节豆包
 //       Ollama、LM Studio、vLLM（本地部署）
 import crypto from 'crypto'
+// 🔥 2026-10-25 T6：模型响应正文抽取（商汤 reasoning 回退 + think 剥离）
+import { extractModelText, describeModelText } from './oh-story/model-response'
 
 // 🔥 防崩溃安全网：单条 AI 请求（如 undici socket 错误、本地 Ollama 推理异常、限流重置连接）
 // 不得拖垮整个 dev server。捕获未处理异常/拒绝，仅记录日志、绝不退出进程。
@@ -24,6 +26,12 @@ export interface LLMConfig {
   baseUrl?: string  // 自定义API地址
   model: string     // 模型名称
   isImageModel?: boolean  // 🔥 绘图/图像模型标记（动态兜底池需过滤掉）
+  // 🔥 2026-10-17：付费模型标记（models.json 注入），动态兜底池会过滤 isPaid===true 的项
+  isPaid?: boolean
+  // 🔥 2026-09-23：opt-in 按模型频率限制（仅 OpenVeer 等免费中转配置）。
+  //   与全局 _providerRateLimitEnabled 解耦——用户要求"所有模型不要限流"，故仅当本字段存在时才生效，
+  //   用于尊重免费中转硬配额（10/分、100/时、1200/天），避免 429 浪费调用。
+  rateLimit?: { perMinute?: number; perHour?: number; perDay?: number }
 }
 
 export interface LLMMessage {
@@ -33,19 +41,113 @@ export interface LLMMessage {
 
 // 🔥 仿写保护：当前请求级别的"严禁抄袭原著名"约束（由 route.ts 在每个 /api/ai-generate 请求开始时设置）。
 // callLLMWithFallback 在每次调用的【同步起点】将其注入到 system 消息，从而对【所有环节】（idea/worldbuilding/characters/...）
-// 生效，而不再仅限于 content 步。用模块级变量 + 同步捕获，避免并发请求串扰。
-let _imitateGuard = ''
-export function setImitateGuard(guard: string) {
-  _imitateGuard = guard || ''
+// 生效，而不再仅限于 content 步。
+// ⚠️ 并发修复（P2 #7）：原先使用模块级变量 _imitateGuard / _extraFallbackPool，多个并发 /api/ai-generate 请求
+//   在同一 worker 内会互相串扰（请求 B 的 setImitateGuard 覆盖请求 A 的，A 的后续异步 callLLMWithFallback 读到 B 的值）。
+//   改用「请求级上下文」隔离：上下文由服务端专用模块（llm-request-ctx.ts，内部用 AsyncLocalStorage）注入，
+//   该模块仅被 server route 引入，不会进入客户端 bundle；llm.ts 本身只通过 _setLLMContextProvider 读取，
+//   无 Node 内置模块依赖，故仍可被 style/page.tsx 等客户端组件安全引用。无 provider 时回落到模块兜底变量。
+export interface LLMRequestContext {
+  imitateGuard: string
+  extraFallbackPool: LLMConfig[]
 }
 
-// 🔥 2026-08-30：动态兜底池。由 route 每次请求把用户 models.json 里的模型（含付费稳定的
-//   deepseek-v4-flash、OpenRouter 免费档）注入进来，作为 callLLMWithFallback 静态池
-//   （硅基流动/智谱/讯飞）之后的【最后兜底】。解决智谱 RPM 冷却 + 硅基流动 Key 401 +
-//   Ollama 停用 时整条链无可用模型 → 500 的问题。
-let _extraFallbackPool: LLMConfig[] = []
+// 非请求上下文包裹调用（如其它 route 直接调 callLLMWithFallback）的兜底，保持向后兼容
+let _imitateGuardFallback = ''
+let _extraFallbackPoolFallback: LLMConfig[] = []
+
+// 上下文提供方：由服务端模块 llm-request-ctx.ts 注入（基于 AsyncLocalStorage）。
+// 客户端无此注入，currentLLMContext 自动回落到模块兜底变量。
+let _ctxProvider: (() => LLMRequestContext | null) | null = null
+export function _setLLMContextProvider(p: (() => LLMRequestContext | null) | null): void {
+  _ctxProvider = p
+}
+
+export function setImitateGuard(guard: string) {
+  if (_ctxProvider) {
+    const s = _ctxProvider()
+    if (s) { s.imitateGuard = guard || ''; return }
+  }
+  _imitateGuardFallback = guard || ''
+}
 export function setExtraFallbackPool(list: LLMConfig[]) {
-  _extraFallbackPool = Array.isArray(list) ? list : []
+  if (_ctxProvider) {
+    const s = _ctxProvider()
+    if (s) { s.extraFallbackPool = Array.isArray(list) ? list : []; return }
+  }
+  _extraFallbackPoolFallback = Array.isArray(list) ? list : []
+}
+// 供 callLLMWithFallback 读取当前请求上下文（provider 优先，回落模块兜底）
+function currentLLMContext(): LLMRequestContext {
+  if (_ctxProvider) {
+    const s = _ctxProvider()
+    if (s) return s
+  }
+  return { imitateGuard: _imitateGuardFallback, extraFallbackPool: _extraFallbackPoolFallback }
+}
+
+// ============================================================
+// 🔥 2026-10-21 兜底链 Key 校正
+// ------------------------------------------------------------
+// 背景：.env.local 里的 SILICONFLOW_API_KEY 是【占位符】（your...），
+//   而 llm.ts 的静态兜底池（SILICONFLOW_MODELS/ZHIPU_MODELS）用的正是 env 变量，
+//   一旦命中就返回 401「Token is invalid」，白白耗掉一次尝试与一次重试。
+//   真实 Key 只存在于 .tuzhong-data/models.json（管理员/用户配置的模型条目）。
+// 方案：兜底链里每个模型都按 provider+model 去 models.json 取真 Key；
+//   取不到才退回 env Key；env Key 明显是占位符（your_/sk-xxx_your）则跳过该模型。
+// ============================================================
+let _modelsJsonCache: { at: number; list: any[] } | null = null
+function _readModelsJson(): any[] {
+  const now = Date.now()
+  if (_modelsJsonCache && now - _modelsJsonCache.at < 20000) return _modelsJsonCache.list
+  let list: any[] = []
+  try {
+    const fs2 = require('fs')
+    const path2 = require('path')
+    const p = path2.join(process.cwd(), '.tuzhong-data', 'models.json')
+    if (fs2.existsSync(p)) {
+      const parsed = JSON.parse(fs2.readFileSync(p, 'utf8'))
+      list = Array.isArray(parsed) ? parsed : (parsed && parsed.models) || []
+    }
+  } catch (_e) { list = [] }
+  _modelsJsonCache = { at: now, list }
+  return list
+}
+
+/** 占位符 Key 判定：env 里填了但明显不是真 Key */
+function _isPlaceholderKey(k: string): boolean {
+  const s = String(k || '').trim()
+  if (!s) return true
+  if (s.indexOf('*') >= 0) return true
+  if (/^your/i.test(s)) return true
+  if (/your_api_key|yourkey|your-key|placeholder|填入|请填/i.test(s)) return true
+  return false
+}
+
+/** 按 provider+model 从 models.json 取真实 Key */
+function _realKeyFor(provider: string, model: string): string {
+  try {
+    const np = normalizeProviderName(String(provider || ''))
+    const nm = String(model || '').trim()
+    const hit = _readModelsJson().find(function (x: any) {
+      if (!x || x.isPaid === true) return false
+      const k = String(x.apiKey || '').replace(/[`'"]/g, '').trim()
+      if (!k || k.indexOf('*') >= 0) return false
+      if (String(x.model || '').trim() !== nm) return false
+      return normalizeProviderName(String(x.provider || '')) === np
+    })
+    if (hit) return String(hit.apiKey).replace(/[`'"]/g, '').trim()
+  } catch (_e) { /* 忽略 */ }
+  return ''
+}
+
+/** 兜底链条目的有效 Key：models.json 真 Key 优先；env 占位符视为无效 */
+function _effectiveFallbackKey(provider: string, model: string, envKey?: string): string | undefined {
+  const real = _realKeyFor(provider, model)
+  if (real) return real
+  const e = String(envKey || '').replace(/[`'"]/g, '').trim()
+  if (_isPlaceholderKey(e)) return undefined
+  return e || undefined
 }
 
 // 🔥🔥🔥 2026-09-02 模型健康表：限流/鉴权/超时/空内容等失败计入冷却，
@@ -312,25 +414,26 @@ function _resolveModelIdFromConfig(config: LLMConfig): string {
 // ⚠️ 进程级限制：对单实例 Node 部署精确生效；若未来多实例水平扩展，
 //    需改为 Redis 等共享存储的分发式限流。
 // ============================================================
-// 🔥 2026-08-30：内部 provider 限流/冷却总开关。默认 false = 不限流（用户要求所有配置
-//   成功的大模型都不要限流）。若将来需要重新启用防重试螺旋，置 true 即可。
-let _providerRateLimitEnabled = false
+// 🔥 2026-08-30：内部 provider 限流/冷却总开关。默认 true = 按 provider 控制出站频率，
+//   避免免费档（智谱/硅基流动）账户级"您的账户已达到速率限制"。
+//   如需完全关闭（不推荐），设置环境变量 AI_RATE_GATE=0。
+let _providerRateLimitEnabled = process.env.AI_RATE_GATE !== '0'
 const _PROVIDER_RATE_LIMIT = {
   calls: {} as Record<string, number[]>,        // providerKey -> 最近调用时间戳(ms)
   cooldownUntil: {} as Record<string, number>,  // providerKey -> 冷却截止(ms)
 }
 const _PROVIDER_MAX_RPM: Record<string, number> = {
-  '硅基流动': 4,
-  'siliconflow': 4,
-  '智谱': 3,
-  '智谱glm': 3,
-  'zhipu': 3,
+  '硅基流动': 6,
+  'siliconflow': 6,
+  '智谱': 5,
+  '智谱glm': 5,
+  'zhipu': 5,
   // 🔥 2026-08-30：付费 DeepSeek 是并行正文(content)主模型，一批 5 路并发，
   //   默认 4/min 会掐掉第 5 路 → 提额到 30/min，保证批次并行不被自家闸门限流。
   'deepseek': 30,
   '深度求索': 30,
   // OpenRouter 免费档：中等额度，供动态兜底池与并行使用
-  'openrouter': 20,
+  'openrouter': 15,
 }
 const _RATE_LIMIT_WINDOW_MS = 60_000
 const _RATE_LIMIT_DEFAULT_RPM = 4
@@ -357,9 +460,9 @@ function _rateLimitShouldSkip(provider?: string): boolean {
 
 // 在每次出站请求前调用：保证同 provider 不超 RPM，且尊重 429 冷却
 async function _acquireProviderRateLimit(provider?: string): Promise<void> {
-  // 🔥 2026-08-30 用户要求：所有配置成功的大模型都不要限流。默认关闭内部按 provider 的
-  //   RPM/冷却闸门——每个已配置模型都直接发起真实调用；若真命中 provider 429，
-  //   callLLM 仍会抛 RATE_LIMIT 并由 callLLMWithFallback 自动切下一个模型兜底。
+  // 🔥 2026-10-24：默认开启（AI_RATE_GATE=0 可关闭）。免费档（智谱/硅基流动）账户级
+  //   "您的账户已达到速率限制"就是这个闸门要解决的目标：同 provider 出站先排队，
+  //   命中 429 后该 provider 进入冷却并自动切下一个模型兜底。
   if (!_providerRateLimitEnabled) return
   if (_rateLimitShouldSkip(provider)) return
   const key = _rateLimitProviderKey(provider)
@@ -403,7 +506,9 @@ function _registerRateLimitCooldown(provider?: string, retryAfterSec?: number): 
   if (!_providerRateLimitEnabled) return
   if (_rateLimitShouldSkip(provider)) return
   const key = _rateLimitProviderKey(provider)
-  const coolSec = Math.max(Number(retryAfterSec) || 0, 8)
+  // 🔥 2026-10-24：最短冷却从 8s 提到 20s。免费档的限额窗口通常按分钟计，
+  //   8s 后立刻重试几乎必然再撞 429，会把 fallback 链拖成"每次都要撞一次"。
+  const coolSec = Math.max(Number(retryAfterSec) || 0, 20)
   const coolMs = Math.min(coolSec * 1000, 120_000)
   const until = Date.now() + coolMs
   if (!_PROVIDER_RATE_LIMIT.cooldownUntil[key] || _PROVIDER_RATE_LIMIT.cooldownUntil[key] < until) {
@@ -412,12 +517,156 @@ function _registerRateLimitCooldown(provider?: string, retryAfterSec?: number): 
   console.warn('[限流闸门] provider=' + key + ' 命中 429，冷却至 ' + new Date(until).toISOString() + ' (retryAfter=' + retryAfterSec + 's)')
 }
 
+// 🔥 2026-10-24：按 provider 的在途并发上限。仅靠 RPM 挡不住"账户级速率限制"——
+//   5 个并发请求在 1 分钟内只算 5 次，但免费档的并发配额往往只有 1-2。
+//   这里对每次真实出站做"槽位占用"，超出上限的请求排队等待，回来后释放。
+const _PROVIDER_MAX_CONCURRENCY: Record<string, number> = {
+  '硅基流动': 2,
+  'siliconflow': 2,
+  // 🔥 2026-10-24 实测：智谱免费档并发配额极窄，两次请求几乎同时到达即返回
+  //   {"code":1302,"message":"您的账户已达到速率限制，请您控制请求频率"}，
+  //   因此并发锁死为 1，并配合下面的最小间隔做串行化。
+  '智谱glm': 1,
+  'zhipu': 1,
+  // 🔥 付费 DeepSeek 是正文并行主模型（一批 5 路并发），并发槽位放宽到 12，避免排队误切模型
+  'deepseek': 12,
+  '深度求索': 12,
+  'openrouter': 4,
+}
+// 同一 provider 两次出站之间的最小间隔（毫秒）：避免免费档"请求过于频繁"的瞬时打点
+const _PROVIDER_MIN_GAP_MS: Record<string, number> = {
+  '智谱glm': 4000,
+  '硅基流动': 1500,
+  'openrouter': 1000,
+}
+const _PROVIDER_LAST_START: Record<string, number> = {}
+const _RATE_LIMIT_DEFAULT_CONCURRENCY = 3
+const _PROVIDER_INFLIGHT: Record<string, number> = {}
+const _PROVIDER_WAITERS: Record<string, Array<() => void>> = {}
+
+function _maxConcurrency(provider?: string): number {
+  const k = _rateLimitProviderKey(provider)
+  return _PROVIDER_MAX_CONCURRENCY[k] != null ? _PROVIDER_MAX_CONCURRENCY[k] : _RATE_LIMIT_DEFAULT_CONCURRENCY
+}
+
+/** 占用一个并发槽位，返回释放函数（必须在 finally 中调用，避免槽位泄漏） */
+async function _acquireProviderConcurrency(provider?: string): Promise<() => void> {
+  const noop = function () {}
+  if (!_providerRateLimitEnabled) return noop
+  if (_rateLimitShouldSkip(provider)) return noop
+  const key = _rateLimitProviderKey(provider)
+  const max = _maxConcurrency(provider)
+  const releaseSlot = function () {
+    _PROVIDER_INFLIGHT[key] = Math.max(0, (_PROVIDER_INFLIGHT[key] || 1) - 1)
+    const q = _PROVIDER_WAITERS[key]
+    if (q && q.length) { const next = q.shift(); if (next) next() }
+  }
+  if ((_PROVIDER_INFLIGHT[key] || 0) < max) {
+    _PROVIDER_INFLIGHT[key] = (_PROVIDER_INFLIGHT[key] || 0) + 1
+  } else {
+    // 槽位已满：排队，等前一个请求释放（上限 120s，超时直接抛 RATE_LIMIT 让兜底链切模型）
+    await new Promise<void>((resolve, reject) => {
+      let done = false
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const grant = function () {
+        if (done) return
+        done = true
+        if (timer) clearTimeout(timer)
+        _PROVIDER_INFLIGHT[key] = (_PROVIDER_INFLIGHT[key] || 0) + 1
+        resolve()
+      }
+      if (!_PROVIDER_WAITERS[key]) _PROVIDER_WAITERS[key] = []
+      _PROVIDER_WAITERS[key].push(grant)
+      timer = setTimeout(function () {
+        if (done) return
+        done = true
+        const q = _PROVIDER_WAITERS[key] || []
+        const i = q.indexOf(grant)
+        if (i >= 0) q.splice(i, 1)
+        reject(new Error('RATE_LIMIT: provider ' + key + ' 并发达上限，切下一模型'))
+      }, 120_000)
+    })
+  }
+  // 槽位到手后再执行最小间隔，保证免费档不会出现"两次请求几乎同时打点"
+  const gap = _PROVIDER_MIN_GAP_MS[key] || 0
+  if (gap > 0) {
+    const wait = (_PROVIDER_LAST_START[key] || 0) + gap - Date.now()
+    if (wait > 0) await new Promise(function (r) { setTimeout(r, Math.min(wait, gap)) })
+  }
+  _PROVIDER_LAST_START[key] = Date.now()
+  return releaseSlot
+}
+
+// 🔥 2026-09-23：按模型（opt-in）速率限制。仅当 LLMConfig 携带 rateLimit 字段时生效，
+// 与全局 _providerRateLimitEnabled 完全解耦——不影响其它模型，仅尊重 OpenVeer 等免费中转硬配额
+//（10/分、100/时、1200/天），超出则等待或放弃该模型让兜底链切下一模型。
+const _MODEL_RATE_LIMIT: Record<string, { minute: number[]; hour: number[]; day: number[] }> = {}
+const _MODEL_RL_WINDOW = { minute: 60_000, hour: 3_600_000, day: 86_400_000 }
+const _MODEL_RL_WAIT_CAP_MS = 60_000 // 单模型频限最多等 60s，过久则放弃该模型
+
+function _modelRateLimitKey(cfg?: LLMConfig): string {
+  if (!cfg) return ''
+  return (normalizeProviderName(cfg.provider || '') + '|' + (cfg.model || '')).toLowerCase()
+}
+
+async function _acquireModelRateLimit(cfg?: LLMConfig): Promise<void> {
+  if (!cfg || !cfg.rateLimit) return
+  const rl = cfg.rateLimit
+  const key = _modelRateLimitKey(cfg)
+  if (!key) return
+  if (!_MODEL_RATE_LIMIT[key]) _MODEL_RATE_LIMIT[key] = { minute: [], hour: [], day: [] }
+  const b = _MODEL_RATE_LIMIT[key]
+  const _clean = function (arr: number[], win: number) {
+    const t = Date.now()
+    while (arr.length && t - arr[0] > win) arr.shift()
+  }
+  _clean(b.minute, _MODEL_RL_WINDOW.minute); _clean(b.hour, _MODEL_RL_WINDOW.hour); _clean(b.day, _MODEL_RL_WINDOW.day)
+  // 预留本次名额（同步，单线程无 TOCTOU）
+  const now = Date.now()
+  b.minute.push(now); b.hour.push(now); b.day.push(now)
+  const deadline = Date.now() + _MODEL_RL_WAIT_CAP_MS
+  while (Date.now() < deadline) {
+    const t = Date.now()
+    _clean(b.minute, _MODEL_RL_WINDOW.minute); _clean(b.hour, _MODEL_RL_WINDOW.hour); _clean(b.day, _MODEL_RL_WINDOW.day)
+    const overMin = rl.perMinute != null && b.minute.length > rl.perMinute
+    const overHour = rl.perHour != null && b.hour.length > rl.perHour
+    const overDay = rl.perDay != null && b.day.length > rl.perDay
+    if (!overMin && !overHour && !overDay) return
+    const waits: number[] = []
+    if (overMin && b.minute.length) waits.push(b.minute[0] + _MODEL_RL_WINDOW.minute - t)
+    if (overHour && b.hour.length) waits.push(b.hour[0] + _MODEL_RL_WINDOW.hour - t)
+    if (overDay && b.day.length) waits.push(b.day[0] + _MODEL_RL_WINDOW.day - t)
+    const wait = Math.max(0, Math.min.apply(null, waits))
+    if (wait > 0) {
+      if (wait > _MODEL_RL_WAIT_CAP_MS) {
+        b.minute.pop(); b.hour.pop(); b.day.pop()
+        throw new Error('RATE_LIMIT: model ' + key + ' 频限超额，切下一模型')
+      }
+      await new Promise(function (r) { setTimeout(r, Math.min(wait, 1000)) })
+    }
+  }
+  // 兜底放行（避免永久阻塞），仅可能超限 1 笔，由 429 冷却兜底
+}
+
+// 🔥 2026-11-05 多 Key 轮询：apiKey 支持逗号/分号/换行分隔的多个 Key（同一 provider 多账号），
+//   进程内 round-robin 轮换——配额按 Key 计费时，N 个 Key ≈ N 倍配额。
+var _multiKeyRR: Record<string, number> = {}
+function _pickMultiKeyRoundRobin(rawKey: string, provider: string, model: string): string {
+  const parts = String(rawKey || '').split(/[,;\n]+/).map(function (s) { return s.trim() }).filter(function (s) { return s.length > 8 })
+  if (parts.length <= 1) return rawKey
+  const k = provider + '::' + model
+  const idx = (_multiKeyRR[k] = ((_multiKeyRR[k] || 0) + 1)) % parts.length
+  return parts[idx]
+}
 export async function callLLM(config: LLMConfig, messages: LLMMessage[], opts?: { maxTokens?: number; timeoutMs?: number; temperature?: number; topP?: number; presencePenalty?: number; frequencyPenalty?: number; step?: string }): Promise<string> {
-  const { apiKey, baseUrl, model } = config
+  const { baseUrl, model } = config
+  const apiKey = _pickMultiKeyRoundRobin(config.apiKey, normalizeProviderName(config.provider), model)
   const provider = normalizeProviderName(config.provider)
 
   // 🔥 全局按提供商限流闸门：免费档 SaaS 必须，所有出站请求统一在此排队（覆盖 base/fallback/跨平台/重试/跨步）
   await _acquireProviderRateLimit(provider)
+  // 🔥 2026-09-23：opt-in 按模型频率限制（仅 OpenVeer 等配置了 rateLimit 的模型）
+  await _acquireModelRateLimit(config)
 
   const maxTokens = opts?.maxTokens ?? 4096
   const __isJsonLlm = (() => {
@@ -504,6 +753,9 @@ export async function callLLM(config: LLMConfig, messages: LLMMessage[], opts?: 
           temperature: temperature,
           top_p: topP,
           num_predict: maxTokens,
+          // 🔥 #226P：Ollama 本地回落模型同样施加抗重复惩罚（主模型 glm-4-flash 已在 OpenAI body 透传，此处补齐回落护栏）
+          frequency_penalty: (typeof frequencyPenalty === 'number' ? frequencyPenalty : 0.6),
+          presence_penalty: (typeof presencePenalty === 'number' ? presencePenalty : 0.4),
           // 🔥 2026-08-10：deepseek-r1 在正文步关闭 thinking，避免推理链吃掉正文 token 预算
           ...((/deepseek-r1|r1:/i.test(model) && opts?.step === 'content') ? { think: false } : {}),
         },
@@ -517,7 +769,8 @@ export async function callLLM(config: LLMConfig, messages: LLMMessage[], opts?: 
     }
 
     const data = await response.json()
-    return data.message?.content || ''
+    // 🔥 2026-10-25 T6：本地推理模型同样可能把正文落在 reasoning
+    return String(data?.message?.content || data?.message?.reasoning || '')
   }
 
   if (!apiUrl) throw new Error('未配置API地址')
@@ -543,6 +796,33 @@ export async function callLLM(config: LLMConfig, messages: LLMMessage[], opts?: 
   if (/deepseek/i.test(model || '')) {
     bodyObj.thinking = { type: 'disabled' }
     console.log('[callLLM] DeepSeek 已禁用 thinking(推理)：' + model)
+  }
+  // 🔥 #194（2026-09-08）：sensenova-6.8 同为推理模型（思考在 message.reasoning 字段）。
+  //   带思考时对"字数守恒"类提示会数数螺旋（reasoning 2万+字符、单次 ~100s），关后 ~7s 出全量。
+  if (/sensenova/i.test(model || '')) {
+    bodyObj.thinking = { type: 'disabled' }
+    console.log('[callLLM] sensenova 已禁用 thinking(推理)：' + model)
+  }
+  // 🔥 2026-10-22：Qwen3 系过 thinking 时 reasoning tokens 挤占 max_tokens，
+  //   实测节拍表 JSON 在第1场 hook 处被截断（可见输出 ~400 字 vs maxTokens 3200）。
+  //   引擎内容型调用（step==='content'）禁用 thinking：JSON 一步到位、正文不再为思考付费。
+  if (/qwen3/i.test(model || '') && opts?.step === 'content') {
+    bodyObj.enable_thinking = false
+    console.log('[callLLM] Qwen3 已禁用 thinking(推理)：' + model)
+  }
+  // 🔥 2026-10-29 P0：智谱 glm 系在 content 步会先把「1. 分析需求 / 解决矛盾 / 起草策略 /
+  //   感官与情绪检查」这类构思稿写进正文：① 吃掉 max_tokens → 正文只剩 ~900 字
+  //   ② 污染正文首段（实测 ch1 输出 2131 字，前 11 段全是构思，正文从第 12 段才开始）。
+  //   在最后一条消息尾部追加硬禁止条文（不改任何创作要求，只禁构思/标记输出）。
+  if (opts?.step === 'content' && /glm/i.test(model || '')) {
+    const GLM_PROSE_GUARD = '\n\n【输出铁律·最高优先级】只输出小说正文本身，从第一句叙事开始。严禁输出任何分析、构思、提纲、节拍、起草策略、“分析需求”“解决矛盾”“感官与情绪检查”、字数统计或自我检查；严禁用 * 、# 、数字编号分条罗列；严禁在末尾单独标注节拍名（如“峰回路转”“高潮”）；严禁写任何括注批注（如“（开篇3行内切入冲突）”“（首段冲突：…）”“（主角博弈25%）”）。直接写正文。'
+    const _msgs = Array.isArray(messages) ? messages.slice() : []
+    if (_msgs.length) {
+      const _li = _msgs.length - 1
+      _msgs[_li] = { ..._msgs[_li], content: String(_msgs[_li].content || '') + GLM_PROSE_GUARD }
+      bodyObj.messages = _msgs
+    }
+    console.log('[callLLM] glm 正文步已追加禁构思护栏：' + model)
   }
   const requestBody = JSON.stringify(bodyObj)
 
@@ -577,15 +857,23 @@ export async function callLLM(config: LLMConfig, messages: LLMMessage[], opts?: 
   console.log('[callLLM] 调用: ' + model + ' | ' + provider + ' | timeout=' + timeoutMs + 'ms | temp=' + temperature + ' | topP=' + topP + ' | maxTokens=' + maxTokens + ' | presencePenalty=' + presencePenalty + ' | frequencyPenalty=' + frequencyPenalty)
 
   // 🔥 统一硅基模型接口参数（修复 v4 C8：使用 opts 传入的参数模板值）
+  // 🔥 2026-10-24：占一个 provider 并发槽位，避免免费档并发配额被打穿（"账户已达到速率限制"）
+  const _releaseSlot = await _acquireProviderConcurrency(provider)
   let response: Response
   try {
     response = await fetch(apiUrl + '/chat/completions', {
       method: 'POST',
       headers,
       body: requestBody,
+      // 🔥 2026-10-28：关闭 undici 默认 300s bodyTimeout/headersTimeout，避免慢速但存活的模型
+      //   流式响应在 300s 被网关式掐断成 fetch failed（看似超时实为 undici 硬限）。真正的请求
+      //   截止由 signal:AbortSignal.timeout(timeoutMs) 控制（content 步 200–300s，引擎总预算 28min）。
+      bodyTimeout: 0,
+      headersTimeout: 0,
       signal: AbortSignal.timeout(timeoutMs),
     })
   } catch (fetchErr: unknown) {
+    _releaseSlot()
     // 区分超时错误和网络错误
     const errName = fetchErr instanceof Error ? fetchErr.name : String(fetchErr)
     const errMsg = fetchErr instanceof Error ? fetchErr.message : String(fetchErr)
@@ -596,6 +884,7 @@ export async function callLLM(config: LLMConfig, messages: LLMMessage[], opts?: 
     console.error('[callLLM] 网络错误: ' + (errMsg || fetchErr))
     throw new Error('NETWORK_ERROR: ' + (errMsg || '网络请求失败'))
   }
+  _releaseSlot()
 
   if (!response.ok) {
     const errorText = await response.text()
@@ -607,8 +896,13 @@ export async function callLLM(config: LLMConfig, messages: LLMMessage[], opts?: 
     if (response.status === 404) {
       throw new Error('MODEL_NOT_FOUND: 模型 ' + model + ' 不存在或已下线')
     }
-    if (response.status === 429) {
-      // 🔥 尊重服务端 retryAfter（硅基流动/SiliconFlow 在 429 body 里带 retryAfter，单位秒），用于退避
+    // 🔥 2026-10-24：免费档的限流不一定用 429 返回——智谱 code 1305 有时挂在 400/500 body 里，
+    //   硅基流动也用非标准状态码。这里统一按错误文案识别，命中即登记 provider 冷却并切模型兜底，
+    //   避免把"您的账户已达到速率限制，请您控制请求频率"原样抛给用户。
+    const _hitRateLimit = response.status === 429 ||
+      /1305|速率限制|rate[\s_-]?limit|too many requests|请求过于频繁|访问量过大|控制请求频率/i.test(errorText)
+    if (_hitRateLimit) {
+      // 尊重服务端 retryAfter（硅基流动/SiliconFlow 在 429 body 里带 retryAfter，单位秒），用于退避
       let _retryAfter = 0
       try {
         const _et = JSON.parse(errorText)
@@ -639,14 +933,25 @@ export async function callLLM(config: LLMConfig, messages: LLMMessage[], opts?: 
     throw new Error('API返回的不是有效JSON: ' + rawText.substring(0, 200))
   }
   
-  const content = data.choices?.[0]?.message?.content
-  // 🔥 兼容推理模型（如astron-code-latest），从reasoning_content提取实际输出
-  if (!content) {
-    const reasoningContent = data.choices?.[0]?.message?.reasoning_content
-    if (reasoningContent && typeof reasoningContent === 'string' && reasoningContent.trim().length > 0) {
-      console.log('[callLLM] content为空，从reasoning_content提取内容 (长度=' + reasoningContent.length + ')')
-      return reasoningContent
+  // 🔥 2026-10-24：部分免费档限流走 HTTP 200 + {"error":{...code:1305...}}，
+  //   此前会落到"API返回内容为空"原样抛给用户。这里先识别，统一转成 RATE_LIMIT 并登记冷却。
+  if (data && data.error) {
+    const _errText = typeof data.error === 'string' ? data.error : JSON.stringify(data.error)
+    if (/1305|速率限制|rate[\s_-]?limit|too many requests|请求过于频繁|访问量过大|控制请求频率/i.test(_errText)) {
+      _registerRateLimitCooldown(provider, data.error.retryAfter)
+      throw new Error('RATE_LIMIT: 请求频率过高，请稍后重试')
     }
+  }
+
+  // 🔥 2026-10-25 T6：统一正文抽取（oh-story/model-response）——优先 message.content；为空回退
+  //   message.reasoning（商汤 SenseNova 实测正文落该字段：content=0 / reasoning=411）与
+  //   message.reasoning_content（DeepSeek/astron 等）；并剥离  thinking 段与推理前言。
+  const _mx = extractModelText(data)
+  const content = _mx.text
+  if (_mx.text && (_mx.source !== 'content' || _mx.stripped)) {
+    console.log('[callLLM] 正文抽取(' + describeModelText(_mx) + ')')
+  }
+  if (!content) {
     // 🔥 2026-08-29 重推理模型（sensenova-6.8-flash-lite 等）会在隐藏思维链上吃掉绝大部分 max_tokens 预算，
     //   导致 content 被截断成空、finish_reason='length'。此时【一次性】把 max_tokens 提到足够大重试同一模型即可，
     //   不做多轮叠加，以免单步总耗时超过 nginx 600s 代理超时被网关掐成 504。
@@ -660,13 +965,12 @@ export async function callLLM(config: LLMConfig, messages: LLMMessage[], opts?: 
           frequency_penalty: frequencyPenalty, presence_penalty: presencePenalty,
         })
         const _r2 = await fetch(apiUrl + '/chat/completions', {
-          method: 'POST', headers, body: _body2, signal: AbortSignal.timeout(timeoutMs),
+          method: 'POST', headers, body: _body2, bodyTimeout: 0, headersTimeout: 0, signal: AbortSignal.timeout(timeoutMs),
         })
         if (_r2.ok) {
           const _j2 = JSON.parse(await _r2.text())
-          const _c2 = _j2.choices?.[0]?.message?.content
-          const _rc2 = _j2.choices?.[0]?.message?.reasoning_content
-          const _final = (_c2 && String(_c2).trim().length > 0) ? String(_c2) : ((_rc2 && String(_rc2).trim().length > 0) ? String(_rc2) : '')
+          const _mx2 = extractModelText(_j2)
+          const _final = _mx2.text
           if (_final.trim().length > 0) {
             console.log('[callLLM] 空内容(finish=length)→一次性放大max_tokens至' + _mtBig + '重试成功 (finish=' + (_j2.choices?.[0]?.finish_reason) + ', completion_tokens=' + (_j2.usage?.completion_tokens || '?') + ')')
             return _final
@@ -676,6 +980,32 @@ export async function callLLM(config: LLMConfig, messages: LLMMessage[], opts?: 
     }
     console.error('[callLLM] API返回内容为空: ' + JSON.stringify(data))
     throw new Error('API返回内容为空')
+  }
+  
+  // 🔥 2026-10-16 非空半句截断兜底：finish_reason==='length' 且 content 非空时，
+  //   一次性放大 max_tokens 重试同一模型。此前该兜底仅在 content 为空时触发，
+  //   导致「写到一半被截断」的半句稿（如"…你也不过是一"）直接落库、无人补救。
+  const _finishTrunc = data.choices?.[0]?.finish_reason
+  if (_finishTrunc === 'length' && typeof content === 'string' && content.trim().length > 0) {
+    try {
+      const _mtBigT = Math.max(8000, Math.min(((maxTokens && maxTokens > 0) ? maxTokens : 2000) * 4, 16000))
+      const _bodyT = JSON.stringify({
+        model: model || 'default', messages, temperature,
+        max_tokens: _mtBigT, top_p: topP,
+        frequency_penalty: frequencyPenalty, presence_penalty: presencePenalty,
+      })
+      const _rT = await fetch(apiUrl + '/chat/completions', {
+        method: 'POST', headers, body: _bodyT, bodyTimeout: 0, headersTimeout: 0, signal: AbortSignal.timeout(timeoutMs),
+      })
+      if (_rT.ok) {
+        const _jT = JSON.parse(await _rT.text())
+        const _cT = extractModelText(_jT).text
+        if (_cT && String(_cT).trim().length > String(content).trim().length) {
+          console.log('[callLLM] 半句截断(finish=length)→放大max_tokens至' + _mtBigT + '重试成功 (completion_tokens=' + (_jT.usage?.completion_tokens || '?') + ')')
+          return String(_cT)
+        }
+      }
+    } catch (_eT) { /* 放大重试失败则返回原截断稿，交由上层续写/重写兜底 */ }
   }
   
   return content
@@ -1237,10 +1567,11 @@ export async function callLLMWithFallback(
   baseConfig: LLMConfig,
   messages: LLMMessage[],
   onModelSwitch?: (modelName: string, reason: string) => void,
-  opts?: { maxTokens?: number; timeoutMs?: number; temperature?: number; skipJsonValidation?: boolean; step?: string }
+  opts?: { maxTokens?: number; timeoutMs?: number; temperature?: number; skipJsonValidation?: boolean; step?: string; frequencyPenalty?: number; presencePenalty?: number }
 ): Promise<{ content: string; usedModel: string }> {
-  // 🔥 仿写保护：将当前请求的"严禁抄袭原著名"约束注入到 system 消息（在同步起点捕获，避免并发串扰）
-  const _imitateGuardText = _imitateGuard
+  // 🔥 仿写保护：将当前请求的"严禁抄袭原著名"约束注入到 system 消息（从请求级 AsyncLocalStorage 读取，隔离并发串扰）
+  const _ctx = currentLLMContext()
+  const _imitateGuardText = _ctx.imitateGuard
   if (_imitateGuardText && _imitateGuardText.length > 0) {
     if (messages.length > 0 && messages[0].role === 'system') {
       messages[0].content = (messages[0].content || '') + '\n\n' + _imitateGuardText
@@ -1250,7 +1581,7 @@ export async function callLLMWithFallback(
   }
 
   // 构建模型列表：优先使用用户配置的模型，然后是同平台的备用模型
-  let modelsToTry: { model: string; provider: string; baseUrl: string; apiKey?: string }[] = []
+  let modelsToTry: { model: string; provider: string; baseUrl: string; apiKey?: string; rateLimit?: LLMConfig['rateLimit'] }[] = []
   
   // 规范化模型名称和提供商
   const normalizedModel = MODEL_NAME_MAP[baseConfig.model || ''] || baseConfig.model
@@ -1301,10 +1632,45 @@ export async function callLLMWithFallback(
   
   for (const fallback of sameProviderModels) {
     if (!modelsToTry.some(function(m) { return m.model === fallback.model })) {
-      modelsToTry.push({ model: fallback.model!, provider: fallback.provider, baseUrl: fallback.baseUrl! })
+      // 🔥 2026-10-21：Key 以 models.json 真 Key 为准；env 占位符 Key 直接跳过（避免 401 空转）
+      const _fk = _effectiveFallbackKey(fallback.provider, fallback.model, fallback.apiKey)
+      if (!_fk) {
+        console.log('[多模型切换] 跳过同平台备用（无有效 Key）: ' + fallback.model)
+        continue
+      }
+      modelsToTry.push({ model: fallback.model!, provider: fallback.provider, baseUrl: fallback.baseUrl!, apiKey: _fk })
       console.log('[多模型切换] 添加同平台备用模型: ' + fallback.model)
     }
   }
+
+  // 🔥 2026-10-21：动态兜底池【前置到 env 静态池之前】
+  //   动态池来自 models.json（管理员/用户配置的真实 Key + 角色排序），
+  //   env 静态池的硅基 Key 是占位符 → 401「Token is invalid」白耗一次尝试。
+  //   动态池前置后：优先用真 Key 的模型（速度快、可用率高），env 池退为末位兜底。
+  try {
+    for (const _m of _ctx.extraFallbackPool) {
+      if (!_m || !_m.model) continue
+      const _ak = String(_m.apiKey || '')
+      if (!_ak || _ak.includes('*')) continue
+      if (_m.isImageModel || /Kolors|Hunyuan-MT/i.test(_m.model)) continue
+      // ⚠️ 2026-10-17 过滤付费模型：管理员不得调用付费模型
+      if (_m.isPaid === true) continue
+      // 🔥 用户要求：永不调用 Ollama 本地——即便 models.json 里残留 Ollama 项也过滤掉
+      const _mp = String(_m.provider || '').toLowerCase()
+      const _mbu = String(_m.baseUrl || '').toLowerCase()
+      if (_mp === 'ollama' || _mp === '本地' || _mp.includes('ollama') || /localhost:11434|127\.0\.0\.1:11434/.test(_mbu)) continue
+      if (modelsToTry.some(function (x) { return x.model === _m.model && x.provider === _m.provider })) continue
+      modelsToTry.push({
+        model: _m.model,
+        provider: _m.provider,
+        baseUrl: String(_m.baseUrl || '').replace(/[`'"]/g, '').trim(),
+        apiKey: _ak.replace(/[`'"]/g, '').trim(),
+        // 🔥 2026-09-23：透传 opt-in 频率限制（OpenVeer 等免费中转硬配额）
+        rateLimit: (_m as any).rateLimit,
+      })
+      console.log('[多模型切换] 追加动态兜底池模型: ' + _m.model + '（' + _m.provider + '）')
+    }
+  } catch (e) { console.warn('[多模型切换] 动态兜底池注入失败(忽略):', e) }
 
   // 🔥 2026-08-11：10 模型池跨平台兜底。当同平台模型全部失败（高并发/限流/宕机）时，
   //   按顺序尝试其他提供商的模型。每个模型自带 apiKey/baseUrl，实现硅基流动 ↔ 智谱互为兜底。
@@ -1314,7 +1680,13 @@ export async function callLLMWithFallback(
   console.log('[多模型切换] 跨平台备用模型数量: ' + crossProviderModels.length)
   for (const fallback of crossProviderModels) {
     if (!modelsToTry.some(function(m) { return m.model === fallback.model })) {
-      modelsToTry.push({ model: fallback.model!, provider: fallback.provider, baseUrl: fallback.baseUrl!, apiKey: fallback.apiKey })
+      // 🔥 2026-10-21：Key 以 models.json 真 Key 为准；env 占位符 Key 直接跳过
+      const _fk = _effectiveFallbackKey(fallback.provider, fallback.model, fallback.apiKey)
+      if (!_fk) {
+        console.log('[多模型切换] 跳过跨平台备用（无有效 Key）: ' + fallback.model + '（' + fallback.provider + '）')
+        continue
+      }
+      modelsToTry.push({ model: fallback.model!, provider: fallback.provider, baseUrl: fallback.baseUrl!, apiKey: _fk })
       console.log('[多模型切换] 添加跨平台备用模型: ' + fallback.model + '（' + fallback.provider + '）')
     }
   }
@@ -1440,28 +1812,7 @@ export async function callLLMWithFallback(
     for (const _e of _ollamaEntries) modelsToTry.push(_e)
   }
 
-  // 🔥 2026-08-30：动态兜底池（models.json：付费稳定 deepseek-v4-flash + OpenRouter 免费档）
-  //   作为静态池之后的最后兜底，避免智谱冷却/硅基流动401/Ollama停用时整链 500。
-  try {
-    for (const _m of _extraFallbackPool) {
-      if (!_m || !_m.model) continue
-      const _ak = String(_m.apiKey || '')
-      if (!_ak || _ak.includes('*')) continue
-      if (_m.isImageModel || /Kolors|Hunyuan-MT/i.test(_m.model)) continue
-      // 🔥 用户要求：永不调用 Ollama 本地——即便 models.json 里残留 Ollama 项也过滤掉
-      const _mp = String(_m.provider || '').toLowerCase()
-      const _mbu = String(_m.baseUrl || '').toLowerCase()
-      if (_mp === 'ollama' || _mp === '本地' || _mp.includes('ollama') || /localhost:11434|127\.0\.0\.1:11434/.test(_mbu)) continue
-      if (modelsToTry.some(function (x) { return x.model === _m.model && x.provider === _m.provider })) continue
-      modelsToTry.push({
-        model: _m.model,
-        provider: _m.provider,
-        baseUrl: String(_m.baseUrl || '').replace(/[`'"]/g, '').trim(),
-        apiKey: _ak.replace(/[`'"]/g, '').trim(),
-      })
-      console.log('[多模型切换] 追加动态兜底池模型: ' + _m.model + '（' + _m.provider + '）')
-    }
-  } catch (e) { console.warn('[多模型切换] 动态兜底池注入失败(忽略):', e) }
+  // 🔥 2026-10-21：动态兜底池已前置到 env 静态池之前（见上方），此处不再重复注入。
 
   const errors: string[] = []
   // 🔥 修复：收集每个模型返回的“原始内容”（即使 JSON 校验失败），用于最终兜底
@@ -1498,7 +1849,7 @@ export async function callLLMWithFallback(
         console.log('[多模型切换] 尝试 ' + (i + 1) + '/' + modelsToTry.length + ': ' + modelConfig.model + ' (第' + (retry + 1) + '次)')
         // 🔥 Ollama 本地推理较慢，但必须设上限避免无限挂起拖垮请求；正文步(7B)更快，给 180s，其余 240s
         const _callOpts = (modelConfig.provider === 'Ollama')
-          ? Object.assign({}, opts || {}, { timeoutMs: (opts?.step === 'content' ? 180000 : 240000) })
+          ? Object.assign({}, opts || {}, { timeoutMs: (opts?.step === 'content' ? 300000 : 240000) })
           : opts
         const content = await callLLM(config, messages, _callOpts)
         

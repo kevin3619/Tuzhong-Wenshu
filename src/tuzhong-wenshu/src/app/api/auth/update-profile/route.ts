@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { prisma } from '@/lib/prisma'
-import { verifyToken, hashPassword, verifyPassword } from '@/lib/auth'
+import { verifyToken, hashPassword, verifyPassword, invalidateUserTokens } from '@/lib/auth'
 
 export async function PUT(request: NextRequest) {
   try {
@@ -34,8 +34,14 @@ export async function PUT(request: NextRequest) {
     const normalizedEmail = email === '' ? null : email
     if (nickname && nickname !== currentUser.nickname) updateData.nickname = nickname
     if (normalizedEmail !== undefined && normalizedEmail !== currentUser.email) {
+      // 🔥 修复：此前邮箱不做格式校验，非法值一路写到 Prisma 才 500
+      if (normalizedEmail !== null && !/^[^s@]+@[^s@]+.[^s@]+$/.test(String(normalizedEmail))) {
+        return NextResponse.json({ code: 400, message: '邮箱格式不正确' }, { status: 400 })
+      }
       updateData.email = normalizedEmail
     }
+
+    let passwordChanged = false
 
     // 修改密码（需要验证旧密码）
     if (newPassword) {
@@ -50,6 +56,7 @@ export async function PUT(request: NextRequest) {
         return NextResponse.json({ code: 400, message: '新密码长度不能少于6位' }, { status: 400 })
       }
       updateData.password = await hashPassword(newPassword)
+      passwordChanged = true
     }
 
     // 修改登录账号（需要验证旧密码）
@@ -75,6 +82,11 @@ export async function PUT(request: NextRequest) {
       where: { id: payload.userId },
       data: updateData,
     })
+
+    // 🔥 修复：改过密码或账号后，此前签发的 token 全部作废（旧实现连改密都不拉黑）
+    if (passwordChanged) {
+      try { await invalidateUserTokens(user.id) } catch (e) { console.error('[update-profile] 撤销历史令牌失败:', e) }
+    }
 
     return NextResponse.json({
       code: 200,

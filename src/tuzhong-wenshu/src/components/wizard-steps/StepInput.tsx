@@ -3,6 +3,7 @@
 import { useState, useEffect, useCallback } from 'react'
 import { Sparkles, Loader2, BookCopy, Search, FileJson, Upload, Bot, Zap, Library, ChevronLeft, ChevronRight, Filter, RefreshCw, Wand2 } from 'lucide-react'
 import { extractText } from '@/lib/text-utils'
+import { autoResize } from '@/hooks/useAutoResize'
 
 interface StepInputProps {
   keywords: string
@@ -171,11 +172,6 @@ export default function StepInput({
   const [browseSearchKeyword, setBrowseSearchKeyword] = useState('')
   const [databaseStats, setDatabaseStats] = useState<{ total: number; genres: string[] } | null>(null)
 
-  const autoResize = function(e: React.FormEvent<HTMLTextAreaElement>) {
-    const ta = e.currentTarget
-    ta.style.height = 'auto'
-    ta.style.height = ta.scrollHeight + 'px'
-  }
 
   useEffect(function() {
     const timer = setTimeout(function() {
@@ -960,7 +956,7 @@ export default function StepInput({
                         try {
                           localStorage.setItem('tuzhong-imitate-data', JSON.stringify(imitateResult))
                           console.log('[仿写] 保存仿写数据:', imitateResult.title)
-                        } catch (e) {}
+                        } catch (e) { console.error('[StepInput] 保存仿写数据失败:', e) }
                       }}
                       className="flex-1 px-4 py-3 bg-stone-800 text-white rounded-xl hover:bg-stone-800 font-medium text-base"
                     >
@@ -1071,7 +1067,7 @@ export default function StepInput({
                           }),
                         })
                         // If API fails (expected since no real LLM), just use the prompt from code
-                      } catch (e) {}
+                      } catch (e) { console.error('[StepInput] 在线生成拆书提示词失败（回退内置模板）:', e) }
                       // Fallback: copy a generic prompt
                       const prompt = `请深度拆解小说【在此填写书名】的创作骨架。\n要求：只提取结构、逻辑、节奏、方法论，不保留原文句子、人名、地名。\n输出标准化JSON格式。\n\n详细提示词模板已内置在系统中，你可直接使用豆包/ChatGPT等工具输入：\n"请拆解小说《XXX》的创作骨架，输出包含世界观、力量体系、人设原型、势力格局、主线剧情、关键节点、分卷节奏、文风特征、爽点模式等9个维度的标准化JSON。"`
                       await navigator.clipboard.writeText(prompt)
@@ -1298,7 +1294,11 @@ export default function StepInput({
           <textarea
             name="keywords"
             value={keywords}
-            onChange={(e) => setKeywords(uniqueKeywords(e.target.value))}
+            // 🔥 2026-11-05 修复：onChange 直存原值——原实现每敲一键就对半截输入做分词重组，
+            //   中文输入法组合态被反复覆盖，表现为「输入时总是自动删除」。
+            //   去重归一化移到 onBlur（失焦时才整理），输入过程零干预。
+            onChange={(e) => setKeywords(e.target.value)}
+            onBlur={(e) => setKeywords(uniqueKeywords(e.target.value))}
             onInput={autoResize}
             placeholder="例如：退婚流 废材逆袭 三年之约"
             rows={3}

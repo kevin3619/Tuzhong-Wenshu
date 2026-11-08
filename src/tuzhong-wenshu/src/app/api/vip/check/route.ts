@@ -3,6 +3,7 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs'
 import { join } from 'path'
 import { prisma } from '@/lib/prisma'
 import { getRequestActor } from '@/lib/permissions'
+import { atomicWriteJson } from '@/lib/file-lock'
 
 const LOCAL_DATA_DIR = join(process.cwd(), '.tuzhong-data')
 const NOVEL_BOOK_FILE = join(LOCAL_DATA_DIR, 'novels.json')
@@ -56,7 +57,7 @@ function loadUserMetadataMap(): Record<string, UserMetadata> {
 
 function saveUserMetadataMap(map: Record<string, UserMetadata>) {
   ensureDataFolder()
-  writeFileSync(USER_METADATA_FILE, JSON.stringify(map, null, 2), 'utf-8')
+  atomicWriteJson(USER_METADATA_FILE, map)
 }
 
 function getUserMetadata(map: Record<string, UserMetadata>, userId: string): UserMetadata {

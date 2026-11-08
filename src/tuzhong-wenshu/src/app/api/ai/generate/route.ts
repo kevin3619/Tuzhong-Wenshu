@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server'
 import { callLLMWithFallback, type LLMConfig, type LLMMessage } from '@/lib/ai/llm'
 import { resolveLLMConfig } from '@/lib/resolve-llm-config'
 import { verifyToken } from '@/lib/auth'
+import { guardAiEndpoint, chargeAiUsage } from '@/lib/quota'
 
 interface CharacterInfo {
   id?: string
@@ -78,6 +79,12 @@ export async function POST(request: Request) {
         if (decoded) userId = decoded.userId
       }
     } catch (_e) {}
+
+    // 🔥 修复（P1 计量缺失）：AI 接口此前不限频、不计额，注册即可无限调用；
+    //   dailyQuotaUsed/dailyQuotaLimit/ai_daily_free_quota 全仓零写入零校验。
+    { const _g = await guardAiEndpoint(request, 'generate', userId || null, false, 1)
+      if (!_g.ok) return NextResponse.json({ error: _g.message, code: _g.status }, { status: _g.status })
+      await chargeAiUsage(_g.userId, false, 1) }
 
     if (type === 'backstory') {
       // 修复：如果是管理员共享模型（apiKey 是 ***），从 models.json 读取真实 apiKey

@@ -86,14 +86,20 @@ function uniqPlaces(list: string[]): string[] {
   return out
 }
 
-/** 取短语边界内的摘要，避免把"构建火器新军体系"截成"构建火" */
-function clipPhrase(s: unknown, max = 14): string {
+/** 取短语边界内的摘要，避免把"构建火器新军体系"截成"构建火"。
+ *  🔥 2026-09-06：用户反馈势力设定部分字段（如「发展轨迹」「最终结局」中引用的目标）显示被截取。
+ *  原因：此处把 goal 截到 14 字导致引用残缺。提升默认长度到 28，且调用方可按需传更大值，
+ *  保证派生字段引用到完整内容而不丢信息。 */
+function clipPhrase(s: unknown, max = 120): string {
   const v = String(s || '').trim()
   if (!v) return ''
   if (v.length <= max) return v
-  const cut = v.slice(0, max)
+  const cut = v.slice(0, max + 1)
   const idx = Math.max(cut.lastIndexOf('，'), cut.lastIndexOf('、'), cut.lastIndexOf('；'), cut.lastIndexOf(' '))
-  return idx >= 4 ? cut.slice(0, idx) : cut
+  // 🔥 2026-09-06 二次修复：找不到标点边界时「宁长勿残」——只要全句仍在硬上限内就返回原句，
+  //    绝不硬切成半截词（原实现 cut.slice(0,max) 会把「构建火器新军体系」砍成「构建火」）。
+  if (idx >= 4) return cut.slice(0, idx)
+  return v.length <= 300 ? v : v.slice(0, max)
 }
 
 function isPlaceholder(v: unknown): boolean {
@@ -169,6 +175,60 @@ function fateByCamp(f: any): string {
   if (/友/.test(camp)) return '与主角结为唇齿之援，共渡危局，事成之后保全建制、共享中兴之功'
   if (/亦敌亦友/.test(camp)) return '在合作与对抗之间反复摇摆，最终在关键一战中作出抉择，或归附或覆灭'
   return '在大势变动中力求自保，先观望后择主，最终被纳入新秩序或被边缘化'
+}
+
+/**
+ * 🔥 2026-09-06 新增：「与主角关系」专用完整句式。
+ * 历史坑：此前复用 fateByCamp 再 slice(0,30)，既语义错位（结局≠关系）又硬截断。
+ * 这里按阵营给出「当下关系 + 后续走向」的完整表述，长度不设截断点。
+ */
+function relationByCamp(f: any): string {
+  const camp = String(f && (f.camp || f.type) || '')
+  const name = factionBaseName(f && f.name) || '该势力'
+  if (/己方|主角/.test(camp)) return name + '是主角起家的根本班底，上下一体、休戚与共，主角每一次抉择都直接牵动其存亡兴衰'
+  if (/亦敌亦友/.test(camp)) return name + '与主角既有共同利害也有根本分歧，平时互通声气、临事各留一手，关系随战局在盟友与对手之间反复摇摆'
+  if (/敌/.test(camp)) return name + '与主角势同水火，前期多方掣肘、屡设陷阱，随着主角羽翼渐丰逐步转为正面决战，最终非降即亡'
+  if (/友/.test(camp)) return name + '与主角互为唇齿，危难时倾力相助、事成后共享其功，但在利益分配上仍保留自身的盘算'
+  return name + '对主角保持观望，既不愿轻易下注也不愿率先结怨，往往在大局明朗之后才决定站到哪一边'
+}
+
+/**
+ * 🔥 2026-09-06 修复：存量势力「发展轨迹/结局」中对目标的引用可能是修复前被截断的片段。
+ *  例：goal=「暗中支持抗清势力，推动历史进程。」而 dev 引用「暗中支持抗清势力」。
+ *  若「」/『』内的片段恰好是完整 goal 的严格前缀（短于 goal），则替换为完整 goal，避免残缺展示。
+ *  仅当前缀关系成立时才替换，不误改正常引用。
+ */
+function repairTruncatedGoalRef(f: any): void {
+  const goal = String(f && f.goal || '').trim()
+  if (!goal) return
+  // 🔥 2026-09-06 扩展：原只覆盖 developmentTrajectory/fate，
+  //   relationshipWithProtagonist / description 里同样存在被砍断的目标引用，一并修复。
+  const FIELDS = ['developmentTrajectory', 'fate', 'relationshipWithProtagonist', 'relationToProtagonist', 'description', 'coreConflict', 'hiddenAgenda']
+  FIELDS.forEach(function (field) {
+    let s = String(f[field] || '')
+    if (!s) return
+    let out = s
+    // A) 带引号的引用：「片段」/『片段』 是 goal 的严格前缀 → 补全为完整 goal
+    out = out.replace(/「[^」]{2,80}」/g, function (m: string) {
+      const fr = m.slice(1, -1)
+      if (fr && goal.length > fr.length && goal.indexOf(fr) === 0) return '「' + goal + '」'
+      return m
+    })
+    out = out.replace(/『[^』]{2,80}』/g, function (m: string) {
+      const fr = m.slice(1, -1)
+      if (fr && goal.length > fr.length && goal.indexOf(fr) === 0) return '『' + goal + '』'
+      return m
+    })
+    // B) 裸截断（无引号）：字段尾部恰好是 goal 的严格前缀（≥6 字，避免误伤短词）→ 补齐剩余部分
+    for (let n = Math.min(goal.length - 1, out.length); n >= 6; n--) {
+      const tail = out.slice(out.length - n)
+      if (goal.indexOf(tail) === 0) {
+        out = out.slice(0, out.length - n) + goal
+        break
+      }
+    }
+    if (out !== s) f[field] = out
+  })
 }
 
 /**
@@ -310,6 +370,8 @@ export function normalizeFactions(input: any, opts?: { fillStructural?: boolean;
   // ---------- 5) 结构性补空 + 残缺模板重写 ----------
   if (fillStructural) {
     merged.forEach(function (f: any) {
+      // 🔥 2026-09-06：先用完整 goal 对账修复「发展轨迹/结局」中被截断的目标引用，再走后续补空逻辑
+      repairTruncatedGoalRef(f)
       const put = function (field: string, value: string) {
         if (!value) return
         f[field] = value
@@ -324,7 +386,10 @@ export function normalizeFactions(input: any, opts?: { fillStructural?: boolean;
       if (isPlaceholder(f.description)) {
         put('description', [factionBaseName(f.name), f.leader ? '由' + f.leader + '统领' : '', f.territory ? '盘踞' + placesOf(f.territory)[0] : '', f.goal ? '志在' + f.goal : ''].filter(Boolean).join('，'))
       }
-      if (isPlaceholder(f.relationshipWithProtagonist)) put('relationshipWithProtagonist', fateByCamp({ camp: f.camp, goal: f.goal }).slice(0, 30))
+      // 🔥 2026-09-06 修复：原为 fateByCamp(...).slice(0, 30) —— 对完整长句硬砍 30 字，
+      //    且无标点兜底，UI 上就是「句子不完整、结尾戛然而止」的截取内容。
+      //    改为专用的「与主角关系」完整句式，完全不截断。
+      if (isPlaceholder(f.relationshipWithProtagonist)) put('relationshipWithProtagonist', relationByCamp(f))
       if (isPlaceholder(f.symbol)) put('symbol', f.camp === '敌方' ? '黑底狼旗' : f.camp === '友方' ? '青旗' : '赤旗')
       // 🔥 2026-09-06 修复：势力级别必须是前端下拉合法值（传说/超级/一流/二流/三流 + 势力），
       // 否则下拉框匹配不上显示为空；同时把实力梯度描述文本规范为 SSS/SS/S/A/B/C/D

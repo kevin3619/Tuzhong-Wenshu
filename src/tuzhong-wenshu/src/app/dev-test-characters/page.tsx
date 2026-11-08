@@ -89,7 +89,7 @@ function MockSection({ mode }: { mode: string }) {
       </h2>
       <StepCharacters
         data={data as never}
-        onChange={setData}
+        onChange={(updated) => setData(updated as AnyChar)}
         onRegenerate={() => {}}
         onGenerate={() => {}}
         onRegenerateAll={() => {}}

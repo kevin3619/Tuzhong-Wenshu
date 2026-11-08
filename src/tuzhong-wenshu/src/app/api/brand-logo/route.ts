@@ -1,28 +1,7 @@
 import { NextResponse } from 'next/server'
-import { readFileSync, existsSync, mkdirSync } from 'fs'
+import { readFileSync, existsSync } from 'fs'
 import { join } from 'path'
-
-function resolveDataDir(): string {
-  const cwd = process.cwd()
-  const candidates = [
-    join(cwd, '.tuzhong-data'),
-    join(cwd, 'data'),
-    join(cwd, 'src', 'tuzhong-wenshu', '.tuzhong-data'),
-    join(cwd, 'src', 'tuzhong-wenshu', 'data'),
-    join(cwd, '..', '.tuzhong-data'),
-    '/www/wwwroot/tuzhong-wenshu/.tuzhong-data',
-  ]
-  for (const p of candidates) {
-    try {
-      if (existsSync(p)) return p
-    } catch {
-      // continue
-    }
-  }
-  const defaultPath = join(cwd, '.tuzhong-data')
-  try { if (!existsSync(defaultPath)) mkdirSync(defaultPath, { recursive: true }) } catch { /* ignore */ }
-  return defaultPath
-}
+import { resolveDataDirC } from '@/lib/data-dir'
 
 const MIME_MAP: Record<string, string> = {
   jpg: 'image/jpeg',
@@ -35,7 +14,7 @@ const MIME_MAP: Record<string, string> = {
 
 export async function GET() {
   try {
-    const dataDir = resolveDataDir()
+    const dataDir = resolveDataDirC()
     const exts = ['png', 'jpg', 'jpeg', 'webp', 'gif', 'svg']
     let logoFile: string | null = null
     let ext = 'png'
@@ -48,7 +27,7 @@ export async function GET() {
           ext = exts[i]
           break
         }
-      } catch { /* ignore */ }
+      } catch (e) { console.error('[brand-logo] 探测Logo候选文件失败:', e) }
     }
 
     if (!logoFile) {

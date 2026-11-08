@@ -17,17 +17,17 @@ export async function sendSafeAiRequest(
     onModelSwitch?: (modelName: string, reason: string) => void
   }
 ): Promise<{ content: string; usedModel: string }> {
-  const temp = options?.temperature ?? 0.2
+  const temperature = options?.temperature ?? 0.2
   const maxTokens = options?.maxTokens ?? 8192
 
-  console.log(`[SafePipeline] 发送AI请求，模型: ${config.model}, temperature: ${temp}, maxTokens: ${maxTokens}`)
+  console.log(`[SafePipeline] 发送AI请求，模型: ${config.model}, temperature: ${temperature}, maxTokens: ${maxTokens}`)
 
   // 强制设置 temperature 参数（通过系统消息注入）
   const enhancedMessages = messages.map((m, i) => {
     if (i === 0 && m.role === 'system') {
       return {
         ...m,
-        content: m.content + `\n\n【输出参数】temperature=${temp}, max_tokens=${maxTokens}`
+        content: m.content + `\n\n【输出参数】temperature=${temperature}, max_tokens=${maxTokens}`
       }
     }
     return m
@@ -208,11 +208,19 @@ export function validateAndSanitizeData<T extends Record<string, unknown>>(
 
     // 1. 空值检查
     if (value === undefined || value === null || value === '') {
-      if (rule.required) {
-        warnings.push(`${field}: 必填字段为空，使用默认值`)
-        value = rule.defaultValue
-      } else if (rule.defaultValue !== undefined) {
-        value = rule.defaultValue
+      if (rule.required || rule.defaultValue !== undefined) {
+        if (rule.required) warnings.push(`${field}: 必填字段为空，使用默认值`)
+        if (rule.defaultValue !== undefined) {
+          value = rule.defaultValue
+        } else {
+          // 🔥 Bug修复：required 且无 defaultValue 时给类型安全默认（'' / [] / {} / 0），
+          //   此前置 undefined → JSON 序列化整键丢失，下游按"字段未生成"而非"用兜底"处理
+          if (rule.type === 'array') value = []
+          else if (rule.type === 'object') value = {}
+          else if (rule.type === 'number') value = 0
+          else if (rule.type === 'boolean') value = false
+          else value = ''
+        }
       }
     }
 

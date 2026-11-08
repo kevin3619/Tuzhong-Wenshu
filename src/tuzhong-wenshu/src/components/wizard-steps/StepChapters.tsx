@@ -3,6 +3,7 @@
 import { useState, useEffect } from 'react'
 import { BookOpen, Loader2, RefreshCw, AlertTriangle, Copy } from 'lucide-react'
 import type { GeneratedData } from '../ai-generate-wizard'
+import { autoResize } from '@/hooks/useAutoResize'
 
 type ChapterItem = NonNullable<NonNullable<GeneratedData['chapters']>['chapters']>[number] & { [key: string]: unknown }
 type VolumeItem = NonNullable<NonNullable<GeneratedData['chapters']>['volumes']>[number]
@@ -175,11 +176,6 @@ export default function StepChapters({
     return text.split(/[，,、；;]/).map(function(s) { return s.trim() }).filter(function(s) { return s.length > 0 })
   }
 
-  const autoResize = function(e: React.FormEvent<HTMLTextAreaElement>) {
-    const ta = e.currentTarget
-    ta.style.height = 'auto'
-    ta.style.height = ta.scrollHeight + 'px'
-  }
 
   useEffect(function() {
     const timer = setTimeout(function() {
@@ -283,11 +279,12 @@ export default function StepChapters({
 
     if (!raw) {
       // 如果没有标题，尝试从摘要中提取
+      // 🔥 Bug2修复：章节序号已由列表左侧圆形徽章单独展示，此处不再前置「第N章」，避免重复
       if (summary) {
         const extracted = extractTitleFromSummary(summary)
-        if (extracted) return `第${chNum}章 ${extracted}`
+        if (extracted) return extracted
       }
-      return `第${chNum}章 待生成`
+      return '待生成'
     }
     let title = raw.trim()
     // 去除所有"第X章"前缀
@@ -295,12 +292,18 @@ export default function StepChapters({
     title = title.replace(/第[一二三四五六七八九十百千\d]+章\s*/g, '')
     // 去除纯数字前缀
     title = title.replace(/^\d+\s*/, '')
+    // 🔥 #192：后端已生成「XXXX，XXXX」规范标题（4-6字+中文逗号+4-6字）时保留原样，禁止去标点/重造
+    // 🔥 Bug2修复：不再前置「第N章」，序号由列表徽章单独展示
+    const _stdMatch = title.match(/^([\u4e00-\u9fa5A-Za-z0-9]{2,6})[，,]([\u4e00-\u9fa5A-Za-z0-9]{2,6})$/)
+    if (_stdMatch) return `${_stdMatch[1]}，${_stdMatch[2]}`
     // 去除标点符号，保留纯中文
     title = title.replace(/[，,·、/；;：:！!？?（）()【】\[\]《》<>""''\s]+/g, '')
 
     // 🔥 BUG-13修复：如果后端已经生成了有效标题（4-12字），直接使用，不再从摘要重新提取
     // 只有在标题无效（过短、不完整）时才从摘要提取
-    const isIncomplete = title.length < 4 || /^(.*)(着|了|的|在|把|被|让|使|将|把|与|和|及|跟|同|向|往|朝|从|自|由|于|以|为|对|给|跟|向|往|朝|从|自|由|于|以|为|对|给)$/.test(title)
+    // 🔥 #207 修复：仅当整个标题【就是】单个介词功能词（而非以介词结尾）时才视为不完整，
+    // 避免「定都行在」等合法四字标题因以「在」结尾被误判，从而覆盖后端正确标题触发从摘要重造
+    const isIncomplete = title.length < 4 || /^(着|了|的|在|把|被|让|使|将|与|和|及|跟|同|向|往|朝|从|自|由|于|以|为|对|给)$/.test(title)
     if (isIncomplete && summary) {
       const extracted2 = extractTitleFromSummary(summary)
       if (extracted2 && extracted2.length >= 4) {
@@ -320,8 +323,8 @@ export default function StepChapters({
     }
     // 最终兜底
     if (!title.trim() || title.length < 2) title = '待生成'
-    // 重新添加唯一的"第X章"前缀
-    return `第${chNum}章 ${title.trim()}`
+    // 🔥 Bug2修复：直接返回标题原文，不再前置唯一的「第X章」前缀（序号由列表徽章展示，避免「第1章 第1章 …」重复）
+    return title.trim()
   }
 
   // 🔥🔥🔥 BUG-13修复：章节标题去重——不再强制统一字数，优先保留后端生成的有效标题
@@ -381,6 +384,11 @@ export default function StepChapters({
       // 提取当前章节的核心标题
       const _m = (ch.title || '').match(/第\d+章\s*([\u4e00-\u9fff]+)/)
       let _core = _m && _m[1] ? _m[1] : ''
+      // 🔥 #192：后端标题无"第N章"前缀但本身是有效标题（如「XXXX，XXXX」4-12字）时直接采用，禁止从摘要重造
+      if (!_core && ch.title) {
+        const _rawT = String(ch.title).trim().replace(/第[一二三四五六七八九十百千\d]+章\s*/g, '').replace(/^\d+\s*/, '')
+        if (_rawT.length >= 4 && _rawT.length <= 12 && /^[\u4e00-\u9fa5A-Za-z0-9，,]+$/.test(_rawT)) _core = _rawT
+      }
 
       // 🔥 BUG-13修复：如果后端已生成有效标题（4-12字），直接使用，不再截断或补全
       if (!_core || _core.length < 4) {
@@ -580,11 +588,14 @@ export default function StepChapters({
   // Build global duplicate tracker for all chapters across all volumes
   const allChapterSummaries: string[] = []
   const allChapterTitles: string[] = []
+  // 🔥 #218c：并行卷索引——弱信号（滑窗/短前缀）只用于跨卷对比（同卷章节按同一卷目标生成，
+  //    共享卷目标短语是设计内协同，实测 265/600 全部为同卷误报；跨卷对几乎零碰撞）
+  const allChapterVolIdx: number[] = []
   if (data?.volumes && Array.isArray(data.volumes)) {
     for (let vi = 0; vi < data.volumes.length; vi++) {
       const vChapters = data.volumes[vi]?.chapters || []
       for (let ci = 0; ci < vChapters.length; ci++) {
-        if (vChapters[ci]?.summary) allChapterSummaries.push(cleanPunct(vChapters[ci].summary).replace(/[，。！？、；：\s（）续\d+]/g, ''))
+        if (vChapters[ci]?.summary) { allChapterSummaries.push(cleanPunct(vChapters[ci].summary).replace(/[，。！？、；：\s（）续\d+]/g, '')); allChapterVolIdx.push(vi) }
         if (vChapters[ci]?.title) allChapterTitles.push(cleanPunct(vChapters[ci].title).replace(/[（续\d+）]/g, ''))
       }
     }
@@ -598,6 +609,8 @@ export default function StepChapters({
       if (i === currentIdx) continue
       const existing = allChapterSummaries[i].replace(/[，。！？、；：\s（）续\d+]/g, '')
       if (existing.length < 5) continue
+      // 🔥 #218c：同卷/跨卷信号分离——弱信号（滑窗/8字前缀）只用于跨卷对，同卷对只用强信号
+      const sameVol = allChapterVolIdx[i] === allChapterVolIdx[currentIdx]
       // Check for exact match (identical summaries)
       if (key === existing) return true
       // Check for high similarity (>80% overlap)
@@ -605,22 +618,27 @@ export default function StepChapters({
       if (minLen > 15 && key.slice(0, minLen) === existing.slice(0, minLen)) return true
       // Check if one is a substring of the other
       if (key.length > 10 && existing.length > 10 && (key.includes(existing) || existing.includes(key))) return true
-      // 🔥🔥🔥 新增：基于字符集合重合度的相似度检查（防止部分重复）
-      if (key.length >= 20 && existing.length >= 20) {
+      // 🔥🔥🔥 新增：基于字符集合重合度的相似度检查（防止部分重复）——仅跨卷
+      if (!sameVol && key.length >= 20 && existing.length >= 20) {
         const _shorter = key.length < existing.length ? key : existing
         const _longer = key.length < existing.length ? existing : key
-        // 滑动窗口：检查8字以上连续子串重合
-        if (_shorter.length >= 8) {
-          for (let _sl = 0; _sl <= _shorter.length - 8; _sl++) {
-            const _sub = _shorter.slice(_sl, _sl + 8)
+        // 修复4：滑动窗口阈值 8 字 → 12 字（8 字窗口在正常章节摘要中误报率过高）
+        // 🔥 #218c：12 字 → 须命中 ≥2 个不同窗口（单一 12 字短语在批量生成内容中常见，
+        //    真正的复制粘贴会共享大量片段，2 个独立窗口才判重复）
+        if (_shorter.length >= 12) {
+          let _hits = 0
+          for (let _sl = 0; _sl <= _shorter.length - 12; _sl++) {
+            const _sub = _shorter.slice(_sl, _sl + 12)
             if (_longer.includes(_sub)) {
-              return true
+              _hits++
+              if (_hits >= 2) return true
             }
           }
         }
       }
-      // 🔥🔥🔥 新增：开头5字相同判定为高度重复（很多章节摘要开头都重复介绍背景）
-      if (key.length >= 10 && existing.length >= 10 && key.slice(0, 5) === existing.slice(0, 5)) {
+      // 🔥🔥🔥 新增：开头相同判定为高度重复（很多章节摘要开头都重复介绍背景）——仅跨卷
+      // 修复4：开头相同阈值 5 字 → 8 字（5 字开头重合在同类题材下极易误报）
+      if (!sameVol && key.length >= 10 && existing.length >= 10 && key.slice(0, 8) === existing.slice(0, 8)) {
         return true
       }
     }
@@ -676,14 +694,15 @@ export default function StepChapters({
   }
 
   // 🔥 检测章节摘要是否包含卷摘要内容（跨层重复检查）
+  // 🔥 #218c：threshold 10 → 20 字——章节摘要本就按本卷目标生成，与本卷摘要共享 ≤10 字
+  //    短语是设计内协同（实测 85/600 全部为「与本卷呼应」误报）；逐字照搬 20 字以上才算抄。
   function isSummaryCrossLayerDuplicate(chapterSummary: string, volumeSummary: string): boolean {
     if (!chapterSummary || !volumeSummary) return false
     const chClean = chapterSummary.replace(/[，。！？、；：\s]/g, '')
     const volClean = volumeSummary.replace(/[，。！？、；：\s]/g, '')
     if (chClean.length < 10 || volClean.length < 10) return false
-    // 检查章节摘要是否包含卷摘要中的连续短语（5字以上）
-    for (let i = 0; i < volClean.length - 4; i++) {
-      const phrase = volClean.slice(i, i + 5)
+    for (let i = 0; i < volClean.length - 19; i++) {
+      const phrase = volClean.slice(i, i + 20)
       if (chClean.includes(phrase)) return true
     }
     return false
@@ -695,9 +714,11 @@ export default function StepChapters({
     const chClean = chapterTitle.replace(/[第\d章\s]/g, '')
     const volClean = volumeName.replace(/[，,·、/；;\s]/g, '')
     if (chClean.length < 2 || volClean.length < 4) return false
-    // 检查章节标题是否包含卷名中的完整词组
-    for (let i = 0; i < volClean.length - 1; i++) {
-      const phrase = volClean.slice(i, i + 2)
+    // 修复4：完整卷名包含 → 判定复用
+    if (chClean.includes(volClean)) return true
+    // 修复4：词组阈值 2 字 → 3 字（2 字词组在短标题中误报率过高）
+    for (let i = 0; i < volClean.length - 2; i++) {
+      const phrase = volClean.slice(i, i + 3)
       if (chClean.includes(phrase) && chClean.length <= 6) return true
     }
     return false
@@ -1112,6 +1133,16 @@ export default function StepChapters({
                                     className="w-full px-2 py-1 text-xs bg-white border border-amber-200 rounded focus:ring-1 focus:ring-amber-400"
                                   >
                                     <option value="">选择章节类型</option>
+                                    {/* 🔥 #222：历史数据可能存有中文类型（朝堂权谋/内政经营等非枚举值），
+                                        不注入 option 时 select 无法回显已存值（显示占位符，用户误以为数据丢失）。
+                                        动态把当前值作为附加 option 注入，保证任何存量值都能回显。 */}
+                                    {(() => {
+                                      var _cur = String(chapter.chapterType || '')
+                                      if (_cur && _chapterTypeOptions.map(function(o) { return o.value }).indexOf(_cur) === -1) {
+                                        return <option key={'__custom_' + _cur} value={_cur}>{_cur}</option>
+                                      }
+                                      return null
+                                    })()}
                                     {_chapterTypeOptions.map(function(opt) {
                                       return <option key={opt.value} value={opt.value}>{opt.label}·{opt.desc}</option>
                                     })}
@@ -1255,11 +1286,12 @@ export default function StepChapters({
                                 </div>
                                 <div>
                                   <label className="text-xs text-stone-500 block mb-0.5">字数预估</label>
+                                  {/* 🔥 2026-10-16 绍宋级口径：支持「2500-4000」范围写法（文本输入），默认 2500-4000，可自由修改 */}
                                   <input
-                                    type="number"
-                                    value={Number(chapter.estimatedWords) || ''}
-                                    onChange={function(e) { handleChapterFieldChange(chapter, vIndex, 'estimatedWords', parseInt(e.target.value) || 0) }}
-                                    placeholder="基于本章内容预估字数"
+                                    type="text"
+                                    value={chapter.estimatedWords === undefined || chapter.estimatedWords === null || chapter.estimatedWords === '' ? '' : String(chapter.estimatedWords)}
+                                    onChange={function(e) { handleChapterFieldChange(chapter, vIndex, 'estimatedWords', e.target.value.trim()) }}
+                                    placeholder="2500-4000"
                                     className="w-full px-2 py-1 text-xs bg-white border border-stone-200 rounded focus:ring-1 focus:ring-stone-400"
                                   />
                                 </div>

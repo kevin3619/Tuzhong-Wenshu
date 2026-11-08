@@ -114,14 +114,12 @@ export class So360SearchSource implements BookSourceProvider {
   }
 
   /**
-   * 请求360搜索
+   * 带超时与统一请求头的 HTML 抓取（fetch360Search / fetch360Baike 共用）
    */
-  private async fetch360Search(keyword: string, timeoutMs: number): Promise<string> {
-    const url = `https://www.so.com/s?q=${encodeURIComponent(keyword)}`
-    
+  private async fetchHtmlWithTimeout(url: string, timeoutMs: number): Promise<string> {
     const ctrl = new AbortController()
     const timeout = setTimeout(() => ctrl.abort(), timeoutMs)
-    
+
     try {
       const res = await fetch(url, {
         signal: ctrl.signal,
@@ -133,18 +131,25 @@ export class So360SearchSource implements BookSourceProvider {
           'Referer': 'https://www.so.com/',
         },
       })
-      
+
       clearTimeout(timeout)
-      
+
       if (!res.ok) {
         throw new Error(`HTTP ${res.status}`)
       }
-      
+
       return await res.text()
     } catch (e) {
       clearTimeout(timeout)
       throw e
     }
+  }
+
+  /**
+   * 请求360搜索
+   */
+  private async fetch360Search(keyword: string, timeoutMs: number): Promise<string> {
+    return this.fetchHtmlWithTimeout(`https://www.so.com/s?q=${encodeURIComponent(keyword)}`, timeoutMs)
   }
 
   /**
@@ -170,32 +175,26 @@ export class So360SearchSource implements BookSourceProvider {
    * 请求360百科页面
    */
   private async fetch360Baike(url: string, timeoutMs: number): Promise<string> {
-    const ctrl = new AbortController()
-    const timeout = setTimeout(() => ctrl.abort(), timeoutMs)
-    
-    try {
-      const res = await fetch(url, {
-        signal: ctrl.signal,
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-          'Accept-Language': 'zh-CN,zh;q=0.9',
-          'Connection': 'keep-alive',
-          'Referer': 'https://www.so.com/',
-        },
-      })
-      
-      clearTimeout(timeout)
-      
-      if (!res.ok) {
-        throw new Error(`HTTP ${res.status}`)
-      }
-      
-      return await res.text()
-    } catch (e) {
-      clearTimeout(timeout)
-      throw e
-    }
+    return this.fetchHtmlWithTimeout(url, timeoutMs)
+  }
+
+  /**
+   * 去除HTML标签并解码实体、压缩空白（cleanBaikePage / cleanSearchResult 共用尾部）
+   */
+  private stripTagsAndDecode(text: string): string {
+    text = text.replace(/<[^>]+>/g, ' ')
+
+    text = text
+      .replace(/&nbsp;/g, ' ')
+      .replace(/&amp;/g, '&')
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&quot;/g, '"')
+      .replace(/&#\d+;/g, ' ')
+
+    text = text.replace(/\s+/g, ' ').trim()
+
+    return text
   }
 
   /**
@@ -203,28 +202,16 @@ export class So360SearchSource implements BookSourceProvider {
    */
   private cleanBaikePage(html: string): string {
     let text = html
-    
+
     text = text.replace(/<script[^>]*>[\s\S]*?<\/script>/gi, ' ')
     text = text.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, ' ')
-    
+
     const mainContentMatch = text.match(/<div[^>]*class="[^"]*content[^"]*"[^>]*>([\s\S]*?)<\/div>/i)
     if (mainContentMatch) {
       text = mainContentMatch[1]
     }
-    
-    text = text.replace(/<[^>]+>/g, ' ')
-    
-    text = text
-      .replace(/&nbsp;/g, ' ')
-      .replace(/&amp;/g, '&')
-      .replace(/&lt;/g, '<')
-      .replace(/&gt;/g, '>')
-      .replace(/&quot;/g, '"')
-      .replace(/&#\d+;/g, ' ')
-    
-    text = text.replace(/\s+/g, ' ').trim()
-    
-    return text
+
+    return this.stripTagsAndDecode(text)
   }
 
   /**
@@ -232,23 +219,11 @@ export class So360SearchSource implements BookSourceProvider {
    */
   private cleanSearchResult(html: string): string {
     let text = html
-    
+
     text = text.replace(/<script[^>]*>[\s\S]*?<\/script>/gi, ' ')
     text = text.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, ' ')
-    
-    text = text.replace(/<[^>]+>/g, ' ')
-    
-    text = text
-      .replace(/&nbsp;/g, ' ')
-      .replace(/&amp;/g, '&')
-      .replace(/&lt;/g, '<')
-      .replace(/&gt;/g, '>')
-      .replace(/&quot;/g, '"')
-      .replace(/&#\d+;/g, ' ')
-    
-    text = text.replace(/\s+/g, ' ').trim()
-    
-    return text
+
+    return this.stripTagsAndDecode(text)
   }
 
   /**

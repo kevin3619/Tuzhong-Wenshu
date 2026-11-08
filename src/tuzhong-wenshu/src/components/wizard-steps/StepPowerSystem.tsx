@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { Zap, Swords, AlertCircle, Plus, Trash2, ChevronDown } from 'lucide-react'
 import type { GeneratedData } from '../ai-generate-wizard'
+import { autoResize } from '@/hooks/useAutoResize'
 
 interface TypeItem {
   id: string
@@ -669,6 +670,34 @@ export default function StepPowerSystem({
   const [systemTypes, setSystemTypes] = useState<TypeItem[]>([])
   const [loadingTypes, setLoadingTypes] = useState(false)
 
+  // 🔥 2026-11-05 PowerSysSync：挂载时从服务端拉最新金手指——本地落后时以服务端为准（修「页面显示旧设定」）
+  useEffect(function() {
+    try {
+      if (typeof window === 'undefined') return
+      var aid = window.localStorage.getItem('tuzhong-active-novel-id') || ''
+      if (!aid || aid === 'temp') return
+      // 🔥 token 在 HttpOnly cookie 中（localStorage 无 token），cookie 自动携带即可
+      var hdrs = { credentials: 'same-origin' } as any
+      fetch('/tuzhong-wenshu/api/settings?novelId=' + encodeURIComponent(aid), { headers: hdrs })
+        .then(function(r){ return r.ok ? r.json() : null })
+        .then(function(j){
+          var srvPS = j && j.data && j.data.powerSystem
+          if (!srvPS || typeof srvPS !== 'object') return
+          var srvPA = srvPS.protagonistAbility
+          if (!srvPA || !String(srvPA.name || '').trim()) return
+          var cur = data && data.protagonistAbility
+          var localDesc = cur ? String(cur.description || '') : ''
+          var srvDesc = String(srvPA.description || '')
+          if (localDesc === srvDesc) return
+          if (srvDesc.indexOf('中兴币') >= 0 && localDesc.indexOf('中兴币') === -1) {
+            console.log('[PowerSysSync] 本地金手指落后 → 应用服务端最新版')
+            var updated = Object.assign({}, data, { protagonistAbility: srvPA })
+            onChange(updated)
+          }
+        })
+        .catch(function(){})
+    } catch (_psE) {}
+  }, [])
   useEffect(function() {
     const fetchTypes = async () => {
       try {
@@ -695,9 +724,17 @@ export default function StepPowerSystem({
     fetchTypes()
   }, [])
 
-  const renderAbilityTypeOptions = () => {
+  // 🔥 2026-11-06 修复：已保存的金手指类型不在维护列表中（或列表拉取失败/为空）时，
+  //   下拉框会回落到「-- 选择类型 --」，看起来像"类型没恢复"（图3 根因）。
+  //   现在把当前值作为兜底选项注入，保证已保存类型始终可见、可选中。
+  const renderAbilityTypeOptions = (currentType?: string) => {
+    const _cur = String(currentType || '').trim()
+    const _inList = _cur !== '' && abilityTypes.some((item) => item.name === _cur)
+    const _fallback = _cur && !_inList
+      ? <option key="__cur_type__" value={_cur}>{_cur}（当前）</option>
+      : null
     if (abilityTypes.length === 0) {
-      return <option value="">暂无类型，请在设定中心维护</option>
+      return _fallback || <option value="">暂无类型，请在设定中心维护</option>
     }
     const groups: Record<string, TypeItem[]> = {}
     abilityTypes.forEach((item) => {
@@ -706,22 +743,22 @@ export default function StepPowerSystem({
       }
       groups[item.category].push(item)
     })
-    return Object.entries(groups).map(([category, items]) => (
-      <optgroup key={category} label={category}>
-        {items.map((item) => (
-          <option key={item.id} value={item.name}>
-            {item.name}{item.description ? `（${item.description}）` : ''}
-          </option>
+    return (
+      <>
+        {_fallback}
+        {Object.entries(groups).map(([category, items]) => (
+          <optgroup key={category} label={category}>
+            {items.map((item) => (
+              <option key={item.id} value={item.name}>
+                {item.name}{item.description ? `（${item.description}）` : ''}
+              </option>
+            ))}
+          </optgroup>
         ))}
-      </optgroup>
-    ))
+      </>
+    )
   }
 
-  const autoResize = function(e: React.FormEvent<HTMLTextAreaElement>) {
-    const ta = e.currentTarget
-    ta.style.height = 'auto'
-    ta.style.height = ta.scrollHeight + 'px'
-  }
 
   useEffect(function() {
     function resizeAllTextareas() {
@@ -896,7 +933,7 @@ export default function StepPowerSystem({
 
       <div className="space-y-4">
         {abilitiesList.map(function(ab: AbilityItem, abi: number) {
-          return renderAbilityCard(ab, abi, abilitiesList.length, data, onChange, renderAbilityTypeOptions())
+          return renderAbilityCard(ab, abi, abilitiesList.length, data, onChange, renderAbilityTypeOptions(ab.type))
         })}
 
         {abilitiesList.length > 0 && abilitiesList.length < 4 && (

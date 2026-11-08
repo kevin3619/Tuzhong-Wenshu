@@ -97,7 +97,7 @@ export default function Header() {
     if (saved) {
       try {
         setUser(JSON.parse(saved))
-      } catch (_e) {}
+      } catch (_e) { console.error('[header] 解析本地用户信息失败:', _e) }
     }
     // 加载系统通知
     setNoticeLoading(true)
@@ -108,7 +108,7 @@ export default function Header() {
           setNoticeContent(data.data.content)
         }
       })
-      .catch(function () {})
+      .catch(function (err) { console.error('[header] 加载公告内容失败:', err) })
       .finally(function () { setNoticeLoading(false) })
   }, [])
 
@@ -209,7 +209,7 @@ export default function Header() {
             localStorage.setItem('tuzhong-novel-title-' + novelId, data.data.title)
           }
         })
-        .catch(function() {})
+        .catch(function(err) { console.error('[header] 拉取小说标题失败:', err) })
     } else {
       setNovelTitle(null)
     }
@@ -351,7 +351,10 @@ export default function Header() {
               </div>
               <div className="border-t border-stone-100 py-1">
                 <button
-                  onClick={function () { localStorage.removeItem('token'); localStorage.removeItem('user'); window.location.href = '/tuzhong-wenshu/login' }}
+                  onClick={function () {
+                    // 修复 Bug#1：退出必须同时清 cookie（middleware 从 cookie 读登录态）
+                    import('@/lib/auth-logout').then(function (m) { m.logoutAndGoHome() })
+                  }}
                   className="flex items-center space-x-2 px-4 py-2 text-sm text-red-600 hover:bg-red-50 transition-colors w-full text-left"
                 >
                   <LogOut className="w-4 h-4" />

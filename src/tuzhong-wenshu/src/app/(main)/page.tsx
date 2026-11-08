@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useMemo } from 'react'
 import {
   BookOpen,
   Plus,
@@ -18,7 +18,18 @@ import {
 } from 'lucide-react'
 import Link from 'next/link'
 import { useRouter } from 'next/navigation'
-import AIGenerateWizard from '@/components/ai-generate-wizard'
+import AIGenerateWizard, {
+  // 🔥 2026-09-11 严重 bug 修复：书架↔向导草稿箱双向同步（服务端权威源 + 删除同步）
+  deleteDraftShared,
+  reconcileDraftsWithServer,
+  filterInProgressDrafts,
+  readLocalDraftsIndex,
+  DRAFTS_INDEX_KEY,
+  ACTIVE_NOVEL_ID_KEY,
+  PENDING_OPEN_DRAFT_KEY,
+  DRAFTS_CHANGED_EVENT,
+  type DraftEntry,
+} from '@/components/ai-generate-wizard'
 
 // ============ 作品类型枚举（覆盖主流网文平台全部分类） ============
 export const GENRE_OPTIONS = [
@@ -77,7 +88,7 @@ interface Novel {
   wordCount: number
   lastModified: string
   healthScore: number
-  status: 'writing' | 'completed' | 'paused'
+  status: 'writing' | 'completed' | 'paused' | 'drafting'
   cover?: string
 }
 
@@ -156,8 +167,36 @@ export default function Home() {
   const [aiGuideNovelId, setAiGuideNovelId] = useState<string | null>(null)
   const [showDraftsModal, setShowDraftsModal] = useState(false)
 
-  // 删除确认弹窗状态
-  const [deleteTarget, setDeleteTarget] = useState<Novel | null>(null)
+  // 删除确认弹窗状态（作品 / 草稿通用，最小结构）
+  const [deleteTarget, setDeleteTarget] = useState<{ id: string; title: string; status?: string } | null>(null)
+
+  // 🔥🔥🔥 2026-09-11 严重 bug 修复：书架↔向导草稿箱双向同步
+  //   书架草稿箱不再只按 novels.filter(status==='drafting') 渲染，而是与服务端对账后的
+  //   「服务端 ∪ 本地索引」并集（与向导草稿箱同源），删除两侧共用 deleteDraftShared。
+  const [draftList, setDraftList] = useState<DraftEntry[]>([])
+  const [novelsLoaded, setNovelsLoaded] = useState(false)
+  const serverDrafts = useMemo(() => novels.filter(n => n.status === 'drafting'), [novels])
+
+  // 从服务端重新拉取作品列表
+  const refreshNovels = async () => {
+    try {
+      const token = localStorage.getItem('token')
+      const headers: Record<string, string> = {}
+      if (token) headers['Authorization'] = 'Bearer ' + token
+      const res = await fetch('/tuzhong-wenshu/api/novels', { headers })
+      if (res.ok) {
+        const json = await res.json()
+        if (json.data && Array.isArray(json.data)) {
+          setNovels(json.data)
+        }
+      }
+    } catch (e) {
+      console.error('[home] 加载作品列表失败，保留当前数据:', e)
+    } finally {
+      setIsLoading(false)
+      setNovelsLoaded(true)
+    }
+  }
 
   // 标记客户端已挂载（避免 SSR/客户端 hydration mismatch）
   useEffect(() => {
@@ -165,26 +204,42 @@ export default function Home() {
   }, [])
 
   // 初始化时通过 API 加载作品数据（服务端文件存储，不依赖 localStorage）
+  useEffect(() => { void refreshNovels() }, [])
+
+  // 与服务端对账草稿列表：服务端 ∪ 本地（按 id 去重，服务端优先），剪除服务端已删项，写回本地索引
+  // 注意：必须在作品列表首次加载完成后再对账，避免用空列表误剪本地条目
   useEffect(() => {
-    async function fetchNovels() {
-      try {
-        const token = localStorage.getItem('token')
-        const headers: Record<string, string> = {}
-        if (token) headers['Authorization'] = 'Bearer ' + token
-        const res = await fetch('/tuzhong-wenshu/api/novels', { headers })
-        if (res.ok) {
-          const json = await res.json()
-          if (json.data && Array.isArray(json.data)) {
-            setNovels(json.data)
-          }
-        }
-      } catch {
-        // API 请求失败，使用默认数据
-      } finally {
-        setIsLoading(false)
+    if (!novelsLoaded) return
+    setDraftList(reconcileDraftsWithServer(serverDrafts))
+  }, [novelsLoaded, serverDrafts])
+
+  // 草稿变更即时同步：同页自定义事件（tuzhong-drafts-changed）+ 跨标签 storage 事件
+  useEffect(() => {
+    const onDraftsChanged = (e: Event) => {
+      const detail = (e as CustomEvent).detail || {}
+      if (detail && detail.deletedId) {
+        // 乐观移除被删项（书架侧 / 向导侧删除均走这里）
+        setNovels(prev => prev.filter(n => n.id !== detail.deletedId))
+        setDraftList(prev => prev.filter(d => d.id !== detail.deletedId))
+      } else {
+        setDraftList(filterInProgressDrafts(readLocalDraftsIndex()))
+      }
+      void refreshNovels()
+    }
+    const onStorage = (e: StorageEvent) => {
+      if (!e || !e.key) return
+      if (e.key === DRAFTS_INDEX_KEY || e.key === ACTIVE_NOVEL_ID_KEY) {
+        // 其它标签页删/改了草稿 → 先按本地索引即时刷新，再从服务端复核
+        setDraftList(filterInProgressDrafts(readLocalDraftsIndex()))
+        void refreshNovels()
       }
     }
-    fetchNovels()
+    window.addEventListener(DRAFTS_CHANGED_EVENT, onDraftsChanged)
+    window.addEventListener('storage', onStorage)
+    return () => {
+      window.removeEventListener(DRAFTS_CHANGED_EVENT, onDraftsChanged)
+      window.removeEventListener('storage', onStorage)
+    }
   }, [])
 
   const filteredNovels = novels.filter(novel =>
@@ -262,32 +317,49 @@ export default function Home() {
   }
 
   // 删除作品
+  // 删除作品 / 草稿：统一走 deleteDraftShared（服务端删除 + 本地草稿清理 + 两侧即时同步）
   const handleDeleteNovel = async () => {
     if (!deleteTarget) return
+    const target = deleteTarget
     try {
-      const res = await fetch(`/tuzhong-wenshu/api/novels?id=${deleteTarget.id}`, {
-        method: 'DELETE',
-      })
-      if (res.ok) {
-        setNovels((prev) => prev.filter((n) => n.id !== deleteTarget.id))
-        setDeleteTarget(null)
-      }
+      await deleteDraftShared(target.id, target.title)
+      // 乐观移除 + 重新拉取服务端列表，保证书架 / 向导 / 跨标签一致
+      setNovels((prev) => prev.filter((n) => n.id !== target.id))
+      setDraftList((prev) => prev.filter((d) => d.id !== target.id))
+      setDeleteTarget(null)
+      void refreshNovels()
     } catch {
       alert('删除失败，请重试')
     }
+  }
+
+  // 书架草稿箱「继续生成」：服务端草稿沿用原恢复逻辑；本地独有草稿交给向导按本地副本恢复
+  const handleResumeDraftItem = (draft: DraftEntry) => {
+    const isServerDraft = serverDrafts.some((d) => d.id === draft.id)
+    if (isServerDraft) { void handleResumeDraft(draft.id); return }
+    try { localStorage.setItem(PENDING_OPEN_DRAFT_KEY, draft.id) } catch (e) { console.error('[home] 写入草稿恢复标记失败:', e) }
+    setShowDraftsModal(false)
+    setShowAIGuide(true)
   }
 
   const handleResumeDraft = async (novelId: string) => {
     try {
       const token = localStorage.getItem('token')
       const r = await fetch(`/tuzhong-wenshu/api/settings?novelId=${novelId}`, { headers: token ? { Authorization: 'Bearer ' + token } : {} })
+      // 🔥 Bug修复：此前未判 r.ok —— 401/500 时 j.data=undefined，用空对象覆盖全局草稿快照，造成数据丢失
+      if (!r.ok) { alert('打开草稿失败（' + r.status + '），请重新登录后重试'); return }
       const j = await r.json()
+      // 🔥 Bug修复：只有拿到有效快照才写入 localStorage，避免空对象覆盖
+      if (!j || typeof j !== 'object' || !j.data || typeof j.data !== 'object' || Object.keys(j.data).length === 0) { alert('该草稿快照为空或服务端返回异常，无法恢复'); return }
       const d = j.data || {}
-      const gen = {
+      if (!d || typeof d !== 'object' || Object.keys(d).length === 0) { alert('该草稿快照为空，无法恢复'); return }
+      const gen: Record<string, any> = {
         idea: d.idea || null, worldbuilding: d.worldbuilding || null, powerSystem: d.powerSystem || null,
         characters: d.characters || null, factions: d.factions || null, relationships: d.relationships || null,
         synopsis: d.synopsis || null, outline: d.outline || null, keyPlots: d.keyPlots || null, chapters: d.chapters || null,
       }
+      // 🔥 2026-09-08 #161 封面恢复：服务端快照 cover.coverUrl 映射回 generatedData.coverUrl（封面步解锁门依赖）
+      if (d.cover && typeof d.cover === 'object' && d.cover.coverUrl) gen.coverUrl = d.cover.coverUrl
       localStorage.setItem('tuzhong-generated-data', JSON.stringify(gen))
       localStorage.setItem('tuzhong-active-novel-id', novelId)
       // 🔥 2026-09-03 #120：回到「中断时所处的环节」，而不是一律跳到 chapters
@@ -459,8 +531,8 @@ export default function Home() {
             >
               <FolderOpen className="w-4 h-4" />
               <span>草稿箱</span>
-              {novels.filter(n => n.status === 'drafting').length > 0 && (
-                <span className="absolute -top-2 -right-2 min-w-[20px] h-5 px-1 rounded-full bg-[#c8364d] text-white text-xs flex items-center justify-center">{novels.filter(n => n.status === 'drafting').length}</span>
+              {draftList.length > 0 && (
+                <span className="absolute -top-2 -right-2 min-w-[20px] h-5 px-1 rounded-full bg-[#c8364d] text-white text-xs flex items-center justify-center">{draftList.length}</span>
               )}
             </button>
             <button
@@ -492,7 +564,7 @@ export default function Home() {
         </div>
 
         {/* 作品网格 */}
-        <div className="grid grid-cols-3 md:grid-cols-5 lg:grid-cols-6 gap-4">
+        <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-5 lg:grid-cols-5 xl:grid-cols-5 gap-4">
           {/* 作品卡片 */}
           {filteredNovels.map((novel, index) => (
             <div
@@ -698,29 +770,34 @@ export default function Home() {
               <button onClick={() => setShowDraftsModal(false)} className="text-stone-400 hover:text-stone-600"><X className="w-5 h-5" /></button>
             </div>
             <div className="p-4 overflow-y-auto">
-              {novels.filter(n => n.status === 'drafting').length === 0 ? (
+              {draftList.length === 0 ? (
                 <div className="text-center py-12 text-stone-400">
                   <FolderOpen className="w-10 h-10 mx-auto mb-3 opacity-40" />
                   <p>暂无草稿</p>
-                  <p className="text-sm mt-1">AI 全自动生成中途退出/刷新未完成的作品会保存在这里</p>
+                  <p className="text-sm mt-1">AI 全自动生成中途退出/刷新未完成的作品会保存在这里（已与向导草稿箱同步）</p>
                 </div>
               ) : (
                 <div className="space-y-3">
-                  {novels.filter(n => n.status === 'drafting').map(n => (
+                  {draftList.map(n => (
                     <div key={n.id} className="flex items-center justify-between p-3 border border-stone-200 rounded-lg hover:bg-stone-50">
                       <div className="min-w-0">
-                        <div className="font-medium text-stone-900 truncate">{n.title}</div>
-                        <div className="text-xs text-stone-500 mt-0.5">{n.genre} · {((n.wordCount || 0) / 10000).toFixed(1)}万字 · {n.lastModified || ''} · 未完成(可续生成)</div>
+                        <div className="font-medium text-stone-900 truncate">{n.title || '（未命名草稿）'}</div>
+                        <div className="text-xs text-stone-500 mt-0.5">
+                          {n.genre || '未定题材'} · {((n.wordCount || 0) / 10000).toFixed(1)}万字
+                          {n.lastModified ? ' · ' + n.lastModified : (n.updatedAt ? ' · ' + new Date(n.updatedAt).toLocaleDateString('zh-CN') : '')}
+                          {' · 未完成(可续生成)'}
+                        </div>
                       </div>
                       <div className="flex-shrink-0 ml-3 flex items-center gap-2">
-                        <button onClick={() => handleResumeDraft(n.id)} className="px-3 py-1.5 bg-[#c8364d] text-white rounded-lg text-sm hover:bg-[#a82841] transition-colors">继续生成</button>
-                        <button onClick={() => setDeleteTarget(n)} title="删除草稿" className="px-2 py-1.5 bg-red-50 text-red-600 rounded-lg text-sm hover:bg-red-100 transition-colors">🗑</button>
+                        <button onClick={() => handleResumeDraftItem(n)} className="px-3 py-1.5 bg-[#c8364d] text-white rounded-lg text-sm hover:bg-[#a82841] transition-colors">继续生成</button>
+                        <button onClick={() => setDeleteTarget({ id: n.id, title: n.title || '（未命名草稿）' })} title="删除草稿" className="px-2 py-1.5 bg-red-50 text-red-600 rounded-lg text-sm hover:bg-red-100 transition-colors">🗑</button>
                       </div>
                     </div>
                   ))}
                 </div>
               )}
             </div>
+            <div className="px-5 py-3 border-t border-stone-200 text-xs text-stone-400">草稿已与服务端同步：此处删除会同步到「AI 全自动生成」向导内的草稿箱，反之亦然。</div>
           </div>
         </div>
       )}

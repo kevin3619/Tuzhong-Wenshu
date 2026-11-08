@@ -3,6 +3,7 @@ import fs from 'fs'
 import path from 'path'
 import crypto from 'crypto'
 import { getRequestActor } from '@/lib/permissions'
+import { atomicWriteJson } from '@/lib/file-lock'
 
 // 风格数据结构类型定义
 interface Style {
@@ -43,7 +44,7 @@ function readStyles(): Style[] {
 // 写入风格数据
 function writeStyles(data: Style[]) {
   ensureDataFolder()
-  fs.writeFileSync(stylesFile, JSON.stringify(data, null, 2), 'utf-8')
+  atomicWriteJson(stylesFile, data)
 }
 
 /**
@@ -103,7 +104,9 @@ export async function POST(request: Request) {
 
     // 检查是否已存在同名风格（仅当前用户范围内）
     const existingStyle = styles.find(
-      (s) => s.name.toLowerCase() === name.toLowerCase() && (!s.userId || s.userId === actor.userId)
+      // 🔥 修复（P2）：库里的 name 可能为 null/对象（旧版 PUT 无字段校验），
+      //   旧写法会让整个风格列表 500，影响所有用户。
+      (s) => String(s.name || '').toLowerCase() === String(name).toLowerCase() && (!s.userId || s.userId === actor.userId)
     )
     if (existingStyle) {
       return NextResponse.json(
@@ -168,14 +171,29 @@ export async function PUT(request: Request) {
     }
 
     // 归属校验：仅所有者或管理员可修改
-    if (!actor.isAdmin && styles[index].userId && styles[index].userId !== actor.userId) {
+    // 🔥 修复（P2 越权）：无归属的旧记录此前任何登录用户都能改/删。
+    if (!actor.isAdmin && (!styles[index].userId || styles[index].userId !== actor.userId)) {
       return NextResponse.json({ error: '无权修改此风格' }, { status: 403 })
     }
+
+    // 🔥 修复（P2）：updateData 原样展开可把 name 写成 null，之后读取即抛错。
+    const safeUpdate = { ...(updateData as Record<string, unknown>) }
+    if ('name' in safeUpdate) {
+      const nm = typeof safeUpdate.name === 'string' ? safeUpdate.name.trim() : ''
+      if (!nm || nm.length > 60) return NextResponse.json({ error: '风格名称必须是 1-60 个字符的文本' }, { status: 400 })
+      safeUpdate.name = nm
+    }
+    if ('description' in safeUpdate) {
+      const d = typeof safeUpdate.description === 'string' ? safeUpdate.description.trim() : ''
+      if (!d || d.length > 500) return NextResponse.json({ error: '风格描述必须是 1-500 个字符的文本' }, { status: 400 })
+      safeUpdate.description = d
+    }
+    if (!actor.isAdmin) { delete safeUpdate.userId; delete safeUpdate.id; delete safeUpdate.createdAt }
 
     // 更新风格数据
     styles[index] = {
       ...styles[index],
-      ...updateData,
+      ...safeUpdate,
       // 不允许修改 id 和 createdAt
       id: styles[index].id,
       createdAt: styles[index].createdAt,

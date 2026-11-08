@@ -40,6 +40,12 @@ const SNAKE_TO_CAMEL: Record<string, string> = {
   wechat_pay_private_key: 'wechatPayPrivateKey',
   legal_terms: 'legalTerms',
   legal_privacy: 'legalPrivacy',
+  mail_host: 'mailHost',
+  mail_port: 'mailPort',
+  mail_user: 'mailUser',
+  mail_pass: 'mailPass',
+  mail_secure: 'mailSecure',
+  mail_from: 'mailFrom',
 }
 const CAMEL_TO_SNAKE: Record<string, string> = {}
 Object.entries(SNAKE_TO_CAMEL).forEach(function ([snake, camel]) {
@@ -78,7 +84,7 @@ const DEFAULTS: Record<string, string> = {
   quarterly_price: '219',
   yearly_price: '799',
   lifetime_price: '2199',
-  ai_daily_free_quota: '3',
+  ai_daily_free_quota: '20',
   system_notice: '',
   ai_provider: 'deepseek',
   ai_api_key: '',
@@ -101,6 +107,12 @@ const DEFAULTS: Record<string, string> = {
   wechat_callback_domain: process.env.WECHAT_CALLBACK_DOMAIN || '',
   legal_terms: '',
   legal_privacy: '',
+  mail_host: '',
+  mail_port: '587',
+  mail_user: '',
+  mail_pass: '',
+  mail_secure: '0',
+  mail_from: '',
 }
 
 // 🔥 脏值黑名单：这些明显是开发期占位/测试用户名密码，绝不允许从 LEGACY_KEYS 或 默认值 写入到敏感配置
@@ -130,6 +142,7 @@ const SENSITIVE_CONFIG_KEYS = new Set<string>([
   'wechat_pay_private_key', 'wechatPayPrivateKey',
   'ai_api_key', 'aiApiKey',
   'wx_open_appid', 'wx_open_secret',
+  'mail_pass', 'mailPass',
 ])
 
 function isDirtyValue(key: string, val: string): boolean {
@@ -209,6 +222,12 @@ function normalizeMap(
     if (cDirty) { configMap[camel] = ''; migrated = true }
     if ((!sDirty) && sEmpty && !cEmpty) { configMap[snake] = cVal; migrated = true }
     else if ((!cDirty) && !sEmpty && cEmpty) { configMap[camel] = sVal; migrated = true }
+    // 🔥 统一两套命名：canonical = snake。若两侧都有值且不一致（历史脏数据），
+    //    强制 camel 取 snake，保证「改一个另一个也生效 / 读任一侧都一致」。
+    else if ((!sDirty) && (!cDirty) && !sEmpty && !cEmpty && sVal !== cVal) {
+      configMap[camel] = sVal
+      migrated = true
+    }
   })
 
   return { migrated }
@@ -251,7 +270,7 @@ export async function GET(request: NextRequest) {
             create: { configKey: k, configValue: String(v), createdAt: now, updatedAt: now },
           })
         }
-      } catch { /* 静默 */ }
+      } catch (e) { console.error('[sys-config] upsert 系统配置失败:', e) }
     }
 
     // 强制客户端 & 中间层永不缓存，避免 React 水合后显示陈旧 "leiyang" 等脏数据
@@ -327,7 +346,7 @@ export async function POST(request: NextRequest) {
     const writeKeysSet = new Set(rows.map(function (r) { return r.key }))
     for (const lk of legacyKeysToDelete) {
       if (lk && !writeKeysSet.has(lk)) {
-        await prisma.systemConfig.deleteMany({ where: { configKey: lk } }).catch(function () {})
+        await prisma.systemConfig.deleteMany({ where: { configKey: lk } }).catch(function (err) { console.error('[sys-config] 清理遗留配置键失败:', lk, err) })
       }
     }
 

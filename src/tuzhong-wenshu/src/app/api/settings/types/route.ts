@@ -2,35 +2,8 @@ import { NextResponse } from 'next/server'
 import fs from 'fs'
 import path from 'path'
 import { getRequestActor } from '@/lib/permissions'
-
-// 修复：动态解析数据目录路径，支持 PM2 等不同运行环境
-// 同时支持 .tuzhong-data (规范) 与 data (用户习惯命名)
-function resolveDataDir(): string {
-  const cwd = process.cwd()
-  const candidates = [
-    path.join(cwd, '.tuzhong-data'),
-    path.join(cwd, 'data'),
-    path.join(cwd, 'src', 'tuzhong-wenshu', '.tuzhong-data'),
-    path.join(cwd, 'src', 'tuzhong-wenshu', 'data'),
-    path.join(cwd, '..', '.tuzhong-data'),
-    path.join(cwd, '..', 'data'),
-    '/www/wwwroot/tuzhong-wenshu/.tuzhong-data',
-    '/www/wwwroot/tuzhong-wenshu/data',
-  ]
-  for (const p of candidates) {
-    try {
-      if (fs.existsSync(p)) return p
-    } catch {
-      // continue
-    }
-  }
-  const defaultPath = path.join(cwd, '.tuzhong-data')
-  try { if (!fs.existsSync(defaultPath)) fs.mkdirSync(defaultPath, { recursive: true }) } catch { /* ignore */ }
-  return defaultPath
-}
-
-// 每次调用动态解析，不缓存
-function getDataDir(): string { return resolveDataDir() }
+import { resolveDataDir, getDataDir } from '@/lib/data-dir'
+import { atomicWriteJson } from '@/lib/file-lock'
 
 function ensureDataFolder() {
   const d = getDataDir()
@@ -577,7 +550,7 @@ function readTypes(): TypesData {
 
 function writeTypes(data: TypesData) {
   ensureDataFolder()
-  fs.writeFileSync(getTypesFile(), JSON.stringify(data, null, 2), 'utf-8')
+  atomicWriteJson(getTypesFile(), data)
 }
 
 export async function GET() {

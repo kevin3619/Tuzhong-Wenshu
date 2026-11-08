@@ -109,7 +109,7 @@ export function cleanGraphJson(rawResponse: string): {
       }
     }
   } catch (_err1) {
-    // 第一次解析失败，尝试二次修正
+    console.error('[graph-json-cleaner] 第一次JSON解析失败，尝试二次修正:', _err1)
   }
 
   // 二次修正：修复常见JSON格式问题
@@ -136,7 +136,7 @@ export function cleanGraphJson(rawResponse: string): {
       }
     }
   } catch (_err2) {
-    // 二次修正也失败
+    console.error('[graph-json-cleaner] 二次修正后JSON仍解析失败，返回空图谱兜底:', _err2)
   }
 
   // 最终兜底：返回空图谱结构

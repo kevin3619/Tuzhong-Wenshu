@@ -3,6 +3,7 @@
 import { useEffect, useState } from 'react'
 import { AlertCircle } from 'lucide-react'
 import type { GeneratedData } from '../ai-generate-wizard'
+import { autoResize } from '@/hooks/useAutoResize'
 
 interface StepWorldbuildingProps {
   data: GeneratedData['worldbuilding']
@@ -302,11 +303,6 @@ export default function StepWorldbuilding({
       .catch(function(e: unknown) { console.warn('[StepWorldbuilding] 加载体系类型失败:', e instanceof Error ? e.message : String(e)) })
   }, [])
 
-  const autoResize = function(e: React.FormEvent<HTMLTextAreaElement>) {
-    const ta = e.currentTarget
-    ta.style.height = 'auto'
-    ta.style.height = ta.scrollHeight + 'px'
-  }
 
   useEffect(function() {
     const timer = setTimeout(function() {
@@ -563,7 +559,7 @@ export default function StepWorldbuilding({
         }
       }
     }
-  } catch (_pfErr) { /* 兜底失败不影响主流程 */ }
+  } catch (_pfErr) { console.error('[StepWorldbuilding] 兜底回填配对 rankTable 失败（不影响主流程）:', _pfErr) }
 
   return (
     <div className="space-y-6">

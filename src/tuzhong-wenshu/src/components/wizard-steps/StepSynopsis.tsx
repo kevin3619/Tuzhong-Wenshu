@@ -2,6 +2,7 @@
 
 import { useEffect } from 'react'
 import type { GeneratedData } from '../ai-generate-wizard'
+import { autoResize } from '@/hooks/useAutoResize'
 
 interface StepSynopsisProps {
   data: GeneratedData['synopsis']
@@ -30,11 +31,6 @@ export default function StepSynopsis({
     return function() { clearTimeout(timer) }
   }, [data])
 
-  const autoResize = function(e: React.FormEvent<HTMLTextAreaElement>) {
-    const ta = e.currentTarget
-    ta.style.height = 'auto'
-    ta.style.height = ta.scrollHeight + 'px'
-  }
 
   if (!data || (!data.shortIntro && !data.oneLineIntro && !data.fullIntro && !data.sellingPoints)) {
     return (

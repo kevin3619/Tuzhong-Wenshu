@@ -14,7 +14,7 @@ YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
-APP_DIR="/root/tuzhong-wenshu"
+APP_DIR="/www/wwwroot/tuzhong-wenshu"
 APP_PORT=3001
 NGINX_CONF_SRC="/root/tuzhong-wenshu/nginx-tuzhongwang.conf"
 NGINX_CONF_DST="/etc/nginx/conf.d/tuzhongwang.conf"
@@ -207,6 +207,40 @@ fi
 # 检查 Nginx
 NGINX_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost 2>/dev/null || echo "000")
 echo -e "${GREEN}  [OK] Nginx 反向代理 (HTTP $NGINX_CODE)${NC}"
+
+# ============================================
+# STEP 12: 登录 E2E 校验（防止 Edge 中间件密钥与运行时不一致导致登录后被弹回）
+# 历史故障：15:00 构建内联旧 JWT_SECRET，17:00 改 .env 未重建 → 中间件验签失败 → 登录闪退。
+# ============================================
+echo -e "${YELLOW}[STEP 12] Login E2E verify...${NC}"
+
+B="http://localhost:$APP_PORT/tuzhong-wenshu"
+VU="deployverify$(date +%s)"
+curl -s -o /dev/null -X POST "$B/api/auth/register" -H 'Content-Type: application/json' \
+  -d "{\"username\":\"$VU\",\"password\":\"Verify#2026!\",\"nickname\":\"verify\"}" -w 'register:%{http_code}\n'
+curl -s -c /tmp/deploy-verify-cookies.txt -o /dev/null -X POST "$B/api/auth/login" -H 'Content-Type: application/json' \
+  -d "{\"username\":\"$VU\",\"password\":\"Verify#2026!\"}" -w 'login:%{http_code}\n'
+# 断言 1：带 cookie 访问受保护页面 /write 必须 200（不能 307 弹回登录）
+# 注：不能用 "$B/" 做断言——basePath 根路径带尾斜杠会 308 归一，属误判源。
+PAGE_CODE=$(curl -s -b /tmp/deploy-verify-cookies.txt -o /dev/null -w '%{http_code}' "$B/write")
+# 断言 2：无 cookie 访问 /write 必须 307（确认中间件真的生效，而非未鉴权误放行）
+ANON_CODE=$(curl -s -o /dev/null -w '%{http_code}' "$B/write")
+if [ "$PAGE_CODE" != "200" ] || [ "$ANON_CODE" != "307" ]; then
+  echo -e "${RED}  [FAIL] 登录守卫未通过：带 Cookie /write=$PAGE_CODE（预期 200），匿名 /write=$ANON_CODE（预期 307）。${NC}"
+  echo -e "${RED}  若为 307：极可能是 Edge 中间件构建时内联的 JWT_SECRET 与运行时 .env 不一致。${NC}"
+  echo -e "${RED}  若为 200/307 互换：检查 middleware 鉴权逻辑与 basePath 归一。${NC}"
+  echo -e "${RED}  处理：确认 .env 后重新 npm run build && pm2 delete/start tuzhong-wenshu${NC}"
+  rm -f /tmp/deploy-verify-cookies.txt
+  exit 1
+fi
+echo -e "${GREEN}  [OK] 登录链路校验通过 (登录后 /write=$PAGE_CODE, 匿名 /write=$ANON_CODE)${NC}"
+# 清理临时校验账号
+node -e "
+const {PrismaClient}=require('@prisma/client');
+const p=new PrismaClient();
+p.user.delete({where:{username:'$VU'}}).then(()=>console.log('verify user cleaned')).catch(()=>console.log('verify user clean skipped'));
+" 2>/dev/null || true
+rm -f /tmp/deploy-verify-cookies.txt
 
 echo ""
 echo -e "${CYAN}==========================================${NC}"

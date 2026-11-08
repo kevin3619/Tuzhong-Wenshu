@@ -181,7 +181,7 @@ import { join } from 'path'
 const CACHE_DIR = join(process.cwd(), '.tuzhong-data')
 const CACHE_FILE = join(CACHE_DIR, 'historical-titles-cache.json')
 let _cache: Record<string, { title: string; src: string; at: number }> | null = null
-const _inflight: Record<string, Promise<{ title: string; src: string } | null>> = {}
+const _inflight: Record<string, Promise<{ title: string; src: string } | null> | undefined> = {}
 
 function loadCache() {
   if (_cache) return _cache
@@ -195,7 +195,7 @@ function saveCache() {
   try {
     if (!existsSync(CACHE_DIR)) mkdirSync(CACHE_DIR, { recursive: true })
     writeFileSync(CACHE_FILE, JSON.stringify(_cache || {}, null, 2), 'utf-8')
-  } catch (_e) { /* 缓存写失败不影响主流程 */ }
+  } catch (_e) { console.error('[historical-titles] 缓存写盘失败（不影响主流程）:', _e) }
 }
 
 // 官职/爵位类后缀（用于从百科正文里挑出可作徽章的定称）
@@ -248,7 +248,7 @@ async function fetchBaikePersonText(name: string): Promise<string> {
         return html.replace(/<script[\s\S]*?<\/script>/g, ' ').replace(/<style[\s\S]*?<\/style>/g, ' ').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ')
       }
     }
-  } catch (_e) { /* 回退 Playwright */ }
+  } catch (_e) { console.error('[historical-titles] fetch 拉取历史词条失败，回退 Playwright:', _e) }
   try {
     const pw = (await import('./book-sources/playwright-manager')).default
     const browser = await pw.getBrowser()
@@ -275,7 +275,7 @@ export async function lookupTitleOnline(name: unknown): Promise<{ title: string;
   const cached = cache[n]
   if (cached && cached.title) return { title: cached.title, src: cached.src || '百度百科' }
   if (_inflight[n]) return _inflight[n]
-  _inflight[n] = (async function () {
+  const p = (async function () {
     try {
       const text = await fetchBaikePersonText(n)
       const title = text ? extractTitleFromBaikeText(text, n) : ''
@@ -287,7 +287,8 @@ export async function lookupTitleOnline(name: unknown): Promise<{ title: string;
     } catch (_e) { return null }
     finally { delete _inflight[n] }
   })()
-  return _inflight[n]
+  _inflight[n] = p
+  return p
 }
 
 /** 批量在线查证（限并发，避免打爆来源） */

@@ -147,8 +147,9 @@ export async function PUT(request: NextRequest) {
       subscriptionExpiresAt?: string | null
       isAdmin?: boolean
     } = { updatedAt: new Date().toISOString() }
-    const VALID_TIERS_PUT = ['free', 'monthly', 'quarterly', 'yearly', 'lifetime', 'pro']
-    if (status !== undefined) updateData.status = status
+    const VALID_TIERS_PUT = ['free', 'monthly', 'quarterly', 'yearly', 'lifetime', 'pro', 'annual']
+    // 🔥 Bug修复：status 未校验（非 0/1 值直接写入 Prisma Int 字段会 500，脏数据长期入库）
+    if (status !== undefined) updateData.status = Number(status) === 0 ? 0 : 1
     if (subscriptionTier !== undefined) {
       const t = String(subscriptionTier).trim()
       updateData.subscriptionTier = VALID_TIERS_PUT.includes(t) ? t : 'free'

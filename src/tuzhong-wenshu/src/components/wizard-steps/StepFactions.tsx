@@ -4,6 +4,7 @@ import { useEffect, useState } from 'react'
 import { Trash2 } from 'lucide-react'
 import { extractText } from '@/lib/text-utils'
 import type { GeneratedData } from '../ai-generate-wizard'
+import { autoResize } from '@/hooks/useAutoResize'
 
 type FactionItem = NonNullable<NonNullable<GeneratedData['factions']>['factions']>[number]
 
@@ -55,11 +56,6 @@ export default function StepFactions({
     } finally {
       setNormalizing(false)
     }
-  }
-  const autoResize = function(e: React.FormEvent<HTMLTextAreaElement>) {
-    const ta = e.currentTarget
-    ta.style.height = 'auto'
-    ta.style.height = ta.scrollHeight + 'px'
   }
   // 数组字段解析：逗号/顿号分隔字符串 → 数组（用于内部派系/核心资源/招牌人物/友方/敌方）
   const _parseArrayField = function(text: string): string[] {

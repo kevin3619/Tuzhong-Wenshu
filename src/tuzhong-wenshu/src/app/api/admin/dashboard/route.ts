@@ -2,10 +2,13 @@ import { NextRequest, NextResponse } from 'next/server'
 import { Prisma } from '@prisma/client'
 import { prisma } from '@/lib/prisma'
 import { verifyAdmin } from '@/lib/permissions'
+import { countActiveVipUsers } from '@/lib/vip'
 import { loadFsNovels } from '@/lib/novel-storage'
 
 const THIRTY_MINUTES_MS = 30 * 60 * 1000
 
+// 🔥 修复（P1）：旧实现在「打开后台看板」这个只读请求里，按硬编码 30 分钟把 status=0
+//   改成前端不认的 status=3，既不看订单自己的 expireAt，也会把用户正在支付的订单提前判死。
 function autoCancelExpiredPayments() {
   const now = new Date()
   const expiredThreshold = new Date(now.getTime() - THIRTY_MINUTES_MS).toISOString()
@@ -44,7 +47,7 @@ export async function GET(request: NextRequest) {
     await autoCancelExpiredPayments()
 
     const totalUsers = await prisma.user.count()
-    const vipCount = await prisma.user.count({ where: { subscriptionTier: { not: 'free' } } })
+    const vipCount = await countActiveVipUsers(prisma)
     const dbNovels = await prisma.novel.count()
 
     const fsBooks = loadFsNovels()

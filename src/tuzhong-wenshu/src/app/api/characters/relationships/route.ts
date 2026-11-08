@@ -3,6 +3,8 @@ import fs from 'fs'
 import path from 'path'
 import crypto from 'crypto'
 import { getRequestActor, isAdminOnlyNovel, loadNovelMetaOrNull } from '@/lib/permissions'
+import { checkNovelAccessFor } from '@/lib/novel-access'
+import { atomicWriteJson } from '@/lib/file-lock'
 
 const dataDir = path.join(process.cwd(), '.tuzhong-data')
 
@@ -39,20 +41,13 @@ function readRelationships(): Record<string, Relationship[]> {
 
 function writeRelationships(data: Record<string, Relationship[]>) {
   ensureDataFolder()
-  fs.writeFileSync(relationshipsFile, JSON.stringify(data, null, 2), 'utf-8')
+  atomicWriteJson(relationshipsFile, data)
 }
 
 // 检查当前访问者是否有权限读取/写入指定 novel 的人物关系数据
-async function checkNovelAccess(request: Request, novelId: string): Promise<{ ok: boolean; status?: number; error?: string }> {
-  const actor = await getRequestActor(request)
-  if (actor.isAdmin) return { ok: true }
-  if (isAdminOnlyNovel(String(novelId))) return { ok: false, status: 403, error: '无权访问此作品人物关系' }
-  const meta = loadNovelMetaOrNull(String(novelId))
-  if (!meta) return { ok: false, status: 404, error: '作品不存在' }
-  if (!actor.userId) return { ok: false, status: 401, error: '请先登录' }
-  if (meta.userId && String(meta.userId) !== String(actor.userId)) return { ok: false, status: 403, error: '无权访问此作品人物关系' }
-  return { ok: true }
-}
+
+const checkNovelAccess = (request: Request, novelId: string) =>
+  checkNovelAccessFor(request, novelId, '人物关系')
 
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url)

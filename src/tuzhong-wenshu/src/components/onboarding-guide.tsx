@@ -69,14 +69,17 @@ export function useOnboarding() {
   useEffect(() => {
     // 检查是否是首次使用
     const completed = localStorage.getItem('tuzhong-onboarding-completed')
+    let delayTimer: ReturnType<typeof setTimeout> | null = null
     if (!completed) {
       // 使用 microtask 避免 useEffect 中同步 setState 触发 React Compiler 警告
       queueMicrotask(() => {
         setHasCompleted(false)
         // 延迟显示，等页面加载完成
-        setTimeout(() => setShowGuide(true), 1000)
+        delayTimer = setTimeout(() => setShowGuide(true), 1000)
       })
     }
+    // 🔥 Bug修复：1 秒内卸载/跳页后幽灵计时器仍会 setState
+    return function () { if (delayTimer) clearTimeout(delayTimer) }
   }, [])
 
   const startGuide = useCallback(() => {

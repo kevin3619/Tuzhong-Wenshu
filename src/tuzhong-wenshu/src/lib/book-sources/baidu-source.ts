@@ -51,7 +51,6 @@ export class BaiduSearchSource implements BookSourceProvider {
       
       const cached = localCache.get<BookSourceData>(CACHE_NAMESPACE, bookName)
       if (cached) {
-        console.log(`[BaiduSearchSource] 缓存命中: ${bookName}`)
         return cached
       }
       
@@ -71,7 +70,6 @@ export class BaiduSearchSource implements BookSourceProvider {
       
       try {
         // 先尝试静态fetch PC版（快速）
-        console.log('[BaiduSearchSource] 尝试静态fetch百度百科PC版...')
         
         let staticSuccess = false
         let isBlocked = true
@@ -92,22 +90,17 @@ export class BaiduSearchSource implements BookSourceProvider {
                 fromBaike = true
                 staticSuccess = true
                 baikeInfoBox = this.extractInfoBoxFromHtml(staticBaikeHtml)
-                console.log('[BaiduSearchSource] 静态fetch百度百科PC版成功（小说版），长度:', cleanedBaike.length)
-                console.log('[BaiduSearchSource] 静态提取信息框字段:', Object.keys(baikeInfoBox).length)
               } else {
-                console.log('[BaiduSearchSource] 静态fetch PC版成功但不是小说版，尝试移动版...')
                 isBlocked = true // 继续尝试移动版
               }
             }
           }
         } catch (staticError) {
-          console.log('[BaiduSearchSource] 静态fetch PC版失败（HTTP错误）:', staticError instanceof Error ? staticError.message : String(staticError))
           isBlocked = true
         }
         
         // PC版失败，尝试移动版
         if (!staticSuccess && isBlocked) {
-          console.log('[BaiduSearchSource] 尝试静态fetch百度百科移动版...')
           try {
             const mobileBaikeHtml = await this.fetchBaiduBaikeStatic(mobileBaikeUrl, Math.min(1500, timeout / 6), 'mobile')
             const isMobileBlocked = this.isBlockedPage(mobileBaikeHtml)
@@ -124,16 +117,12 @@ export class BaiduSearchSource implements BookSourceProvider {
                   fromBaike = true
                   staticSuccess = true
                   baikeInfoBox = this.extractInfoBoxFromHtml(mobileBaikeHtml)
-                  console.log('[BaiduSearchSource] 静态fetch百度百科移动版成功（小说版），长度:', cleanedMobile.length)
-                  console.log('[BaiduSearchSource] 移动版提取信息框字段:', Object.keys(baikeInfoBox).length)
                 } else {
-                  console.log('[BaiduSearchSource] 静态fetch移动版成功但不是小说版，跳过Playwright...')
                   isBlocked = true
                 }
               }
             }
           } catch (mobileError) {
-            console.log('[BaiduSearchSource] 静态fetch移动版失败:', mobileError instanceof Error ? mobileError.message : String(mobileError))
             isBlocked = true
           }
         }
@@ -158,29 +147,17 @@ export class BaiduSearchSource implements BookSourceProvider {
           const completeCount = [hasAuthor, hasWords, hasGenre, hasStatus].filter(Boolean).length
           staticDataComplete = completeCount >= 4 && hasChars
           
-          console.log('[BaiduSearchSource] 静态数据完整度检查:', 
-            '作者:', hasAuthor, 
-            '字数:', hasWords, 
-            '章节:', hasChapters, 
-            '类型:', hasGenre, 
-            '状态:', hasStatus,
-            '角色:', hasChars,
-            '完整:', staticDataComplete)
         }
         
         const needPlaywright = !staticSuccess || !staticDataComplete
         
         if (needPlaywright && elapsed < timeout * 0.6) {
-          console.log('[BaiduSearchSource] 静态数据不完整，切换Playwright模式补充数据...')
           
           try {
             const playwrightResult = await this.fetchBaiduBaikePlaywright(baikeUrl, remainingTimeout)
             const playwrightHtml = playwrightResult.html
-            console.log('[BaiduSearchSource] Playwright返回HTML长度:', playwrightHtml.length)
             
             const cleanedPlaywright = stripHtml(playwrightHtml)
-            console.log('[BaiduSearchSource] Playwright清理后文本长度:', cleanedPlaywright.length)
-            console.log('[BaiduSearchSource] 包含书名:', cleanedPlaywright.includes(bookName))
             
             if (cleanedPlaywright.length > 1000 && cleanedPlaywright.includes(bookName)) {
               baikeText = cleanedPlaywright
@@ -190,26 +167,17 @@ export class BaiduSearchSource implements BookSourceProvider {
               // 优先使用Playwright直接从DOM提取的infoBox（最准确）
               if (playwrightResult.infoBox && Object.keys(playwrightResult.infoBox).length > 0) {
                 baikeInfoBox = playwrightResult.infoBox
-                console.log('[BaiduSearchSource] 使用Playwright DOM提取的信息框')
               } else {
                 // 兜底：从HTML中静态提取
                 baikeInfoBox = this.extractInfoBoxFromHtml(playwrightHtml)
-                console.log('[BaiduSearchSource] 使用静态HTML提取的信息框')
-              }
-              console.log('[BaiduSearchSource] 信息框字段数:', Object.keys(baikeInfoBox).length)
-              console.log('[BaiduSearchSource] Playwright百度百科成功，长度:', cleanedPlaywright.length)
-            } else {
-              console.warn('[BaiduSearchSource] Playwright内容验证失败，长度:', cleanedPlaywright.length, '包含书名:', cleanedPlaywright.includes(bookName))
-              if (cleanedPlaywright.length > 0 && cleanedPlaywright.length < 2000) {
-                console.warn('[BaiduSearchSource] 内容预览:', cleanedPlaywright.substring(0, 200))
               }
             }
           } catch (pwError) {
-            console.warn('[BaiduSearchSource] Playwright模式失败:', pwError instanceof Error ? pwError.message : String(pwError))
+            console.error('[baidu-source] Playwright 拉取百科正文失败:', pwError)
           }
         }
       } catch (e) {
-        console.warn('[BaiduSearchSource] 百度百科访问失败:', e instanceof Error ? e.message : String(e))
+        console.error('[baidu-source] 百科抓取主流程（静态+Playwright）异常:', e)
       }
       
       // 🔥 判断百度百科数据完整度
@@ -237,12 +205,6 @@ export class BaiduSearchSource implements BookSourceProvider {
       const isCoreComplete = coreFieldsCount >= 3
       const isHighQuality = coreFieldsCount >= 4 && hasChapterData && hasSummary && !isChapterSuspicious && chapterNum >= 100
       
-      console.log('[BaiduSearchSource] 数据完整度评估:', 
-        '核心字段:', coreFieldsCount, '/4', 
-        '章节数据:', hasChapterData, 
-        '章节可疑:', isChapterSuspicious,
-        '摘要:', hasSummary, 
-        '高质量:', isHighQuality)
       
       // 🔥 优化搜索策略：只有关键信息缺失时才追加搜索
       let baseQueries: string[] = []
@@ -266,7 +228,6 @@ export class BaiduSearchSource implements BookSourceProvider {
         if ((!hasChapterData || isChapterSuspicious) && baikeInfoBox['连载状态'] !== '连载中') {
           baseQueries.unshift(`${bookName} 小说 一共多少章`)
           baseQueries.unshift(`${bookName} 小说 总章节数`)
-          console.log('[BaiduSearchSource] 缺少章节数据或章节数可疑，追加章节数查询')
         }
       }
       
@@ -279,9 +240,7 @@ export class BaiduSearchSource implements BookSourceProvider {
       
       // 🔥 如果百度百科数据高质量完整，跳过所有额外搜索
       if (isHighQuality) {
-        console.log('[BaiduSearchSource] 百度百科数据高质量完整，跳过所有百度搜索补充')
       } else if (fromBaike && isCoreComplete && hasChapterData && !isChapterSuspicious && chapterNum >= 100) {
-        console.log('[BaiduSearchSource] 百度百科核心数据完整，跳过搜索补充')
       } else {
       for (let i = 0; i < baseQueries.length; i++) {
         const query = baseQueries[i]
@@ -309,13 +268,12 @@ export class BaiduSearchSource implements BookSourceProvider {
             break
           }
         } catch (e) {
-          console.warn(`[BaiduSearchSource] 搜索"${query}"失败:`, e instanceof Error ? e.message : String(e))
+          console.error('[baidu-source] 解析搜索结果候选异常，跳过该候选继续:', e)
         }
       }
       }
       
       if (successCount === 0 || !allText.trim()) {
-        console.warn('[BaiduSearchSource] 所有搜索都失败了，返回基础数据供LLM补全')
         const fallbackResult = createDefaultBook(bookName, '百度搜索')
         fallbackResult.confidence = 30
         return fallbackResult
@@ -332,7 +290,6 @@ export class BaiduSearchSource implements BookSourceProvider {
       if (!isFromBaikeDetail) {
         const originalConfidence = result.confidence
         result.confidence = Math.min(result.confidence, 55)
-        console.log(`[BaiduSearchSource] 非百度百科详情页数据，置信度从 ${originalConfidence} 降至 ${result.confidence}`)
       }
       
       // 🔥 数据合理性校验：字数和章节数比例是否合理
@@ -340,7 +297,6 @@ export class BaiduSearchSource implements BookSourceProvider {
         const avgChapterWords = (result.wordCountWan * 10000) / result.totalChapters
         // 网络小说平均每章通常在1000-10000字之间
         if (avgChapterWords < 500 || avgChapterWords > 20000) {
-          console.warn(`[BaiduSearchSource] 字数章节比例异常（平均每章${Math.round(avgChapterWords)}字），降低置信度`)
           result.confidence = Math.max(20, result.confidence - 25)
         }
       }
@@ -348,7 +304,6 @@ export class BaiduSearchSource implements BookSourceProvider {
       // 🔥 作者名校验：如果作者名看起来不可信，降低置信度
       if (result.author && result.author !== '未知') {
         if (!isValidChineseName(result.author)) {
-          console.warn(`[BaiduSearchSource] 作者名"${result.author}"看起来不可信，降低置信度`)
           result.confidence = Math.max(20, result.confidence - 30)
         }
       }
@@ -361,11 +316,9 @@ export class BaiduSearchSource implements BookSourceProvider {
       const resultHasStatus = result.status && result.status.trim() !== '' && result.status !== '已完结'
       
       if (!resultHasAuthor && !resultHasWords && !resultHasChapters && !resultHasGenre && !resultHasStatus) {
-        console.warn('[BaiduSearchSource] 解析结果无效（被反爬拦截），尝试知名小说兜底数据')
         
         const fallback = FAMOUS_NOVELS[bookName]
         if (fallback) {
-          console.log(`[BaiduSearchSource] 使用知名小说兜底数据: ${bookName}`)
           const fallbackResult = createDefaultBook(bookName, '百度搜索')
           Object.assign(fallbackResult, fallback)
           fallbackResult.confidence = 85
@@ -375,13 +328,11 @@ export class BaiduSearchSource implements BookSourceProvider {
       
       // 🔥 置信度过低则丢弃，避免错误数据影响融合结果
       if (result.confidence < 20) {
-        console.warn(`[BaiduSearchSource] 置信度过低（${result.confidence}），丢弃该数据源`)
         return null
       }
       
       if (result.confidence >= 70) {
         localCache.set(CACHE_NAMESPACE, bookName, result, CACHE_TTL)
-        console.log(`[BaiduSearchSource] 已写入缓存: ${bookName}`)
       }
       
       return result
@@ -413,7 +364,6 @@ export class BaiduSearchSource implements BookSourceProvider {
       const authorInSuffix = suffix.replace(/小说|网络|玄幻|仙侠|都市|言情|著|作/g, '').trim()
       if (authorInSuffix.length >= 2 && isValidChineseName(authorInSuffix)) {
         // 该词条明确指向另一作者的同名作品，不匹配
-        console.log(`[BaiduSearchSource] 词条编辑标题含其他作者："${suffix}"，判定为同名不同书`)
         return false
       }
     }
@@ -466,7 +416,6 @@ export class BaiduSearchSource implements BookSourceProvider {
       const cleanBookName = bookName.replace(/\s+/g, '').replace(/[《》"']/g, '')
       const cleanText = text.replace(/\s+/g, '')
       if (!cleanText.includes(cleanBookName)) {
-        console.log('[BaiduSearchSource] 页面不包含书名，判定为非目标词条')
         return false
       }
     }
@@ -483,7 +432,6 @@ export class BaiduSearchSource implements BookSourceProvider {
         // 进一步确认：是否有小说信息框字段（总字数、总章节数等）
         const hasNovelInfoBox = /(总字数|总章节数|连载状态|作品类型).{0,20}[\d\u4e00-\u9fa5]/.test(text)
         if (!hasNovelInfoBox) {
-          console.log('[BaiduSearchSource] 页面是作者/人物词条，不是小说词条')
           return false
         }
       }
@@ -496,7 +444,6 @@ export class BaiduSearchSource implements BookSourceProvider {
         const title = titleMatch[1]
         // 如果标题里没有书名，或者标题明显是人物/作者词条
         if (!title.includes(bookName) && /(作家|作者|个人|简介|生平|经历)/.test(title)) {
-          console.log('[BaiduSearchSource] 词条标题不包含书名，可能是错误跳转:', title)
           return false
         }
       }
@@ -535,7 +482,6 @@ export class BaiduSearchSource implements BookSourceProvider {
       if (matches) novelCount += matches.length
     }
     
-    console.log(`[BaiduSearchSource] 页面类型判断: 小说关键词=${novelCount}, 非小说关键词=${nonNovelCount}`)
     
     // 判断规则：
     // 1. 如果非小说关键词 > 小说关键词 * 2，认为不是小说版
@@ -543,12 +489,10 @@ export class BaiduSearchSource implements BookSourceProvider {
     // 3. 否则根据内容进一步判断
     
     if (nonNovelCount > novelCount * 2 && nonNovelCount >= 5) {
-      console.log('[BaiduSearchSource] 页面不是小说版（非小说关键词过多）')
       return false
     }
     
     if (novelCount > nonNovelCount && novelCount >= 3) {
-      console.log('[BaiduSearchSource] 页面是小说版（小说关键词更多）')
       return true
     }
     
@@ -556,30 +500,25 @@ export class BaiduSearchSource implements BookSourceProvider {
     // 如果页面包含"总字数"、"总章节数"、"连载状态"等字段，99%是小说词条
     const hasNovelInfo = /(总字数|总章节数|小说作者|连载状态|作品类型|连载平台|首发时间|是否出版).{0,20}[\d\u4e00-\u9fa5]/.test(text)
     if (hasNovelInfo && novelCount >= 1) {
-      console.log('[BaiduSearchSource] 页面是小说版（有小说信息框字段）')
       return true
     }
     
     // 🔥 放宽判断：如果小说关键词>=非小说关键词，且小说关键词>=2，认为是小说版
     if (novelCount >= nonNovelCount && novelCount >= 2) {
-      console.log('[BaiduSearchSource] 页面是小说版（小说关键词占优）')
       return true
     }
     
     // 进一步检查：是否有明确的非小说信息
     const hasNonNovelInfo = /(导演|主演|集数|上映时间|播出时间).{0,20}[\d\u4e00-\u9fa5]/.test(text)
     if (hasNonNovelInfo && nonNovelCount >= 3) {
-      console.log('[BaiduSearchSource] 页面不是小说版（有影视信息字段）')
       return false
     }
     
     // 默认：如果页面长度足够且包含小说相关关键词，保守认为是小说版
     if (text.length > 2000 && novelCount >= 1) {
-      console.log('[BaiduSearchSource] 页面类型不确定，但内容长度足够且有小说关键词，认为是小说版')
       return true
     }
     
-    console.log('[BaiduSearchSource] 页面类型不确定，保守处理为非小说版')
     return false
   }
 
@@ -674,7 +613,6 @@ export class BaiduSearchSource implements BookSourceProvider {
    * 返回：{ html, infoBox } - infoBox是直接从DOM提取的信息框结构化数据（最准确）
    */
   private async fetchBaiduBaikePlaywright(url: string, timeoutMs: number): Promise<{ html: string; infoBox?: Record<string, string> }> {
-    console.log('[BaiduSearchSource] 使用Playwright抓取百度百科...')
     
     // 初始化Playwright
     await playwrightManager.initialize()
@@ -691,7 +629,6 @@ export class BaiduSearchSource implements BookSourceProvider {
     const strategy1NovelTimeout = Math.max(3000, timeoutMs * 0.12)
 
     try {
-      console.log('[BaiduSearchSource] Playwright策略1：直接访问 + 小说版切换...')
       const result = await this._playwrightDirectVisit(url, bookName, strategy1Timeout)
       if (result) {
         const text = stripHtml(result.html)
@@ -710,9 +647,7 @@ export class BaiduSearchSource implements BookSourceProvider {
         
         if (isGoodQuality) {
           strategy1Result = result
-          console.log(`[BaiduSearchSource] Playwright策略1成功（备用）（小说版 + 信息框${hasEnoughInfoBox ? '✓' : '✗'} 摘要${hasSummary ? '✓' : '✗'} 角色${hasCharacters ? '✓' : '✗'} 章节${hasMaxChapter ? '✓' : '✗'}）`)
         } else {
-          console.log(`[BaiduSearchSource] Playwright策略1数据质量不足（小说版=${isNovel}, 信息框字段=${infoBoxKeys.length}），尝试小说版URL...`)
           
           // 尝试访问 "书名（小说）" 的URL
           const novelUrl1 = `https://baike.baidu.com/item/${encodeURIComponent(bookName + '（小说）')}`
@@ -720,7 +655,6 @@ export class BaiduSearchSource implements BookSourceProvider {
           
           for (const novelUrl of [novelUrl1, novelUrl2]) {
             try {
-              console.log('[BaiduSearchSource] 尝试小说版URL:', novelUrl.substring(0, 60))
               const novelResult = await this._playwrightDirectVisit(novelUrl, bookName, strategy1NovelTimeout)
               if (novelResult) {
                 const novelText = stripHtml(novelResult.html)
@@ -738,31 +672,28 @@ export class BaiduSearchSource implements BookSourceProvider {
                 
                 if (novelIsGoodQuality) {
                   strategy1Result = novelResult
-                  console.log(`[BaiduSearchSource] 小说版URL成功（信息框${novelHasEnoughInfoBox ? '✓' : '✗'} 摘要${novelHasSummary ? '✓' : '✗'} 角色${novelHasCharacters ? '✓' : '✗'} 章节${novelHasMaxChapter ? '✓' : '✗'}）`)
                   break
                 }
               }
             } catch (e) {
-              console.log('[BaiduSearchSource] 小说版URL失败:', e instanceof Error ? e.message : String(e))
+              console.error('[baidu-source] 策略1候选解析异常，继续下一候选:', e)
             }
           }
         }
       }
     } catch (e) {
-      console.log('[BaiduSearchSource] Playwright策略1失败:', e instanceof Error ? e.message : String(e))
+      console.error('[baidu-source] 策略1搜索流程异常:', e)
     }
     
     // 策略2：从百度搜索跳转进入（完整真人行为，自动切换小说版义项，数据更完整）
     // 🔥 如果策略1已经成功获取到高质量数据，跳过策略2以节省时间（策略2通常3-4分钟）
     if (strategy1Result) {
-      console.log('[BaiduSearchSource] 策略1已成功，跳过策略2（节省时间）')
       return strategy1Result
     }
 
     const keyword = `${bookName} 小说 百度百科`
     const targetPattern = /baike\.baidu\.com\/item\//
     
-    console.log('[BaiduSearchSource] Playwright策略2：从百度搜索跳转（优先小说版）...')
     
     try {
       const result = await playwrightManager.fetchFromBaiduSearch(keyword, targetPattern, {
@@ -773,17 +704,15 @@ export class BaiduSearchSource implements BookSourceProvider {
       if (result && result.html) {
         const text = stripHtml(result.html)
         if (text.length > 2000 && !this.isBlockedPage(result.html)) {
-          console.log('[BaiduSearchSource] Playwright搜索跳转成功')
           return { html: result.html, infoBox: result.infoBox }
         }
       }
     } catch (e) {
-      console.log('[BaiduSearchSource] Playwright策略2失败:', e instanceof Error ? e.message : String(e))
+      console.error('[baidu-source] 抓取百科页面失败:', e)
     }
     
     // 策略2失败，使用策略1的结果
     if (strategy1Result) {
-      console.log('[BaiduSearchSource] 策略2失败，使用策略1的备用结果')
       return strategy1Result
     }
     
@@ -1066,10 +995,6 @@ export class BaiduSearchSource implements BookSourceProvider {
       characterArchetypes: Record<string, unknown>
     }> = {}
     
-    console.log('[BaiduSearchSource] 解析信息框数据，原始字段:', Object.keys(infoBox).length)
-    for (const [key, value] of Object.entries(infoBox)) {
-      console.log(`  ${key}: ${value.substring(0, 60)}`)
-    }
     
     // 标准化字段名（去掉空格、全角半角统一）
     const normalizedInfo: Record<string, string> = {}
@@ -1090,7 +1015,6 @@ export class BaiduSearchSource implements BookSourceProvider {
           if (!isNaN(num) && num > 0 && num < 100000) {
             result.totalChapters = num
             hasExplicitChapterCount = true
-            console.log('[BaiduSearchSource] [信息框DOM] 使用信息框总章节数字段:', num, '(字段:', key, ')')
             break
           }
         }
@@ -1101,7 +1025,6 @@ export class BaiduSearchSource implements BookSourceProvider {
           if (!isNaN(num) && num > 0 && num < 100000) {
             result.totalChapters = num
             hasExplicitChapterCount = true
-            console.log('[BaiduSearchSource] [信息框DOM] 使用信息框总章节数字段(纯数字):', num, '(字段:', key, ')')
             break
           }
         }
@@ -1113,9 +1036,6 @@ export class BaiduSearchSource implements BookSourceProvider {
       const maxChapter = parseInt(normalizedInfo['_maxChapter'])
       if (maxChapter > 0 && maxChapter < 10000) {
         result.totalChapters = maxChapter
-        console.log('[BaiduSearchSource] [信息框DOM] 使用Playwright提取的目录最大章节号:', maxChapter)
-      } else {
-        console.log('[BaiduSearchSource] [信息框DOM] Playwright提取的目录最大章节号不合理，不信任:', maxChapter)
       }
     }
     
@@ -1142,7 +1062,6 @@ export class BaiduSearchSource implements BookSourceProvider {
       }
       if (summary.length > 50) {
         result.synopsis = summary
-        console.log('[BaiduSearchSource] [信息框DOM] 使用Playwright提取的百度百科摘要:', summary.substring(0, 50) + '...')
       }
     }
     
@@ -1157,7 +1076,6 @@ export class BaiduSearchSource implements BookSourceProvider {
         authorName = authorName.split(/[，,、\/\s；;]/)[0].trim()
         if (isValidChineseName(authorName)) {
           result.author = authorName
-          console.log('[BaiduSearchSource] [信息框DOM] 作者:', result.author)
           break
         }
       }
@@ -1191,10 +1109,9 @@ export class BaiduSearchSource implements BookSourceProvider {
             if (/界$|大陆$|神域$|神界$|域$|国$|山脉$|海域$|森林$|山谷$|深渊$|世界$/.test(c.name)) return false
             return true
           })
-          console.log('[BaiduSearchSource] [信息框DOM] 使用Playwright提取的登场角色:', result.characters.map((c: BookCharacter) => `${c.name}(${c.position || '配角'})`).join('、'))
         }
       } catch (e) {
-        console.warn('[BaiduSearchSource] 解析角色数据失败:', e instanceof Error ? e.message : String(e))
+        console.error('[baidu-source] 地名/世界名过滤处理异常:', e)
       }
     }
 
@@ -1214,7 +1131,6 @@ export class BaiduSearchSource implements BookSourceProvider {
         if (protoName && protoName.length >= 2 && protoName.length <= 10) {
           if (!(result as unknown as Record<string, unknown>).protagonistName) {
             ;(result as unknown as Record<string, unknown>).protagonistName = protoName
-            console.log('[BaiduSearchSource] [信息框DOM] 主要角色(主角):', protoName)
           }
           // 同时将其添加到角色列表的最前面（标记为主角）
           if (!result.characters) result.characters = []
@@ -1252,7 +1168,6 @@ export class BaiduSearchSource implements BookSourceProvider {
             result.characters[existingIdx].role = '女主'
             result.characters[existingIdx].note = result.characters[existingIdx].note || '从信息框女主角字段提取'
           }
-          console.log('[BaiduSearchSource] [信息框DOM] 女主角:', flName)
           break
         }
       }
@@ -1301,7 +1216,6 @@ export class BaiduSearchSource implements BookSourceProvider {
         }
         if (matchedGenre) {
           result.genre = matchedGenre
-          console.log('[BaiduSearchSource] [信息框DOM] 类型:', result.genre, '(原始:', genreRaw, ')')
           break
         }
       }
@@ -1322,7 +1236,6 @@ export class BaiduSearchSource implements BookSourceProvider {
           result.status = '连载中'
         }
         if (result.status) {
-          console.log('[BaiduSearchSource] [信息框DOM] 状态:', result.status)
           break
         }
       }
@@ -1347,11 +1260,9 @@ export class BaiduSearchSource implements BookSourceProvider {
               else if (_wordMatch[2] === '亿') _estimatedWords = _wordNum * 10000
             }
             if (_estimatedWords >= 100 && num < 50) {
-              console.log('[BaiduSearchSource] [信息框DOM] 章节数' + num + '可疑（预估字数' + _estimatedWords + '万），跳过')
               continue
             }
             result.totalChapters = num
-            console.log('[BaiduSearchSource] [信息框DOM] 章节数:', result.totalChapters)
             break
           }
         }
@@ -1360,7 +1271,6 @@ export class BaiduSearchSource implements BookSourceProvider {
           const num = chineseNumberToInt(chMatchCn[1])
           if (num && num > 0 && isReasonableChapters(num)) {
             result.totalChapters = num
-            console.log('[BaiduSearchSource] [信息框DOM] 章节数(中文数字):', result.totalChapters)
             break
           }
         }
@@ -1370,7 +1280,6 @@ export class BaiduSearchSource implements BookSourceProvider {
             const num = parseInt(numMatch[0].replace(/[,.]/g, ''))
             if (!isNaN(num) && num > 0 && isReasonableChapters(num)) {
               result.totalChapters = num
-              console.log('[BaiduSearchSource] [信息框DOM] 章节数(纯数字):', result.totalChapters)
               break
             }
           }
@@ -1392,7 +1301,6 @@ export class BaiduSearchSource implements BookSourceProvider {
           if (!isNaN(num) && num > 0 && isReasonableWords(num)) {
             const displayStr = wordMatch[2] === '亿' ? (num / 10000) + '亿字' : num + '万字'
             result.totalWords = { str: displayStr, num: Math.round(num * 10) / 10 }
-            console.log('[BaiduSearchSource] [信息框DOM] 字数:', result.totalWords.str, '=', result.totalWords.num, '万字')
             break
           }
         }
@@ -1405,7 +1313,6 @@ export class BaiduSearchSource implements BookSourceProvider {
             }
             if (!isNaN(num) && num > 0 && isReasonableWords(num)) {
               result.totalWords = { str: num + '万字', num }
-              console.log('[BaiduSearchSource] [信息框DOM] 字数(纯数字):', result.totalWords.str, '=', result.totalWords.num, '万字')
               break
             }
           }
@@ -1419,7 +1326,6 @@ export class BaiduSearchSource implements BookSourceProvider {
       wb = wb.replace(/\[\d+\]/g, '').trim()
       if (wb.length > 30) {
         result.worldBuilding = wb
-        console.log('[BaiduSearchSource] [信息框DOM] 世界观:', wb.substring(0, 50) + '...')
       }
     }
     
@@ -1429,7 +1335,6 @@ export class BaiduSearchSource implements BookSourceProvider {
       ps = ps.replace(/\[\d+\]/g, '').trim()
       if (ps.length > 20) {
         result.powerSystem = ps
-        console.log('[BaiduSearchSource] [信息框DOM] 力量体系:', ps.substring(0, 50) + '...')
       }
     }
     
@@ -1439,10 +1344,9 @@ export class BaiduSearchSource implements BookSourceProvider {
         const sp = JSON.parse(normalizedInfo['_sellingPoints'])
         if (Array.isArray(sp) && sp.length > 0) {
           result.sellingPoints = sp
-          console.log('[BaiduSearchSource] [信息框DOM] 核心卖点:', sp.join('、'))
         }
       } catch (e) {
-        console.warn('[BaiduSearchSource] 解析核心卖点失败:', e instanceof Error ? e.message : String(e))
+        console.error('[baidu-source] 解析卖点(sellingPoints)JSON失败:', e)
       }
     }
     
@@ -1451,7 +1355,6 @@ export class BaiduSearchSource implements BookSourceProvider {
       const fc = normalizedInfo['_fullContent'].trim()
       if (fc.length > 500) {
         (result as unknown as Record<string, unknown>).fullContent = fc
-        console.log('[BaiduSearchSource] [信息框DOM] 完整正文内容:', fc.length + '字')
       }
     }
     
@@ -1500,11 +1403,9 @@ export class BaiduSearchSource implements BookSourceProvider {
         const existing = chars.find(c => c.name === name)
         if (existing) {
           femaleLead = existing
-          console.log(`[BaiduSearchSource] [信息框DOM] 从信息框_femaleLead提取女主: ${name}`)
         } else {
           femaleLead = { name, role: '女主', note: '从百度百科人物关系提取', position: '女主角' }
           chars.push(femaleLead)
-          console.log(`[BaiduSearchSource] [信息框DOM] 从信息框_femaleLead新增女主: ${name}`)
         }
       }
       
@@ -1545,12 +1446,10 @@ export class BaiduSearchSource implements BookSourceProvider {
               const existing = chars.find(c => c.name === name)
               if (existing) {
                 femaleLead = existing
-                console.log(`[BaiduSearchSource] [信息框DOM] 从正文反向提取女主: ${name}`)
                 break
               } else if (name.length >= 2 && name.length <= 12) {
                 femaleLead = { name, role: '女主', note: '从百度百科人物关系提取', position: '女主角' }
                 chars.push(femaleLead)
-                console.log(`[BaiduSearchSource] [信息框DOM] 从正文反向提取新增女主: ${name}`)
                 break
               }
             }
@@ -1564,9 +1463,6 @@ export class BaiduSearchSource implements BookSourceProvider {
         femaleLead = chars.find(c => 
           wifeDescPattern.test((c.note || '') + ' ' + (c.description || ''))
         )
-        if (femaleLead) {
-          console.log(`[BaiduSearchSource] [信息框DOM] 从角色描述提取女主: ${femaleLead.name}`)
-        }
       }
       
       // 策略4：从正文中提取"xxx与xxx结为夫妻"、"xxx娶xxx为妻"等模式
@@ -1594,12 +1490,10 @@ export class BaiduSearchSource implements BookSourceProvider {
               const existing = chars.find(c => c.name === candidate)
               if (existing) {
                 femaleLead = existing
-                console.log(`[BaiduSearchSource] [信息框DOM] 从婚姻模式提取女主: ${candidate}`)
                 break
               } else if (candidate.length >= 2 && candidate.length <= 10) {
                 femaleLead = { name: candidate, role: '女主', note: '从百度百科婚姻关系提取', position: '女主角' }
                 chars.push(femaleLead)
-                console.log(`[BaiduSearchSource] [信息框DOM] 从婚姻模式提取新增女主: ${candidate}`)
                 break
               }
             }
@@ -1760,7 +1654,6 @@ export class BaiduSearchSource implements BookSourceProvider {
       }
       
       result.characterArchetypes = archetypes
-      console.log('[BaiduSearchSource] [信息框DOM] 生成角色功能定位原型:', Object.keys(archetypes).filter(k => archetypes[k]).join('、'))
     }
     
     // 🔥 生成六阶段主线大纲（基于分卷/章节信息和简介推断）
@@ -1769,7 +1662,6 @@ export class BaiduSearchSource implements BookSourceProvider {
     const sixStage = this.generateSixStageOutline(genre, totalChapters, result.synopsis || '')
     if (sixStage) {
       result.sixStageOutline = sixStage
-      console.log('[BaiduSearchSource] [信息框DOM] 生成六阶段主线大纲')
     }
     
     return result
@@ -1866,10 +1758,6 @@ export class BaiduSearchSource implements BookSourceProvider {
       }
     }
     
-    console.log('[BaiduSearchSource] 信息框提取到', Object.keys(info).length, '个字段:')
-    for (const [key, value] of Object.entries(info)) {
-      console.log(`  - ${key}: ${value.substring(0, 60)}`)
-    }
     
     // 从信息框中匹配我们需要的字段
     for (const [key, value] of Object.entries(info)) {
@@ -1878,7 +1766,6 @@ export class BaiduSearchSource implements BookSourceProvider {
         const authorName = value.split(/[，,、\/\s]/)[0].trim()
         if (isValidChineseName(authorName)) {
           result.author = authorName
-          console.log('[BaiduSearchSource] [信息框] 作者:', result.author)
         }
       }
       
@@ -1911,7 +1798,6 @@ export class BaiduSearchSource implements BookSourceProvider {
         }
         if (matchedGenre) {
           result.genre = matchedGenre
-          console.log('[BaiduSearchSource] [信息框] 类型:', result.genre, '(原始:', value, ')')
         }
       }
       
@@ -1922,9 +1808,6 @@ export class BaiduSearchSource implements BookSourceProvider {
         } else if (/连载|更新|进行中/.test(value)) {
           result.status = '连载中'
         }
-        if (result.status) {
-          console.log('[BaiduSearchSource] [信息框] 状态:', result.status)
-        }
       }
       
       // 总章节数
@@ -1934,7 +1817,6 @@ export class BaiduSearchSource implements BookSourceProvider {
           const num = parseInt(chMatch[1].replace(/[,.]/g, ''))
           if (!isNaN(num) && num > 0) {
             result.totalChapters = num
-            console.log('[BaiduSearchSource] [信息框] 章节数:', result.totalChapters)
           }
         }
       }
@@ -1950,7 +1832,6 @@ export class BaiduSearchSource implements BookSourceProvider {
           if (!isNaN(num) && num > 0) {
             const displayStr = wordMatch[2] === '亿' ? (num / 10000) + '亿字' : num + '万字'
             result.totalWords = { str: displayStr, num: Math.round(num * 10) / 10 }
-            console.log('[BaiduSearchSource] [信息框] 字数:', result.totalWords.str, '=', result.totalWords.num, '万字')
           }
         }
         if (!result.totalWords) {
@@ -1961,7 +1842,6 @@ export class BaiduSearchSource implements BookSourceProvider {
               num = Math.round(num / 10000 * 10) / 10
               if (!isNaN(num) && num > 0 && num < 10000) {
                 result.totalWords = { str: num + '万字', num }
-                console.log('[BaiduSearchSource] [信息框] 字数(纯数字):', result.totalWords.str, '=', result.totalWords.num, '万字')
               }
             }
           }
@@ -1985,7 +1865,6 @@ export class BaiduSearchSource implements BookSourceProvider {
         const m = text.match(p)
         if (m && m[0].length >= 30 && m[0].length <= 500) {
           result.synopsis = m[0].trim()
-          console.log('[BaiduSearchSource] [正文] 简介:', result.synopsis.substring(0, 50) + '...')
           break
         }
       }
@@ -1996,7 +1875,6 @@ export class BaiduSearchSource implements BookSourceProvider {
       const titleAuthorMatch = text.match(new RegExp(`${escapeRegExp(bookName)}\\s*[（(]([\\u4e00-\\u9fa5·]{2,5})[^）)]*[）)]`, 'i'))
       if (titleAuthorMatch && isValidChineseName(titleAuthorMatch[1])) {
         result.author = titleAuthorMatch[1]
-        console.log('[BaiduSearchSource] [标题] 作者:', result.author)
       }
     }
     
@@ -2018,17 +1896,14 @@ export class BaiduSearchSource implements BookSourceProvider {
       const _pageTitleMatch = this.isBaikeTitleMatch(bookName, infoBox)
       if (!_pageTitleMatch) {
         const _pt = ((infoBox && (infoBox['_pageTitle'] || infoBox['_lemmaTitle'])) || '').toString()
-        console.warn(`[BaiduSearchSource] 词条编辑不匹配：搜索"${bookName}"，页面标题"${_pt.trim()}"，拒绝使用该百度百科数据`)
         // 清空infoBox中可能来自错误页面的数据，避免污染
         infoBox = {}
       } else {
         const _pt = ((infoBox && (infoBox['_pageTitle'] || infoBox['_lemmaTitle'])) || '').toString()
-        console.log(`[BaiduSearchSource] 词条编辑匹配确认：${_pt.trim()}`)
       }
 
       // 第一优先级：直接从DOM提取的infoBox（Playwright模式下最准确）
       if (infoBox && Object.keys(infoBox).length > 0) {
-        console.log('[BaiduSearchSource] [最高优先级] 使用DOM直接提取的信息框数据')
         const infoBoxResult = this.parseInfoBoxData(infoBox, bookName)
         if (infoBoxResult.author) result.author = infoBoxResult.author
         if (infoBoxResult.totalWords) {
@@ -2080,7 +1955,6 @@ export class BaiduSearchSource implements BookSourceProvider {
       if (baikeHtml && (!result.author || !result.totalWords || !result.totalChapters)) {
         const titleMatch = baikeHtml.match(/<title>([^<]+)<\/title>/i)
         if (titleMatch && titleMatch[1] && !titleMatch[1].includes(bookName)) {
-          console.warn(`[BaiduSearchSource] 静态HTML标题不匹配：搜索"${bookName}"，标题"${titleMatch[1]}"，跳过静态HTML解析`)
         } else {
         const baikeInfo = this.extractFromBaikePage(baikeHtml, bookName)
         if (baikeInfo.author && !result.author) result.author = baikeInfo.author
@@ -2166,11 +2040,9 @@ export class BaiduSearchSource implements BookSourceProvider {
         
         if (maxChapter > 0 && maxChapter < 10000) {
           if (estimatedWords >= 100 && maxChapter < 100) {
-            console.log('[BaiduSearchSource] [作品目录] 章节数' + maxChapter + '可疑（预估字数' + estimatedWords + '万），跳过目录提取，继续使用投票机制')
             continue // 跳过目录提取，继续使用投票机制
           }
           result.totalChapters = maxChapter
-          console.log('[BaiduSearchSource] [作品目录] 提取到最大章节数:', maxChapter)
           break
         }
       }
@@ -2190,7 +2062,6 @@ export class BaiduSearchSource implements BookSourceProvider {
         if (chapters) {
           result.totalChapters = chapters
         }
-        console.log('[BaiduSearchSource] [投票机制] 字数' + wordsWan + '万，投票章节数:', chapters)
       }
     }
     
@@ -2678,7 +2549,6 @@ export class BaiduSearchSource implements BookSourceProvider {
       
       if (psSections.length > 0) {
         result.powerSystem = psSections.join('\n\n')
-        console.log('[BaiduSearchSource] [正文] 力量体系:', result.powerSystem.substring(0, 60) + '...')
       }
     }
     
@@ -2765,7 +2635,6 @@ export class BaiduSearchSource implements BookSourceProvider {
       
       if (wbSections.length > 0) {
         result.worldBuilding = wbSections.join('\n\n')
-        console.log('[BaiduSearchSource] [正文] 世界观:', result.worldBuilding.substring(0, 50) + '...')
       }
     }
     
@@ -2876,7 +2745,6 @@ export class BaiduSearchSource implements BookSourceProvider {
       
       if (wsSections.length >= 3) {
         result.writingStyle = wsSections.join(' ')
-        console.log('[BaiduSearchSource] [正文] 写作风格:', result.writingStyle.substring(0, 60) + '...')
       }
     }
     
@@ -3203,7 +3071,6 @@ export class BaiduSearchSource implements BookSourceProvider {
     
     const avgNum = Math.round(medianNum * 10) / 10
     
-    console.log(`[BaiduSearchSource] [voteWordCount] 最佳桶: ${bestBucket}万, 权重: ${bestWeight.toFixed(1)}, 候选数: ${bestNums.length}, 来源: ${bestData.sources.join(',')}, 最终值: ${avgNum}万字`)
     
     return {
       str: avgNum + '万字',
@@ -3391,7 +3258,6 @@ export class BaiduSearchSource implements BookSourceProvider {
     
     const finalNum = Math.round(medianNum)
     
-    console.log(`[BaiduSearchSource] [voteChapters] 最佳桶: ${bestBucket}章, 权重: ${bestWeight.toFixed(1)}, 候选数: ${bestNums.length}, 来源: ${bestData.sources.join(',')}, 最终值: ${finalNum}章`)
     
     return finalNum
   }
@@ -3802,22 +3668,10 @@ export class BaiduSearchSource implements BookSourceProvider {
             
             position = positions.length > 0 ? positions.join('、') : '配角'
             
-            if (!voteMap[name]) {
-              voteMap[name] = { role, position, weight, desc: desc.substring(0, 300), description: desc.substring(0, 300) }
-            } else {
-              voteMap[name].weight += weight
-              if (role === '主角' || role === '女主') {
-                voteMap[name].role = role
-                voteMap[name].position = position
-              }
-              if (!voteMap[name].desc || voteMap[name].desc.length < desc.length) {
-                voteMap[name].desc = desc.substring(0, 300)
-              }
-            }
+            this.mergeCharVote(voteMap, name, role, position, weight, desc)
           }
           continue
-        }
-        
+        }        
         // 模式2：表格格式（角色\t介绍）
         const tableMatch = trimmed.match(/^([\u4e00-\u9fa5·]{2,12})\t+(.+)$/)
         if (tableMatch) {
@@ -3861,18 +3715,7 @@ export class BaiduSearchSource implements BookSourceProvider {
             }
             position = positions.length > 0 ? positions.join('、') : '配角'
             
-            if (!voteMap[name]) {
-              voteMap[name] = { role, position, weight, desc: desc.substring(0, 300), description: desc.substring(0, 300) }
-            } else {
-              voteMap[name].weight += weight
-              if (role === '主角' || role === '女主') {
-                voteMap[name].role = role
-                voteMap[name].position = position
-              }
-              if (!voteMap[name].desc || voteMap[name].desc.length < desc.length) {
-                voteMap[name].desc = desc.substring(0, 300)
-              }
-            }
+            this.mergeCharVote(voteMap, name, role, position, weight, desc)
           }
         }
       }
@@ -3924,7 +3767,28 @@ export class BaiduSearchSource implements BookSourceProvider {
     
     return chars
   }
-  
+
+  /**
+   * 角色投票条目合并（extractCharacters 模式1/模式2 共用）
+   */
+  private mergeCharVote(
+    voteMap: Record<string, { role: string; position: string; weight: number; desc: string; description: string }>,
+    name: string, role: string, position: string, weight: number, desc: string
+  ): void {
+    if (!voteMap[name]) {
+      voteMap[name] = { role, position, weight, desc: desc.substring(0, 300), description: desc.substring(0, 300) }
+    } else {
+      voteMap[name].weight += weight
+      if (role === '主角' || role === '女主') {
+        voteMap[name].role = role
+        voteMap[name].position = position
+      }
+      if (!voteMap[name].desc || voteMap[name].desc.length < desc.length) {
+        voteMap[name].desc = desc.substring(0, 300)
+      }
+    }
+  }
+
   /**
    * 从全文中提取角色定位信息
    */

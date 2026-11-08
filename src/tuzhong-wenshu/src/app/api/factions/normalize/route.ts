@@ -63,7 +63,7 @@ export async function POST(request: NextRequest) {
               if (v && v.length >= 10 && !/灵气|功法|护宗|修真|修仙|飞升|金丹|元婴/.test(v)) { f.developmentTrajectory = v; polished++ }
             })
           }
-        } catch (_e) { /* 润色失败保留确定性文案 */ }
+        } catch (_e) { console.error('[factions/normalize] 势力发展轨迹润色失败，保留确定性文案:', _e) }
       }
     }
 

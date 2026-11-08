@@ -1,5 +1,6 @@
 import { prisma } from '@/lib/prisma'
 import { createToken } from '@/lib/auth'
+import { randomBytes } from 'crypto'
 
 interface WxLoginTokenStore {
   tokenKey: string
@@ -38,7 +39,7 @@ async function _loadWxSessionFromDB(tokenKey: string): Promise<WxLoginTokenStore
       return parsed
     }
     if (parsed) {
-      try { await prisma.systemConfig.delete({ where: { configKey: WX_SESS_KEY_PREFIX + tokenKey } }) } catch { /* ignore */ }
+      try { await prisma.systemConfig.delete({ where: { configKey: WX_SESS_KEY_PREFIX + tokenKey } }) } catch (e) { console.error('[wechat] 删除过期微信会话失败:', e) }
     }
     return null
   } catch {
@@ -55,13 +56,13 @@ async function _saveWxSessionToDB(entry: WxLoginTokenStore): Promise<void> {
       update: { configValue: JSON.stringify(entry), updatedAt: nowIso },
       create: { configKey: key, configValue: JSON.stringify(entry), createdAt: nowIso, updatedAt: nowIso },
     })
-  } catch { /* ignore */ }
+  } catch (e) { console.error('[wechat] 保存微信会话到DB失败:', e) }
 }
 
 async function _removeWxSessionFromDB(tokenKey: string): Promise<void> {
   try {
     await prisma.systemConfig.delete({ where: { configKey: WX_SESS_KEY_PREFIX + tokenKey } })
-  } catch { /* ignore */ }
+  } catch (e) { console.error('[wechat] 从DB删除微信会话失败:', e) }
 }
 
 // 清理过期登录token
@@ -79,12 +80,20 @@ async function sweepExpiredWxTokens() {
       _removeWxSessionFromDB(keyList[i])
     }
   }
+  // Bug#3（次要）：内存外的 DB wxsess_ 行此前无人清理（219条遗留），
+  // 目测表只有几百行，直接按 ttl 全量清一次成本低
+  try {
+    // updatedAt 为 ISO 字符串存储（schema: String），字典序等价时间序，可直接字符串比较
+    await prisma.systemConfig.deleteMany({
+      where: { configKey: { startsWith: 'wxsess_' }, updatedAt: { lt: new Date(nowStamp - WX_TOKEN_EXPIRE_MS * 2).toISOString() } },
+    })
+  } catch (_e) { /* 忽略 */ }
 }
 
 // 创建新的微信登录Token（同时写入内存和 DB，避免跨进程丢失）
 export async function createWxLoginToken(): Promise<string> {
   await sweepExpiredWxTokens()
-  const tokenKey = 'wx_' + Date.now() + '_' + Math.random().toString(36).slice(2, 10)
+  const tokenKey = 'wx_' + randomBytes(18).toString('hex')
   const entry: WxLoginTokenStore = {
     tokenKey: tokenKey,
     scanStatus: 'pending',
@@ -294,22 +303,23 @@ export async function processWxOauthCallback(authCode: string, tokenKey: string)
     } else {
       // 将微信登录绑定到已存在的 kevin 管理员账号（若该账号尚未绑定微信）；
       // 其余微信登录一律创建为普通 wx_ 用户，不会自动成为管理员。
-      const kevinAccount = await prisma.user.findFirst({
-        where: { username: 'kevin', isAdmin: true, wechatOpenid: null },
-      })
+      // 🔥 修复（P0 越权）：旧实现会把「第一个扫登录码的微信号」自动绑定到尚未绑定微信的
+      //   管理员账号并直接下发 admin token —— 陌生人扫登录页二维码即可接管全站。
+      //   管理员与微信的绑定必须在后台显式操作，登录流程只允许创建普通用户。
+      const legacyAdminClaim = null as null | { id: string; avatarUrl: string | null; nickname: string | null }
 
-      if (kevinAccount) {
+      if (legacyAdminClaim) {
         await prisma.user.update({
-          where: { id: kevinAccount.id },
+          where: { id: legacyAdminClaim.id },
           data: {
             wechatOpenid: wxOpenid,
             wechatUnionid: userInfoBody.unionid || null,
-            avatarUrl: userInfoBody.headimgurl || kevinAccount.avatarUrl,
-            nickname: userInfoBody.nickname || kevinAccount.nickname || 'Kevin',
+            avatarUrl: userInfoBody.headimgurl || legacyAdminClaim.avatarUrl,
+            nickname: userInfoBody.nickname || legacyAdminClaim.nickname || 'Kevin',
           },
         })
-        console.log('[微信OAuth] 第三步: 微信已绑定到 kevin 管理员账号, userId=' + kevinAccount.id)
-        targetUserId = kevinAccount.id
+        console.log('[微信OAuth] 第三步: 微信已绑定到 kevin 管理员账号, userId=' + legacyAdminClaim.id)
+        targetUserId = legacyAdminClaim.id
         targetUserIsAdmin = true
       } else {
         // 免费账号：避免同名冲突

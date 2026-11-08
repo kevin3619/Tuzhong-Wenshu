@@ -4,25 +4,9 @@ import { verifyAdmin } from '@/lib/permissions'
 import { loadFsNovels } from '@/lib/novel-storage'
 import { existsSync, readdirSync, readFileSync } from 'fs'
 import { join } from 'path'
+import { resolveDataDirB } from '@/lib/data-dir'
 
-function resolveDataDir(): string {
-  const candidates = [
-    join(process.cwd(), '.tuzhong-data'),
-    join(process.cwd(), 'src', 'tuzhong-wenshu', '.tuzhong-data'),
-    join(process.cwd(), '..', '.tuzhong-data'),
-    '/www/wwwroot/tuzhong-wenshu/.tuzhong-data',
-  ]
-  for (const p of candidates) {
-    try {
-      if (existsSync(p)) return p
-    } catch {
-      // continue
-    }
-  }
-  return join(process.cwd(), '.tuzhong-data')
-}
-
-const LOCAL_DATA_DIR = resolveDataDir()
+const LOCAL_DATA_DIR = resolveDataDirB()
 const CHAPTERS_DIR = join(LOCAL_DATA_DIR, 'chapters')
 
 function loadSettingsMeta(): Record<string, { characterCount: number; aiTitle?: string }> {
@@ -48,7 +32,7 @@ function loadSettingsMeta(): Record<string, { characterCount: number; aiTitle?: 
       const ideaTitle = (entry as any).idea && typeof (entry as any).idea === 'object' ? ((entry as any).idea.title || '') : ''
       metaMap[nid] = { characterCount: cc, aiTitle: ideaTitle || undefined }
     }
-  } catch { /* ignore */ }
+  } catch (e) { console.error('[admin/all-works] 解析 settings.json 统计元数据失败:', e) }
   return metaMap
 }
 
@@ -61,14 +45,14 @@ function loadCountData() {
       const raw = JSON.parse(readFileSync(charsFile, 'utf-8'))
       if (raw && typeof raw === 'object') chars = raw
     }
-  } catch { /* ignore */ }
+  } catch (e) { console.error('[admin/all-works] 读取 characters.json 失败:', e) }
   try {
     const volsFile = join(LOCAL_DATA_DIR, 'volumes.json')
     if (existsSync(volsFile)) {
       const raw = JSON.parse(readFileSync(volsFile, 'utf-8'))
       if (raw && typeof raw === 'object') vols = raw
     }
-  } catch { /* ignore */ }
+  } catch (e) { console.error('[admin/all-works] 读取 volumes.json 失败:', e) }
   return { chars, vols }
 }
 

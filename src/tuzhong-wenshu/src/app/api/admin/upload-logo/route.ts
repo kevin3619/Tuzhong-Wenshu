@@ -1,32 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { writeFileSync, existsSync, mkdirSync } from 'fs'
+import { writeFileSync } from 'fs'
 import { join } from 'path'
 import { prisma } from '@/lib/prisma'
 import { verifyAdmin } from '@/lib/permissions'
+import { resolveDataDirC } from '@/lib/data-dir'
 
 // 🔥 修复品牌Logo上传：使用 multipart/form-data 上传文件到磁盘，避免 base64 JSON 超 Nginx body 限制
-
-function resolveDataDir(): string {
-  const cwd = process.cwd()
-  const candidates = [
-    join(cwd, '.tuzhong-data'),
-    join(cwd, 'data'),
-    join(cwd, 'src', 'tuzhong-wenshu', '.tuzhong-data'),
-    join(cwd, 'src', 'tuzhong-wenshu', 'data'),
-    join(cwd, '..', '.tuzhong-data'),
-    '/www/wwwroot/tuzhong-wenshu/.tuzhong-data',
-  ]
-  for (const p of candidates) {
-    try {
-      if (existsSync(p)) return p
-    } catch {
-      // continue
-    }
-  }
-  const defaultPath = join(cwd, '.tuzhong-data')
-  try { if (!existsSync(defaultPath)) mkdirSync(defaultPath, { recursive: true }) } catch { /* ignore */ }
-  return defaultPath
-}
 
 export async function POST(request: NextRequest) {
   const admin = await verifyAdmin(request)
@@ -53,7 +32,7 @@ export async function POST(request: NextRequest) {
       'image/svg+xml': 'svg',
     }
     const ext = extMap[file.type] || 'png'
-    const dataDir = resolveDataDir()
+    const dataDir = resolveDataDirC()
     const fileName = 'brand-logo.' + ext
     const filePath = join(dataDir, fileName)
 

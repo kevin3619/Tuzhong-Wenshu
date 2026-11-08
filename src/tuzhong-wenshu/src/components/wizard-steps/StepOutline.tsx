@@ -3,6 +3,7 @@
 import { useEffect } from 'react'
 import { extractText } from '@/lib/text-utils'
 import type { GeneratedData } from '../ai-generate-wizard'
+import { autoResize } from '@/hooks/useAutoResize'
 
 type OutlineDynamicItem = {
   [key: string]: string | string[] | number | undefined
@@ -25,11 +26,6 @@ export default function StepOutline({
   data, onChange, onRegenerate, onGenerate, isLoading, regeneratePrompt, setRegeneratePrompt, RegenButton, regeneratingField, stepName,
 }: StepOutlineProps) {
   const isWholeStepRegenerating = regeneratingField === stepName
-  const autoResize = function(e: React.FormEvent<HTMLTextAreaElement>) {
-    const ta = e.currentTarget
-    ta.style.height = 'auto'
-    ta.style.height = ta.scrollHeight + 'px'
-  }
   // 🔥 图1：仅"有等级战力需求"的题材（修仙/洪荒/西幻/科幻等）显示"战力等级"字段；朝堂/历史等官阶体系隐藏
   const _showPowerLevel = (function () {
     var _wbPsRaw: any = (data as any)?.worldBuilding?.powerSystem

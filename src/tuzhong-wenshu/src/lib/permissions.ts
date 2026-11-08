@@ -2,26 +2,11 @@ import { join } from 'path'
 import { readFileSync, existsSync } from 'fs'
 import { NextRequest } from 'next/server'
 import { verifyToken } from './auth'
+import { resolveDataDirB } from './data-dir'
 
-// 修复：动态解析数据目录路径
-function resolveDataDir(): string {
-  const candidates = [
-    join(process.cwd(), '.tuzhong-data'),
-    join(process.cwd(), 'src', 'tuzhong-wenshu', '.tuzhong-data'),
-    join(process.cwd(), '..', '.tuzhong-data'),
-    '/www/wwwroot/tuzhong-wenshu/.tuzhong-data',
-  ]
-  for (const p of candidates) {
-    try {
-      if (existsSync(p)) return p
-    } catch {
-      // 继续尝试
-    }
-  }
-  return join(process.cwd(), '.tuzhong-data')
-}
+// 修复：动态解析数据目录路径（B 家族：4 候选、无 mkdir 兜底）
 
-const LOCAL_DATA_DIR = resolveDataDir()
+const LOCAL_DATA_DIR = resolveDataDirB()
 const NOVEL_BOOK_FILE = join(LOCAL_DATA_DIR, 'novels.json')
 
 // 管理员专属知名小说 ID 列表：9 本导入的知名网文作品，仅管理员账号可见

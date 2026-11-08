@@ -400,13 +400,11 @@ export async function POST(req: NextRequest) {
     }
 
     const text = await req.text()
-    console.log('[book-search POST] 请求体原始内容:', text)
 
     let body: { bookName?: string; author?: string } = {}
     try {
       body = JSON.parse(text)
     } catch (e) {
-      console.error('[book-search POST] JSON 解析失败:', e)
       return NextResponse.json({
         success: false,
         error: '请求格式错误',
@@ -445,7 +443,6 @@ export async function POST(req: NextRequest) {
     try {
       const confirmedBook = getConfirmedBook(searchName)
       if (confirmedBook) {
-        console.log(`[book-search POST] ✅ 命中用户已确认数据: ${confirmedBook.title}`)
         const apiResult = convertConfirmedToApiFormat(confirmedBook)
         const responseData = buildResponse(apiResult, '用户已确认', 100)
         return new NextResponse(JSON.stringify(responseData), {
@@ -453,13 +450,12 @@ export async function POST(req: NextRequest) {
         })
       }
     } catch (e) {
-      console.log('[book-search POST] 已确认数据检查失败:', e instanceof Error ? e.message : String(e))
+      console.error('[book-search] 第一层已确认作品匹配异常，继续下一层:', e)
     }
 
     // ===== 第二层：数据源文件（821 本全网爆款网文，100% 准确） =====
     const dbMatch = getNovelByExactName(searchName)
     if (dbMatch) {
-      console.log(`[book-search POST] ✅ 命中数据源文件: ${dbMatch.title} (ID: ${dbMatch.id})`)
       const apiResult = convertNovelsDatabaseToApiFormat(dbMatch)
       const responseData = buildResponse(apiResult, '数据源文件', 100)
       return new NextResponse(JSON.stringify(responseData), {
@@ -468,26 +464,21 @@ export async function POST(req: NextRequest) {
     }
 
     // ===== 兜底：未找到 → 🔥 P2.1.1-P2.1.4 修复：调用 bookSourceManager 动态抓取 =====
-    console.log(`[book-search POST] ⚠️ 数据源中未找到: ${searchName}，启动动态抓取（百度百科/360/搜狗等多源融合）...`)
     try {
       // 设置 13 秒超时（满足项目硬约束"搜索和提取必须15秒内完成"）
       const dynamicResult = await bookSourceManager.searchBook(searchName, { timeout: 13000 })
       if (dynamicResult && dynamicResult.title && (dynamicResult.author || dynamicResult.synopsis || dynamicResult.genre)) {
-        console.log(`[book-search POST] ✅ 动态抓取成功: ${dynamicResult.title} (作者: ${dynamicResult.author || '未知'}, 来源: ${dynamicResult.source})`)
         const apiResult = convertBookSourceDataToApiFormat(dynamicResult, searchName)
         const responseData = buildResponse(apiResult, dynamicResult.source || '动态抓取', dynamicResult.confidence || 70)
         return new NextResponse(JSON.stringify(responseData), {
           headers: { 'Content-Type': 'application/json; charset=utf-8' },
         })
-      } else {
-        console.log(`[book-search POST] ❌ 动态抓取未返回有效数据`)
       }
     } catch (dynamicErr) {
-      console.warn(`[book-search POST] 动态抓取失败:`, dynamicErr instanceof Error ? dynamicErr.message : String(dynamicErr))
+      console.error('[book-search] 动态抓取失败，返回占位数据兜底:', dynamicErr)
     }
 
     // ===== 最终兜底：动态抓取也失败，返回基础占位数据 =====
-    console.log(`[book-search POST] ❌ 所有数据源均未找到: ${searchName}`)
     const fallback = buildFallbackData(searchName, `《${searchName}》不在数据源中（共${getDatabaseStats().total}本），且动态抓取未返回有效数据。请点击"浏览数据源"按钮从列表中选择作品`)
     const responseData = buildResponse(fallback, '未找到', 0)
     return new NextResponse(JSON.stringify(responseData), {

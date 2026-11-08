@@ -37,13 +37,24 @@ export function lenientParseJSON(rawText: string): any | null {
       const c = t[i]
       if (c === '\\') {
         const nx = t[i + 1]
-        if (nx === 'n') out += '\n'
-        else if (nx === 't') out += '\t'
-        else if (nx === 'r') out += '\r'
-        else if (nx === 'u') { out += t.slice(i, i + 6); i += 5 }
-        else if (nx === '"' || nx === '\\' || nx === '/' || nx === 'b' || nx === 'f') out += nx
-        else out += nx
-        i += 2
+        // 🔥 Bug修复：此前 \u 分支 i += 5 + 2 = 7（应推进 6 → 每个 \uXXXX 吞掉后 1 个字），
+        //   且 out += 原始文本根本没解码 → 中文内容被静默错乱。现在真正解码 + hex 校验
+        if (nx === 'n') { out += '\n'; i += 2 }
+        else if (nx === 't') { out += '\t'; i += 2 }
+        else if (nx === 'r') { out += '\r'; i += 2 }
+        else if (nx === 'u') {
+          const _hex = t.slice(i + 2, i + 6)
+          if (/^[0-9a-fA-F]{4}$/.test(_hex)) {
+            out += String.fromCharCode(parseInt(_hex, 16))
+            i += 6
+            continue
+          }
+          out += nx; i += 2
+        }
+        else if (nx === '"' || nx === '\\' || nx === '/') { out += nx; i += 2 }
+        else if (nx === 'b') { out += '\b'; i += 2 }
+        else if (nx === 'f') { out += '\f'; i += 2 }
+        else { out += (nx || ''); i += 2 }
       } else if (c === '"') {
         i++
         return out
@@ -146,7 +157,7 @@ export function lenientParseJSON(rawText: string): any | null {
     const result = parseObject()
     if (result && typeof result === 'object') return result
   } catch (e) {
-    // 容错解析不应抛错，返回已解析部分
+    console.error('[json-lenient] 容错解析异常，返回已解析部分/null:', e)
   }
   return null
 }

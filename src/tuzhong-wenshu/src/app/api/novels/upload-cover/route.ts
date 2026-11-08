@@ -1,32 +1,12 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { writeFileSync, existsSync, mkdirSync, readFileSync } from 'fs'
+import { writeFileSync, existsSync, readFileSync } from 'fs'
 import { join } from 'path'
 import { getRequestActor, isAdminOnlyNovel, loadNovelMetaOrNull } from '@/lib/permissions'
-
-function resolveDataDir(): string {
-  const cwd = process.cwd()
-  const candidates = [
-    join(cwd, '.tuzhong-data'),
-    join(cwd, 'data'),
-    join(cwd, 'src', 'tuzhong-wenshu', '.tuzhong-data'),
-    join(cwd, 'src', 'tuzhong-wenshu', 'data'),
-    join(cwd, '..', '.tuzhong-data'),
-    '/www/wwwroot/tuzhong-wenshu/.tuzhong-data',
-  ]
-  for (const p of candidates) {
-    try {
-      if (existsSync(p)) return p
-    } catch {
-      // continue
-    }
-  }
-  const defaultPath = join(cwd, '.tuzhong-data')
-  try { if (!existsSync(defaultPath)) mkdirSync(defaultPath, { recursive: true }) } catch { /* ignore */ }
-  return defaultPath
-}
+import { resolveDataDirC } from '@/lib/data-dir'
+import { atomicWriteJson } from '@/lib/file-lock'
 
 function loadNovelBooks(): Array<Record<string, unknown>> {
-  const dataDir = resolveDataDir()
+  const dataDir = resolveDataDirC()
   const file = join(dataDir, 'novels.json')
   if (!existsSync(file)) return []
   try {
@@ -39,9 +19,9 @@ function loadNovelBooks(): Array<Record<string, unknown>> {
 }
 
 function saveNovelBooks(books: Array<Record<string, unknown>>) {
-  const dataDir = resolveDataDir()
+  const dataDir = resolveDataDirC()
   const file = join(dataDir, 'novels.json')
-  writeFileSync(file, JSON.stringify(books, null, 2), 'utf-8')
+  atomicWriteJson(file, books)
 }
 
 export async function POST(request: NextRequest) {

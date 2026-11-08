@@ -163,6 +163,14 @@ function fmtDateFlex(v: string | number | undefined | null, fallback: string = '
   try { return d.toLocaleDateString('zh-CN') } catch { return fallback }
 }
 
+// AI 设定概览：列表「展开/收起」折叠阈值。
+// 条目数 ≤ 该值时全部展示（如本作 10 卷 → 10 卷全显，不再砍成 5 卷）；
+// 仅当条目数超过阈值才会折叠为前 N 条，并提供「展开全部」按钮——只做显示折叠，绝不删减数据。
+const AI_LIST_FOLD_LIMIT = 12
+function foldLimit(total: number, expanded: boolean, limit: number = AI_LIST_FOLD_LIMIT): number {
+  return (total > limit && !expanded) ? limit : total
+}
+
 // ============ 主组件 ============
 
 type TopTabType = 'novel' | 'types'
@@ -252,6 +260,9 @@ export default function WorldSettingsPage() {
     synopsis?: Record<string, unknown>
   }>({})
   const [loadingAiData, setLoadingAiData] = useState(false)
+  // AI 设定概览：各列表「展开/收起」状态（key -> 是否已展开）。只看显示，不参与数据。
+  const [aiExpanded, setAiExpanded] = useState<Record<string, boolean>>({})
+  const toggleAiSection = (key: string) => setAiExpanded((prev) => ({ ...prev, [key]: !prev[key] }))
 
   // 加载作品列表（增强容错：支持多次重试 + 解析异常降级）
   useEffect(() => {
@@ -586,7 +597,7 @@ export default function WorldSettingsPage() {
   const filteredForeshadowings = foreshadowings.filter((f) => {
     if (foreshadowFilter === '全部') return true
     const want = _fsStatusMap[foreshadowFilter] || foreshadowFilter
-    const actual = f.status === 'resolved' ? 'recovered' : f.status
+    const actual = (f.status as string) === 'resolved' ? 'recovered' : f.status
     return actual === want
   })
 
@@ -821,6 +832,19 @@ export default function WorldSettingsPage() {
       setCoverUploading(false)
     }
   }
+
+  // AI 设定概览是否「有任何可展示的已生成内容」（任一来源非空即视为有数据，避免误报「暂无AI生成数据」）
+  const hasAnyAiData = !!(
+    aiData.idea?.title
+    || (aiData.synopsis && Object.keys(aiData.synopsis).length > 0)
+    || (aiData.worldbuilding && Object.keys(aiData.worldbuilding).length > 0)
+    || aiData.powerSystem?.worldPowerSystem?.name
+    || aiData.characters?.protagonist?.name
+    || (Array.isArray(aiData.factions?.factions) && aiData.factions.factions.length > 0)
+    || (Array.isArray(aiData.keyPlots?.volumes) && aiData.keyPlots.volumes.length > 0)
+    || aiData.outline?.storyOrigin
+    || (Array.isArray(aiData.outline?.mainPlot) && aiData.outline.mainPlot.length > 0)
+  )
 
   return (
     <div className="min-h-screen bg-gray-50">
@@ -1497,7 +1521,7 @@ export default function WorldSettingsPage() {
                 <div className="w-8 h-8 border-2 border-gray-200 border-t-blue-500 rounded-full animate-spin mx-auto mb-3"></div>
                 <p className="text-sm text-gray-400">正在加载AI生成数据...</p>
               </div>
-            ) : !aiData.idea?.title ? (
+            ) : !hasAnyAiData ? (
               <div className="py-16 text-center bg-white rounded-xl border border-gray-200">
                 <div className="w-20 h-20 mx-auto mb-4 bg-purple-50 rounded-full flex items-center justify-center">
                   <Sparkles className="w-10 h-10 text-purple-400/70" />
@@ -1517,8 +1541,8 @@ export default function WorldSettingsPage() {
                     </h3>
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                       <div><span className="text-sm text-gray-500">书名：</span><span className="text-sm font-medium text-gray-800">{aiData.idea.title}</span></div>
-                      <div><span className="text-sm text-gray-500">主角名：</span><span className="text-sm font-medium text-gray-800">{aiData.idea.protagonistName || '—'}</span></div>
-                      <div className="md:col-span-2"><span className="text-sm text-gray-500">一句话简介：</span><span className="text-sm text-gray-700">{aiData.idea.tagline || '—'}</span></div>
+                      <div><span className="text-sm text-gray-500">主角名：</span><span className="text-sm font-medium text-gray-800">{aiData.idea.protagonistName || '（未生成）'}</span></div>
+                      <div className="md:col-span-2"><span className="text-sm text-gray-500">一句话简介：</span><span className="text-sm text-gray-700">{aiData.idea.tagline || '（未生成）'}</span></div>
                       {aiData.idea.sellingPoints && (
                         <div className="md:col-span-2">
                           <span className="text-sm text-gray-500">核心卖点：</span>
@@ -1532,6 +1556,61 @@ export default function WorldSettingsPage() {
                     </div>
                   </div>
                 )}
+
+                {/* 简介卖点（synopsis）：服务端已下发但此前未渲染——与「灵感创作」并列的只读区块。
+                    存在的字段完整展示（不截断），空字段显示「（未生成）」，绝不用模板/默认文案填充。 */}
+                {(function() {
+                  const s = (aiData.synopsis || {}) as Record<string, unknown>
+                  const str = function(v: unknown): string { return (typeof v === 'string' && v.trim()) ? v : '' }
+                  const shortIntro = str(s.shortIntro) || str(s.oneLineIntro)
+                  const fullIntro = str(s.fullIntro) || str(s.longIntro) || str(s.synopsis)
+                  const golden = str(s.coreGoldenSentence) || str(s.coreGoldenQuote)
+                  const sellingPoints = Array.isArray(s.sellingPoints)
+                    ? (s.sellingPoints as unknown[]).map(function(x) { return str(x) }).filter(Boolean)
+                    : []
+                  const tags = Array.isArray(s.tags)
+                    ? (s.tags as unknown[]).map(function(x) { return str(x) }).filter(Boolean)
+                    : []
+                  const keywords = Array.isArray(s.keywords)
+                    ? (s.keywords as unknown[]).map(function(x) { return str(x) }).filter(Boolean)
+                    : (str(s.keywords) ? str(s.keywords).split(/[、,，\s]+/).filter(Boolean) : [])
+                  return (
+                    <div className="bg-white rounded-xl border border-gray-200 p-5">
+                      <h3 className="text-lg font-bold text-gray-900 mb-4 flex items-center gap-2">
+                        <FileText className="w-5 h-5 text-rose-500" /> 简介卖点
+                      </h3>
+                      <div className="space-y-3">
+                        <div><span className="text-sm text-gray-500">一句话简介：</span><span className="text-sm text-gray-700">{shortIntro || '（未生成）'}</span></div>
+                        <div><span className="text-sm text-gray-500">完整简介：</span><span className="text-sm text-gray-700 whitespace-pre-wrap">{fullIntro || '（未生成）'}</span></div>
+                        <div><span className="text-sm text-gray-500">核心金句：</span><span className="text-sm text-gray-700">{golden || '（未生成）'}</span></div>
+                        <div>
+                          <span className="text-sm text-gray-500">核心卖点：</span>
+                          {sellingPoints.length > 0 ? (
+                            <ul className="mt-1 space-y-1 list-disc list-inside">
+                              {sellingPoints.map(function(sp, i) { return <li key={i} className="text-sm text-gray-700">{sp}</li> })}
+                            </ul>
+                          ) : <span className="text-sm text-gray-400">（未生成）</span>}
+                        </div>
+                        <div>
+                          <span className="text-sm text-gray-500">标签：</span>
+                          {tags.length > 0 ? (
+                            <span className="inline-flex flex-wrap gap-2 mt-1">
+                              {tags.map(function(t, i) { return <span key={i} className="px-2 py-0.5 bg-rose-50 text-rose-700 text-xs rounded-full border border-rose-200">{t}</span> })}
+                            </span>
+                          ) : <span className="text-sm text-gray-400">（未生成）</span>}
+                        </div>
+                        <div>
+                          <span className="text-sm text-gray-500">关键词：</span>
+                          {keywords.length > 0 ? (
+                            <span className="inline-flex flex-wrap gap-2 mt-1">
+                              {keywords.map(function(k, i) { return <span key={i} className="px-2 py-0.5 bg-gray-100 text-gray-600 text-xs rounded-full">{k}</span> })}
+                            </span>
+                          ) : <span className="text-sm text-gray-400">（未生成）</span>}
+                        </div>
+                      </div>
+                    </div>
+                  )
+                })()}
 
                 {/* 世界观设定 */}
                 {aiData.worldbuilding && Object.keys(aiData.worldbuilding).length > 0 && (
@@ -1556,7 +1635,7 @@ export default function WorldSettingsPage() {
                     </h3>
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                       <div><span className="text-sm text-gray-500">世界力量体系：</span><span className="text-sm font-medium text-gray-800">{aiData.powerSystem.worldPowerSystem.name}</span></div>
-                      <div><span className="text-sm text-gray-500">主角金手指：</span><span className="text-sm font-medium text-gray-800">{aiData.powerSystem.protagonistAbility?.name || '—'}</span></div>
+                      <div><span className="text-sm text-gray-500">主角金手指：</span><span className="text-sm font-medium text-gray-800">{aiData.powerSystem.protagonistAbility?.name || '（未生成）'}</span></div>
                       {aiData.powerSystem.worldPowerSystem.description && <div className="md:col-span-2"><span className="text-sm text-gray-500">体系描述：</span><span className="text-sm text-gray-700">{aiData.powerSystem.worldPowerSystem.description}</span></div>}
                     </div>
                   </div>
@@ -1588,14 +1667,28 @@ export default function WorldSettingsPage() {
                           </div>
                         )
                       })}
-                      {Array.isArray(aiData.characters.antagonists) && aiData.characters.antagonists.slice(0, 3).map(function(a) {
+                      {Array.isArray(aiData.characters?.antagonists) && (function() {
+                        const list = (aiData.characters?.antagonists || []) as Array<{ name?: string; identity?: string }>
+                        const limit = foldLimit(list.length, !!aiExpanded['antagonists'])
                         return (
-                          <div key={a.name} className="flex items-center gap-2">
-                            <span className="px-2 py-0.5 bg-red-100 text-red-700 text-xs rounded-full">反派</span>
-                            <span className="text-sm font-medium text-gray-800">{a.name}</span>
-                          </div>
+                          <>
+                            {list.slice(0, limit).map(function(a, i) {
+                              return (
+                                <div key={(a && a.name) || ('ant-' + i)} className="flex items-center gap-2">
+                                  <span className="px-2 py-0.5 bg-red-100 text-red-700 text-xs rounded-full">反派</span>
+                                  <span className="text-sm font-medium text-gray-800">{a.name || '（未生成）'}</span>
+                                  {a.identity && <span className="text-xs text-gray-500">({a.identity})</span>}
+                                </div>
+                              )
+                            })}
+                            {list.length > AI_LIST_FOLD_LIMIT && (
+                              <button type="button" onClick={() => toggleAiSection('antagonists')} className="text-xs text-blue-600 hover:text-blue-700 font-medium">
+                                {aiExpanded['antagonists'] ? '收起' : ('展开全部（共 ' + list.length + ' 名反派）')}
+                              </button>
+                            )}
+                          </>
                         )
-                      })}
+                      })()}
                     </div>
                   </div>
                 )}
@@ -1618,39 +1711,63 @@ export default function WorldSettingsPage() {
                   </div>
                 )}
 
-                {/* 关键剧情 */}
-                {Array.isArray(aiData.keyPlots?.volumes) && aiData.keyPlots.volumes.length > 0 && (
-                  <div className="bg-white rounded-xl border border-gray-200 p-5">
-                    <h3 className="text-lg font-bold text-gray-900 mb-4 flex items-center gap-2">
-                      <Target className="w-5 h-5 text-orange-500" /> 关键剧情节点
-                    </h3>
-                    <div className="space-y-3">
-                      {aiData.keyPlots.volumes.slice(0, 5).map(function(v, i) {
-                        return (
-                          <div key={i} className="flex items-start gap-3 p-3 bg-orange-50 rounded-lg">
-                            <span className="text-sm font-bold text-orange-600 whitespace-nowrap">{v.name || ('第' + (i + 1) + '卷')}</span>
-                            <span className="text-sm text-gray-600 line-clamp-2">{v.coreObjective || v.openingNode?.event || '—'}</span>
-                          </div>
-                        )
-                      })}
+                {/* 关键剧情（render 全部卷；此前只显前 5 卷 → 已改为全量 + 按需折叠） */}
+                {Array.isArray(aiData.keyPlots?.volumes) && aiData.keyPlots.volumes.length > 0 && (function() {
+                  const vols = (aiData.keyPlots?.volumes || []) as Array<{ name?: string; title?: string; summary?: string; coreObjective?: string; openingNode?: { event?: string } }>
+                  const limit = foldLimit(vols.length, !!aiExpanded['volumes'])
+                  return (
+                    <div className="bg-white rounded-xl border border-gray-200 p-5">
+                      <h3 className="text-lg font-bold text-gray-900 mb-4 flex items-center gap-2">
+                        <Target className="w-5 h-5 text-orange-500" /> 关键剧情节点
+                        <span className="text-xs font-normal text-gray-400">（共 {vols.length} 卷）</span>
+                      </h3>
+                      <div className="space-y-3">
+                        {vols.slice(0, limit).map(function(v, i) {
+                          return (
+                            <div key={i} className="flex items-start gap-3 p-3 bg-orange-50 rounded-lg">
+                              <span className="text-sm font-bold text-orange-600 whitespace-nowrap">{v.name || v.title || ('第' + (i + 1) + '卷')}</span>
+                              <div className="flex-1 space-y-1 min-w-0">
+                                {v.summary && <div className="text-sm text-gray-700 whitespace-pre-wrap">{v.summary}</div>}
+                                {v.coreObjective && <div className="text-sm text-gray-600"><span className="text-gray-400">核心目标：</span>{v.coreObjective}</div>}
+                                {v.openingNode?.event && <div className="text-sm text-gray-600"><span className="text-gray-400">开篇节点：</span>{v.openingNode.event}</div>}
+                                {!v.summary && !v.coreObjective && !v.openingNode?.event && <div className="text-sm text-gray-400">（未生成）</div>}
+                              </div>
+                            </div>
+                          )
+                        })}
+                      </div>
+                      {vols.length > AI_LIST_FOLD_LIMIT && (
+                        <button type="button" onClick={() => toggleAiSection('volumes')} className="mt-3 text-xs text-blue-600 hover:text-blue-700 font-medium">
+                          {aiExpanded['volumes'] ? '收起' : ('展开全部（共 ' + vols.length + ' 卷）')}
+                        </button>
+                      )}
                     </div>
-                  </div>
-                )}
+                  )
+                })()}
 
                 {/* 大纲 */}
-                {aiData.outline?.storyOrigin && (
+                {(aiData.outline?.storyOrigin || (Array.isArray(aiData.outline?.mainPlot) && aiData.outline.mainPlot.length > 0)) && (
                   <div className="bg-white rounded-xl border border-gray-200 p-5">
                     <h3 className="text-lg font-bold text-gray-900 mb-4 flex items-center gap-2">
                       <BookOpen className="w-5 h-5 text-teal-500" /> 故事大纲
                     </h3>
-                    <p className="text-sm text-gray-700 mb-3">{aiData.outline.storyOrigin}</p>
-                    {Array.isArray(aiData.outline.mainPlot) && (
-                      <div className="space-y-1">
-                        {aiData.outline.mainPlot.slice(0, 5).map(function(p: string, i: number) {
-                          return <div key={i} className="text-sm text-gray-600">阶段{i + 1}：{p}</div>
-                        })}
-                      </div>
-                    )}
+                    <p className="text-sm text-gray-700 mb-3 whitespace-pre-wrap">{aiData.outline?.storyOrigin || '（未生成）'}</p>
+                    {Array.isArray(aiData.outline?.mainPlot) && (function() {
+                      const arr = (aiData.outline?.mainPlot || []) as string[]
+                      const limit = foldLimit(arr.length, !!aiExpanded['mainPlot'])
+                      return (
+                        <div className="space-y-1">
+                          {arr.slice(0, limit).map(function(p: string, i: number) {
+                            return <div key={i} className="text-sm text-gray-600 whitespace-pre-wrap">阶段{i + 1}：{p || '（未生成）'}</div>
+                          })}
+                          {arr.length > AI_LIST_FOLD_LIMIT && (
+                            <button type="button" onClick={() => toggleAiSection('mainPlot')} className="mt-2 text-xs text-blue-600 hover:text-blue-700 font-medium">
+                              {aiExpanded['mainPlot'] ? '收起' : ('展开全部（共 ' + arr.length + ' 阶段）')}
+                            </button>
+                          )}
+                        </div>
+                      )
+                    })()}
                   </div>
                 )}
               </div>

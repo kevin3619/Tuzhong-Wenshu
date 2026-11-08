@@ -42,6 +42,9 @@
  *     「智能推荐模型」标签，需与 route.ts 权威表保持同步（改一处必改三处）。
  *
  * 改配置只需改这张表，不用动业务代码。
+ * 🔥 2026-10-17 接入豆包网页版逆向网关（DOUBAO_WEB）：content/imitate/polish 正文类环节首选
+ *   doubao（models.json 中 provider='豆包网页版'，apiKey=sessionid，网关监听 127.0.0.1:8000）。
+ *   与 route.ts 权威表同步；网关失效时由 callLLMWithFallback 自动回落免费池。
  * API Key 由 resolve-llm-config 从 models.json 按 provider+model 匹配取得。
  */
 
@@ -156,6 +159,14 @@ const OR_LFM: StepModel = {
   baseUrl: OPENROUTER,
 }
 
+// ==================== 豆包网页版逆向网关（2026-10-17 接入） ====================
+/** 正文/仿写/润色首选：豆包网页版（doubao-free-api 网关，OpenAI 兼容，apiKey=sessionid） */
+const DOUBAO_WEB: StepModel = {
+  provider: '豆包网页版',
+  model: 'doubao',
+  baseUrl: 'http://127.0.0.1:8000/v1',
+}
+
 // ==================== 两套配置 ====================
 
 /**
@@ -194,9 +205,9 @@ const QUALITY_FIRST: Record<string, StepModel> = {
   factions: ZP_4F,
   relationships: ZP_4F,
   synopsis: ZP_4F,
-  content: ZP_4F,
-  imitate: ZP_4F,
-  polish: ZP_4F,
+  content: DOUBAO_WEB,
+  imitate: DOUBAO_WEB,
+  polish: DOUBAO_WEB,
   compliance: ZP_4F,
   originality: ZP_4F,
   contractScore: ZP_4F,
@@ -228,9 +239,9 @@ const COST_FIRST: Record<string, StepModel> = {
   factions: ZP_4F,
   relationships: ZP_4F,
   synopsis: ZP_4F,
-  content: ZP_4F,
-  imitate: ZP_4F,
-  polish: ZP_4F,
+  content: DOUBAO_WEB,
+  imitate: DOUBAO_WEB,
+  polish: DOUBAO_WEB,
   compliance: ZP_4F,
   originality: ZP_4F,
   contractScore: ZP_4F,

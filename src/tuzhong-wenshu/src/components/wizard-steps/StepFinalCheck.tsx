@@ -6,7 +6,9 @@
  */
 
 import { useState } from 'react'
-import { Shield, Zap, FileCheck, Award, AlertTriangle, CheckCircle, XCircle, RefreshCw, ChevronDown, ChevronRight, TrendingUp, TrendingDown, Globe, Lightbulb } from 'lucide-react'
+import { Shield, Zap, FileCheck, Award, AlertTriangle, CheckCircle, XCircle, RefreshCw, ChevronDown, ChevronRight, TrendingUp, TrendingDown, Globe, Lightbulb, Users, Sparkles, PenLine, BookOpen } from 'lucide-react'
+import StepChecklistPanel from './StepChecklistPanel'
+import type { RepairState } from './StepChecklistPanel'
 
 interface FinalCheckResult {
   aiDetect?: {
@@ -79,15 +81,91 @@ interface FinalCheckResult {
   }
 }
 
+/** 三方评审可选章节（来自 generatedData.chapters.generatedContent，仅保留有正文的章节） */
+interface ReviewableChapter {
+  id: string
+  title: string
+  content: string
+  summary: string
+  chapterNumber: number
+}
+
+/** 三方评审接口返回（POST /tuzhong-wenshu/api/ai/panel-review） */
+interface PanelReviewData {
+  editorScore: number
+  readerScore: number
+  writerNotes: string[]
+  mustFix: string[]
+  verdict: 'PASS' | 'REVISE' | 'DEGRADED'
+  editor: {
+    structure: string
+    pacing: string
+    characterConsistency: string
+    platformRisk: string
+  }
+  reader: {
+    hook: string
+    payoffs: string[]
+    poisonPoints: string[]
+    dropPointAt: string
+  }
+}
+
+/** 收集有正文、可送三方评审的章节 */
+function collectReviewableChapters(data: any): ReviewableChapter[] {
+  var source = data && data.chapters && Array.isArray(data.chapters.generatedContent)
+    ? data.chapters.generatedContent
+    : (data && Array.isArray(data.generatedContent) ? data.generatedContent : [])
+  var list: ReviewableChapter[] = []
+  source.forEach(function(c: any, i: number) {
+    if (!c || typeof c.content !== 'string' || !c.content.trim()) return
+    list.push({
+      id: c.id || 'panel-ch-' + i,
+      title: c.title || ('第' + (i + 1) + '章'),
+      content: c.content,
+      summary: typeof c.summary === 'string' ? c.summary : '',
+      chapterNumber: typeof c.chapterNumber === 'number' ? c.chapterNumber : i + 1,
+    })
+  })
+  return list
+}
+
+/** 人物小传摘要（可选入参，缺失时返回空串） */
+function buildCharactersBrief(data: any): string {
+  var ch = data && data.characters
+  if (!ch) return ''
+  var parts: string[] = []
+  var pushPerson = function(p: any) {
+    if (!p || typeof p.name !== 'string' || !p.name.trim()) return
+    var desc = typeof p.identity === 'string' ? p.identity
+      : typeof p.personality === 'string' ? p.personality
+      : typeof p.role === 'string' ? p.role : ''
+    parts.push(p.name.trim() + (desc ? '（' + desc + '）' : ''))
+  }
+  pushPerson(ch.protagonist)
+  pushPerson(ch.femaleLead)
+  pushPerson(ch.antagonist)
+  if (Array.isArray(ch.supporting)) {
+    ch.supporting.slice(0, 8).forEach(pushPerson)
+  }
+  return parts.join('、')
+}
+
 interface StepFinalCheckProps {
   result: FinalCheckResult | null
   loading: boolean
   onCheck: () => void
   onPolish: () => void
   onRetry: () => void
+  /** 整包生成数据（全环节避坑检查数据源，交由 runPitfallCheck 判定） */
+  generatedData: any
+  /** 一键修复全部（存在即可点击，不再有「即将上线」置灰路径） */
+  onRepairAll?: () => void
+  /** 一键修复进度状态（透传给 StepChecklistPanel 纯展示：running/done/total/failed/message） */
+  repairState?: RepairState
 }
 
-export default function StepFinalCheck({ result, loading, onCheck, onPolish, onRetry }: StepFinalCheckProps) {
+export default function StepFinalCheck({ result, loading, onCheck, onPolish, onRetry, generatedData, onRepairAll, repairState }: StepFinalCheckProps) {
   const [expandedSections, setExpandedSections] = useState<Record<string, boolean>>({
     aiDetect: true,
     polish: false,
@@ -97,6 +175,13 @@ export default function StepFinalCheck({ result, loading, onCheck, onPolish, onR
     platformChecks: true,
     improvements: false,
   })
+
+  /** 三方评审结果仅存组件本地 state，刷新即清空 */
+  const [panelReview, setPanelReview] = useState<PanelReviewData | null>(null)
+  const [panelReviewLoading, setPanelReviewLoading] = useState(false)
+  const [panelReviewError, setPanelReviewError] = useState('')
+  const [panelChapterIndex, setPanelChapterIndex] = useState(0)
+  const [panelReviewedChapter, setPanelReviewedChapter] = useState('')
 
   const toggleSection = function(key: string) {
     setExpandedSections(function(prev) {
@@ -135,19 +220,269 @@ export default function StepFinalCheck({ result, loading, onCheck, onPolish, onR
     }
   }
 
+  /** 可评审章节（有正文的章节） */
+  var panelChapters = collectReviewableChapters(generatedData)
+  var panelSafeIndex = panelChapters.length > 0 ? Math.min(panelChapterIndex, panelChapters.length - 1) : 0
+  var panelChapter = panelChapters.length > 0 ? panelChapters[panelSafeIndex] : null
+
+  /** 运行三方评审：成功覆盖结果，失败保留上一次结果 */
+  var handlePanelReview = async function() {
+    if (!panelChapter || panelReviewLoading) return
+    setPanelReviewLoading(true)
+    setPanelReviewError('')
+    try {
+      var headers: Record<string, string> = { 'Content-Type': 'application/json' }
+      try {
+        var token = localStorage.getItem('token')
+        if (token) headers['Authorization'] = 'Bearer ' + token
+      } catch (e) {}
+      var prevChapter = panelSafeIndex > 0 ? panelChapters[panelSafeIndex - 1] : null
+      var res = await fetch('/tuzhong-wenshu/api/ai/panel-review', {
+        method: 'POST',
+        headers: headers,
+        body: JSON.stringify({
+          content: panelChapter.content,
+          chapterTitle: panelChapter.title,
+          chapterSummary: panelChapter.summary,
+          genre: (generatedData && generatedData.idea && generatedData.idea.genre) || (generatedData && generatedData.genre) || '',
+          characters: buildCharactersBrief(generatedData),
+          previousChapterEnding: prevChapter ? prevChapter.content.slice(-500) : '',
+        }),
+      })
+      var json = await res.json().catch(function() { return null })
+      if (!res.ok || !json || json.success === false) {
+        throw new Error((json && json.error) || '三方评审失败，请稍后重试')
+      }
+      if (!json.data) throw new Error('三方评审返回为空，已保留上次结果')
+      setPanelReview(json.data as PanelReviewData)
+      setPanelReviewedChapter(panelChapter.title)
+    } catch (err) {
+      setPanelReviewError(err instanceof Error ? err.message : '三方评审失败，请稍后重试')
+    } finally {
+      setPanelReviewLoading(false)
+    }
+  }
+
+  /** 三方评审卡片（写手 / 编辑 / 读者三角色 + 总体判定） */
+  var renderPanelReview = function() {
+    var writerNotes = panelReview && Array.isArray(panelReview.writerNotes) ? panelReview.writerNotes : []
+    var mustFix = panelReview && Array.isArray(panelReview.mustFix) ? panelReview.mustFix : []
+    var ed = panelReview ? panelReview.editor : null
+    var rd = panelReview ? panelReview.reader : null
+    var payoffs = rd && Array.isArray(rd.payoffs) ? rd.payoffs : []
+    var poisonPoints = rd && Array.isArray(rd.poisonPoints) ? rd.poisonPoints : []
+    var editorRows = [
+      { label: '结构', value: ed && ed.structure },
+      { label: '节奏', value: ed && ed.pacing },
+      { label: '人物一致性', value: ed && ed.characterConsistency },
+      { label: '平台风险', value: ed && ed.platformRisk },
+    ]
+    var verdictBadge = panelReview
+      ? (panelReview.verdict === 'PASS'
+          ? { bg: 'bg-green-100 text-green-700 border-green-200', text: 'PASS · 通过' }
+          : panelReview.verdict === 'REVISE'
+          ? { bg: 'bg-orange-100 text-orange-700 border-orange-200', text: 'REVISE · 需修改' }
+          : { bg: 'bg-stone-100 text-stone-600 border-stone-200', text: 'DEGRADED · 降级结果' })
+      : null
+
+    return (
+      <div className="bg-white rounded-xl border border-stone-200 overflow-hidden">
+        {/* 标题栏 + 章节选择 + 运行按钮 */}
+        <div className="p-4 border-b border-stone-100 flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-center gap-2 flex-wrap">
+            <Users className="w-5 h-5 text-stone-800" />
+            <span className="font-semibold text-stone-800">三方评审</span>
+            <span className="text-xs text-stone-400">白金写手 · 金牌编辑 · 老书虫读者</span>
+            {verdictBadge && (
+              <span className={`px-2 py-0.5 rounded-full border text-xs font-bold ${verdictBadge.bg}`}>{verdictBadge.text}</span>
+            )}
+          </div>
+          <div className="flex items-center gap-2 flex-wrap">
+            <select
+              value={panelSafeIndex}
+              onChange={function(e) { setPanelChapterIndex(Number(e.target.value)) }}
+              disabled={panelChapters.length === 0 || panelReviewLoading}
+              className="text-sm border border-stone-200 rounded-lg px-2 py-1.5 bg-white text-stone-700 max-w-[240px] disabled:opacity-60"
+            >
+              {panelChapters.length === 0 ? (
+                <option value={0}>暂无可评审章节</option>
+              ) : panelChapters.map(function(c, i) {
+                return <option key={c.id} value={i}>{c.title}</option>
+              })}
+            </select>
+            <button
+              onClick={handlePanelReview}
+              disabled={!panelChapter || panelReviewLoading}
+              className="px-4 py-2 bg-stone-800 text-white rounded-lg hover:bg-stone-700 text-sm font-medium flex items-center gap-2 disabled:opacity-60 disabled:cursor-not-allowed"
+            >
+              {panelReviewLoading ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
+              {panelReviewLoading ? '评审中…' : panelReview ? '重新评审' : '运行三方评审'}
+            </button>
+          </div>
+        </div>
+
+        {/* 失败提示：保留上一次结果，不清空 */}
+        {panelReviewError && (
+          <div className="mx-4 mt-4 bg-red-50 border border-red-200 rounded-lg p-3 text-xs text-red-600 flex items-start gap-2">
+            <AlertTriangle className="w-4 h-4 shrink-0" />
+            <span>{panelReviewError}</span>
+          </div>
+        )}
+
+        {panelReview && panelReviewedChapter && (
+          <div className="px-4 pt-3 text-xs text-stone-400">评审章节：{panelReviewedChapter}</div>
+        )}
+
+        {!panelReview && !panelReviewLoading && (
+          <div className="px-4 py-8 text-center text-sm text-stone-400">
+            {panelChapters.length === 0
+              ? '暂无可评审章节，请先生成章节正文'
+              : '选择章节后运行三方评审，分别给出写手 / 编辑 / 读者三方判断'}
+          </div>
+        )}
+
+        {panelReview && (
+          <div className="p-4">
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+              {/* 白金作者写手 */}
+              <div className="rounded-lg border border-stone-300 p-3">
+                <div className="flex items-center gap-2 mb-2">
+                  <PenLine className="w-4 h-4 text-stone-700" />
+                  <span className="text-sm font-semibold text-stone-800">白金作者写手</span>
+                </div>
+                {writerNotes.length === 0 ? (
+                  <div className="text-xs text-stone-400">暂无写法建议</div>
+                ) : (
+                  <ul className="space-y-1.5">
+                    {writerNotes.map(function(note: string, i: number) {
+                      return (
+                        <li key={i} className="text-xs text-stone-600 leading-relaxed flex items-start gap-1.5">
+                          <span className="text-stone-400 mt-0.5">•</span>
+                          <span>{note}</span>
+                        </li>
+                      )
+                    })}
+                  </ul>
+                )}
+              </div>
+
+              {/* 金牌审稿编辑 */}
+              <div className="rounded-lg border border-slate-400 p-3">
+                <div className="flex items-center gap-2 mb-2">
+                  <Award className="w-4 h-4 text-slate-700" />
+                  <span className="text-sm font-semibold text-stone-800">金牌审稿编辑</span>
+                </div>
+                <div className="flex items-end gap-2 mb-2">
+                  <span className="text-3xl font-bold text-stone-900">{Number(panelReview.editorScore || 0).toFixed(1)}</span>
+                  <span className="text-xs text-stone-400 mb-1">/ 10 编辑评分</span>
+                </div>
+                <div className="space-y-1.5">
+                  {editorRows.map(function(row, i) {
+                    return (
+                      <div key={i} className="text-xs leading-relaxed">
+                        <span className="text-stone-400">{row.label}：</span>
+                        <span className="text-stone-600">{row.value || '—'}</span>
+                      </div>
+                    )
+                  })}
+                </div>
+                {mustFix.length > 0 && (
+                  <div className="mt-3 rounded-lg border border-red-100 bg-red-50 p-2.5">
+                    <div className="text-xs font-semibold text-red-700 mb-1">必须修改（{mustFix.length}）</div>
+                    <ol className="space-y-1">
+                      {mustFix.map(function(item: string, i: number) {
+                        return (
+                          <li key={i} className="text-xs text-red-600 flex items-start gap-1.5">
+                            <span className="shrink-0 font-semibold">{i + 1}.</span>
+                            <span>{item}</span>
+                          </li>
+                        )
+                      })}
+                    </ol>
+                  </div>
+                )}
+              </div>
+
+              {/* 十年老书虫读者 */}
+              <div className="rounded-lg border border-zinc-400 p-3">
+                <div className="flex items-center gap-2 mb-2">
+                  <BookOpen className="w-4 h-4 text-zinc-700" />
+                  <span className="text-sm font-semibold text-stone-800">十年老书虫读者</span>
+                </div>
+                <div className="flex items-end gap-2 mb-2">
+                  <span className="text-3xl font-bold text-stone-900">{Number(panelReview.readerScore || 0).toFixed(1)}</span>
+                  <span className="text-xs text-stone-400 mb-1">/ 10 读者评分</span>
+                </div>
+                <div className="space-y-1.5">
+                  <div className="text-xs leading-relaxed">
+                    <span className="text-stone-400">开篇钩子：</span>
+                    <span className="text-stone-600">{(rd && rd.hook) || '—'}</span>
+                  </div>
+                  <div className="text-xs leading-relaxed">
+                    <div className="text-stone-400">爽点兑现</div>
+                    {payoffs.length === 0 ? (
+                      <div className="text-stone-500">—</div>
+                    ) : (
+                      <ul className="space-y-1 mt-0.5">
+                        {payoffs.map(function(p: string, i: number) {
+                          return (
+                            <li key={i} className="text-stone-600 flex items-start gap-1.5">
+                              <span className="text-stone-400 mt-0.5">•</span>
+                              <span>{p}</span>
+                            </li>
+                          )
+                        })}
+                      </ul>
+                    )}
+                  </div>
+                  <div className="text-xs leading-relaxed">
+                    <div className="text-stone-400">毒点</div>
+                    {poisonPoints.length === 0 ? (
+                      <div className="text-stone-500">—</div>
+                    ) : (
+                      <ul className="space-y-1 mt-0.5">
+                        {poisonPoints.map(function(p: string, i: number) {
+                          return (
+                            <li key={i} className="text-stone-600 flex items-start gap-1.5">
+                              <span className="text-stone-400 mt-0.5">•</span>
+                              <span>{p}</span>
+                            </li>
+                          )
+                        })}
+                      </ul>
+                    )}
+                  </div>
+                  <div className="text-xs leading-relaxed">
+                    <span className="text-stone-400">弃书点：</span>
+                    <span className="text-stone-600">{(rd && rd.dropPointAt) || '—'}</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    )
+  }
+
   if (!result && !loading) {
     return (
-      <div className="flex flex-col items-center justify-center py-20">
-        <Shield className="w-16 h-16 text-stone-300 mb-4" />
-        <h3 className="text-lg font-semibold text-stone-600 mb-2">爆款终检</h3>
-        <p className="text-sm text-stone-400 mb-6">检测AI率、原创度、合规性，评估签约价值</p>
-        <button
-          onClick={onCheck}
-          className="px-8 py-3 wenshu-btn-primary rounded-xl font-medium text-sm flex items-center gap-2"
-        >
-          <Shield className="w-4 h-4" />
-          开始终检
-        </button>
+      <div className="space-y-4">
+        {/* 🔥 #226c：未点「爆款终检」前也先展示全环节避坑检查结果 */}
+        <StepChecklistPanel data={generatedData} onRepairAll={onRepairAll} repairState={repairState} />
+        {renderPanelReview()}
+        <div className="flex flex-col items-center justify-center py-20">
+          <Shield className="w-16 h-16 text-stone-300 mb-4" />
+          <h3 className="text-lg font-semibold text-stone-600 mb-2">爆款终检</h3>
+          <p className="text-sm text-stone-400 mb-6">检测AI率、原创度、合规性，评估签约价值</p>
+          <button
+            onClick={onCheck}
+            className="px-8 py-3 wenshu-btn-primary rounded-xl font-medium text-sm flex items-center gap-2"
+          >
+            <Shield className="w-4 h-4" />
+            开始终检
+          </button>
+        </div>
       </div>
     )
   }
@@ -168,6 +503,9 @@ export default function StepFinalCheck({ result, loading, onCheck, onPolish, onR
 
   return (
     <div className="space-y-4">
+      {/* 🔥 #226c：全环节避坑检查面板置顶（覆盖 55 条真实判定，未通过项置顶） */}
+      <StepChecklistPanel data={generatedData} onRepairAll={onRepairAll} repairState={repairState} />
+      {renderPanelReview()}
       {/* 综合判定横幅 */}
       <div className={`rounded-xl p-6 border-2 ${v.canSubmit ? (v.warnings.length > 0 ? 'bg-yellow-50 border-yellow-300' : 'bg-green-50 border-green-300') : 'bg-red-50 border-red-300'}`}>
         <div className="flex items-start gap-4">
@@ -185,11 +523,12 @@ export default function StepFinalCheck({ result, loading, onCheck, onPolish, onR
         {/* 核心指标 */}
         <div className="grid grid-cols-4 gap-3 mt-4">
           <div className="bg-white rounded-lg p-3 text-center border border-stone-100">
-            <div className="text-xs text-stone-500 mb-1">AI率</div>
+            <div className="text-xs text-stone-500 mb-1">平台自研估测AI率</div>
             <div className={`text-xl font-bold ${v.aiRate < 5 ? 'text-green-600' : v.aiRate < 15 ? 'text-yellow-600' : 'text-red-600'}`}>
               {v.aiRate.toFixed(1)}%
             </div>
             <div className="text-xs text-stone-400">{v.aiRate < 5 ? '达标' : '偏高'}</div>
+            <div className="text-[10px] text-stone-400 mt-0.5 leading-tight">站内算法估测，非朱雀官方结果</div>
           </div>
           <div className="bg-white rounded-lg p-3 text-center border border-stone-100">
             <div className="text-xs text-stone-500 mb-1">原创度</div>

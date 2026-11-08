@@ -35,7 +35,7 @@ export function chineseNumberToInt(str: string): number | null {
   }
   
   let result = 0
-  let temp = 0
+  let currentDigit = 0
   let lastUnit = 0
   let hasDigit = false
   
@@ -43,29 +43,29 @@ export function chineseNumberToInt(str: string): number | null {
     const char = str[i]
     
     if (chineseDigits[char] !== undefined) {
-      temp = chineseDigits[char]
+      currentDigit = chineseDigits[char]
       hasDigit = true
     } else if (units[char] !== undefined) {
       const unit = units[char]
       
       if (unit === 10000 || unit === 100000000) {
-        // 万或亿：需要把之前的temp和result都处理
-        result = (result + temp) * unit
-        temp = 0
+        // 万或亿：需要把之前的currentDigit和result都处理
+        result = (result + currentDigit) * unit
+        currentDigit = 0
       } else {
         // 十、百、千
-        if (temp === 0 && unit === 10) {
+        if (currentDigit === 0 && unit === 10) {
           // 特殊情况："十"开头，如"十五" = 15
-          temp = 1
+          currentDigit = 1
         }
-        result += temp * unit
-        temp = 0
+        result += currentDigit * unit
+        currentDigit = 0
       }
       lastUnit = unit
     }
   }
   
-  result += temp
+  result += currentDigit
   
   if (!hasDigit && result === 0) return null
   

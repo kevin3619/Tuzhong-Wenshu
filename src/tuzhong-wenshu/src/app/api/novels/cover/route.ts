@@ -4,32 +4,9 @@ import { join } from 'path'
 import { verifyToken } from '@/lib/auth'
 import { isAdminOnlyNovel, extractTokenFromRequest } from '@/lib/permissions'
 import { prisma } from '@/lib/prisma'
+import { resolveDataDir, getDataDir } from '@/lib/data-dir'
+import { resolveInsideBase } from '@/lib/safe-path'
 
-function resolveDataDir(): string {
-  const cwd = process.cwd()
-  const candidates = [
-    join(cwd, '.tuzhong-data'),
-    join(cwd, 'data'),
-    join(cwd, 'src', 'tuzhong-wenshu', '.tuzhong-data'),
-    join(cwd, 'src', 'tuzhong-wenshu', 'data'),
-    join(cwd, '..', '.tuzhong-data'),
-    join(cwd, '..', 'data'),
-    '/www/wwwroot/tuzhong-wenshu/.tuzhong-data',
-    '/www/wwwroot/tuzhong-wenshu/data',
-  ]
-  for (const p of candidates) {
-    try {
-      if (existsSync(p)) return p
-    } catch {
-      // continue
-    }
-  }
-  const defaultPath = join(cwd, '.tuzhong-data')
-  try { if (!existsSync(defaultPath)) mkdirSync(defaultPath, { recursive: true }) } catch { /* ignore */ }
-  return defaultPath
-}
-
-function getDataDir(): string { return resolveDataDir() }
 function getNovelBookFile(): string { return join(getDataDir(), 'novels.json') }
 
 function ensureDir() {
@@ -68,8 +45,8 @@ async function getNovelCoverAnywhere(novelId: string): Promise<{ userId: string 
     if (dbRow) {
       return { userId: dbRow.userId || null, cover: dbRow.coverUrl || null }
     }
-  } catch {
-    // ignore prisma errors
+  } catch (e) {
+    console.error('[novels/cover] 查询作品封面元数据失败:', e)
   }
   return null
 }
@@ -183,8 +160,12 @@ export async function GET(request: NextRequest) {
     }
 
     // Case C: local file path
-    const abs = coverVal.startsWith('/') ? coverVal : join(getDataDir(), coverVal)
-    if (existsSync(abs)) {
+    // 🔥 修复（P0 任意文件读）：旧实现允许把 cover 写成 /etc/passwd、/root/.../.env 这类绝对路径
+    //   并直接 readFileSync（且本接口在 middleware 里是匿名可访问的）。
+    //   现只允许 .tuzhong-data 容器内的相对路径，绝对路径/盘符/.. 一律 404。
+    const safeAbs = resolveInsideBase(getDataDir(), String(coverVal))
+    if (safeAbs && existsSync(safeAbs)) {
+      const abs = safeAbs
       try {
         const buf = readFileSync(abs)
         const ext = String(coverVal).split('.').pop()?.toLowerCase() || 'png'
@@ -200,8 +181,8 @@ export async function GET(request: NextRequest) {
             'Cache-Control': 'private, max-age=86400',
           },
         })
-      } catch {
-        // fallthrough
+      } catch (e) {
+        console.error('[novels/cover] 读取封面候选文件失败，尝试下一个:', e)
       }
     }
 

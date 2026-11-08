@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { prisma } from '@/lib/prisma'
-import { hashPassword, createToken } from '@/lib/auth'
+import { hashPassword, createToken, invalidateUserTokens } from '@/lib/auth'
+import { invalidateResetToken } from '@/lib/password-reset'
 
 // POST /api/auth/reset-password/confirm
 // 确认重置密码
@@ -44,7 +45,7 @@ export async function POST(request: NextRequest) {
       // 清理过期token
       try {
         await prisma.systemConfig.delete({ where: { configKey: `reset_token_${token}` } })
-      } catch (_e) { /* ignore */ }
+      } catch (_e) { console.error('[reset-password] 清理过期重置token失败:', _e) }
       return NextResponse.json({ code: 400, message: '重置链接已过期' }, { status: 400 })
     }
 
@@ -64,10 +65,10 @@ export async function POST(request: NextRequest) {
       },
     })
 
-    // 删除已使用的重置token
-    try {
-      await prisma.systemConfig.delete({ where: { configKey: `reset_token_${token}` } })
-    } catch (_e) { /* ignore */ }
+    // 删除已使用的重置token（内存 + DB 一起清）
+    try { await invalidateResetToken(String(token)) } catch (_e) { console.error('[reset-password] 删除已用重置token失败:', _e) }
+    // 🔥 修复：重置成功后撤销该用户此前所有已登录会话
+    try { await invalidateUserTokens(user.id) } catch (e) { console.error('[reset-password] 撤销历史令牌失败:', e) }
 
     // 生成新token让用户直接登录
     const jwtToken = await createToken(user.id, user.isAdmin)

@@ -1,6 +1,7 @@
 import fs from 'fs'
 import path from 'path'
 import { getModelForStep } from './step-model-config'
+import { pickUserOwnModel, toConfig } from './ai/model-router'
 
 const dataDir = path.join(process.cwd(), '.tuzhong-data')
 const modelsFile = path.join(dataDir, 'models.json')
@@ -54,7 +55,15 @@ export function resolveLLMConfig(
   userId?: string,
   step?: string
 ): LLMConfig {
-  if (!inputCfg) return inputCfg as LLMConfig
+  if (!inputCfg) {
+    // 🔥 2026-10-21：请求未带任何模型配置时 → 用该用户自己配置的平台+模型（若有）
+    const _own0 = pickUserOwnModel(userId)
+    if (_own0) {
+      const _c0 = toConfig(_own0, true)
+      return { provider: _c0.provider, apiKey: _c0.apiKey, baseUrl: _c0.baseUrl, model: _c0.model }
+    }
+    return inputCfg as LLMConfig
+  }
 
   // 用副本操作，避免污染调用方传入的对象
   const cfg: LLMConfig & { modelId?: string } = { ...inputCfg }
@@ -95,7 +104,10 @@ export function resolveLLMConfig(
   }
 
   if (match && match.apiKey) {
-    const canUse = match.isAdminDefault === true || (userId && match.userId === userId) || !userId
+    // 🔥 安全修复：去掉 `|| !userId` —— 匿名/无归属请求不得回填任何人的真实 Key。
+    //   可用性收紧为：管理员共享模型(isAdminDefault) 或 本人自己的模型。
+    //   （此前未登录请求只要报个模型名就能拿到别人的真实 apiKey）
+    const canUse = match.isAdminDefault === true || (!!userId && match.userId === userId)
     if (canUse) {
       return {
         ...(cfg as LLMConfig),
@@ -105,6 +117,15 @@ export function resolveLLMConfig(
         model: cfg.model || match.model || '',
       } as LLMConfig
     }
+  }
+
+  // 🔥 2026-10-21：用户自有模型优先——注册用户配置了自己的平台+大模型后，
+  //   系统切换成他的平台与大模型，生成所有内容（续写/改写/检测/终检/润色…）。
+  //   优先级：显式指定 > 用户自有默认 > 管理员系统默认。
+  const _own = pickUserOwnModel(userId)
+  if (_own) {
+    const _c = toConfig(_own, true)
+    return { provider: _c.provider, apiKey: _c.apiKey, baseUrl: _c.baseUrl, model: _c.model }
   }
 
   return cfg as LLMConfig

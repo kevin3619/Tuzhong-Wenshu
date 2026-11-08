@@ -3,6 +3,7 @@
 import { useEffect } from 'react'
 import { extractText } from '@/lib/text-utils'
 import type { GeneratedData } from '../ai-generate-wizard'
+import { autoResize } from '@/hooks/useAutoResize'
 
 type KeyPlotVolume = NonNullable<NonNullable<GeneratedData['keyPlots']>['volumes']>[number]
 
@@ -31,11 +32,6 @@ export default function StepKeyPlots({
   data, onChange, onRegenerate, onGenerate, isLoading, regeneratePrompt, setRegeneratePrompt, RegenButton, regeneratingField, stepName,
 }: StepKeyPlotsProps) {
   const isWholeStepRegenerating = regeneratingField === stepName
-  const autoResize = function(e: React.FormEvent<HTMLTextAreaElement>) {
-    const ta = e.currentTarget
-    ta.style.height = 'auto'
-    ta.style.height = ta.scrollHeight + 'px'
-  }
 
   useEffect(function() {
     const timer = setTimeout(function() {

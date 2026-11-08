@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import {
   Settings, Cpu, PenTool, UserCircle, Plus, X, Check, Trash2,
   Edit3, Shield, Globe, Cloud, Server, BookOpen,
@@ -12,6 +12,15 @@ import Link from 'next/link'
 import UserProfileCard from '@/components/UserProfileCard'
 import AIDetectionLibrary from '@/components/AIDetectionLibrary'
 import { PRESET_STYLES } from '@/lib/ai-service'
+import {
+  applyPreferencesToLocalStorage,
+  fetchServerPreferences,
+  getLocalPrefsUpdatedAt,
+  pushServerPreferences,
+  getLocalZhuqueApiKey,
+  setLocalZhuqueApiKey,
+  clearLocalZhuqueApiKey,
+} from '@/lib/user-preferences-client'
 
 interface AIModelItem {
   id: string
@@ -31,6 +40,7 @@ interface AIModelItem {
   usageTag?: string
   isAdminDefault?: boolean
   userId?: string
+  rateLimit?: { perMinute?: number; perHour?: number; perDay?: number }
 }
 
 interface ModelPresetItem {
@@ -102,17 +112,6 @@ const modelPresetPool: ModelPresetItem[] = [
   },
   // 🔥 2026-09-01 第20轮：补齐第 8 个已配置硅基流动模型（非免费，按量计费，仅 bookAnalysis 每部 1 次）
   {
-    id: 'sf-dsv4-flash', name: '开局分析：DeepSeek-V4-Flash',
-    description: '硅基流动第8款已配置模型（按量计费非免费），推理能力强，仅用于 bookAnalysis 开局骨架分析（每部1次），其余环节一律免费模型',
-    usageTag: '开局分析', provider: '硅基流动', model: 'deepseek-ai/DeepSeek-V4-Flash',
-    temperature: 0.55, topP: 0.70, contextWindow: 128000, maxTokens: 4000,
-    presencePenalty: 1.00, frequencyPenalty: 1.00, color: 'blue', icon: '🚀',
-  },
-]
-
-// 2026-08-10：智谱 BigModel 免费模型预设卡片（定价页显示免费）
-const zhipuPresetPool: ModelPresetItem[] = [
-  {
     id: 'zhipu-glm47-flash', name: '超高速正文：GLM-4.7-Flash',
     description: '智谱 BigModel 免费模型，200K 超长上下文，适合正文续写与长文本连贯生成',
     usageTag: '正文写作', provider: '智谱GLM', model: 'glm-4.7-flash',
@@ -136,146 +135,6 @@ const zhipuPresetPool: ModelPresetItem[] = [
 ]
 
 // 2026-08-30：OpenRouter 永久免费模型预设卡片（:free 档，替换已下架旧 ID 为当前可用模型）
-const openrouterPresetPool: ModelPresetItem[] = [
-  {
-    id: 'or-minimax-m3', name: '免费主力：MiniMax-M3',
-    description: 'OpenRouter 免费档，1M 上下文，实测文笔与长文本一致性最佳，正文/大纲主力',
-    usageTag: '正文写作', provider: 'OpenRouter', model: 'minimax/minimax-m3:free',
-    temperature: 0.63, topP: 0.74, contextWindow: 1000000, maxTokens: 4000,
-    presencePenalty: 1.02, frequencyPenalty: 1.03, color: 'purple', icon: '🧠',
-  },
-  {
-    id: 'or-minimax-m27', name: '推理副力：MiniMax-M2.7',
-    description: 'OpenRouter 免费档，推理模型，质量好；需给足 maxTokens 否则思考耗尽返回空',
-    usageTag: '大纲生成', provider: 'OpenRouter', model: 'minimax/minimax-m2.7:free',
-    temperature: 0.55, topP: 0.70, contextWindow: 200000, maxTokens: 4000,
-    presencePenalty: 1.00, frequencyPenalty: 1.00, color: 'cyan', icon: '🔄',
-  },
-  {
-    id: 'or-dots3', name: '长正文：Dots-3-Note-Preview',
-    description: 'OpenRouter 免费档，长正文见长；偶发中英混杂，建议非正文主用',
-    usageTag: '正文备用', provider: 'OpenRouter', model: 'dots-studio/dots-3-note-preview:free',
-    temperature: 0.60, topP: 0.70, contextWindow: 128000, maxTokens: 4000,
-    presencePenalty: 1.02, frequencyPenalty: 1.03, color: 'red', icon: '📝',
-  },
-  {
-    id: 'or-nemotron-super', name: '推理备用：Nemotron-3-Super-120B',
-    description: 'OpenRouter 免费档，120B MoE 推理，结构化规划备用，偏慢',
-    usageTag: '权谋战争', provider: 'OpenRouter', model: 'nvidia/nemotron-3-super-120b-a12b:free',
-    temperature: 0.55, topP: 0.70, contextWindow: 128000, maxTokens: 3000,
-    presencePenalty: 1.05, frequencyPenalty: 1.04, color: 'blue', icon: '⚔️',
-  },
-  {
-    id: 'or-lfm-26b', name: '极速轻量：LFM-2.5-2.6B',
-    description: 'OpenRouter 免费档，2.6B 极速模型，灵感碎片/辅助扩写毫秒级',
-    usageTag: '极速轻量', provider: 'OpenRouter', model: 'liquid/lfm-2.5-2.6b:free',
-    temperature: 0.40, topP: 0.60, contextWindow: 32000, maxTokens: 4000,
-    presencePenalty: 1.00, frequencyPenalty: 1.00, color: 'teal', icon: '🛡️',
-  },
-  {
-    id: 'or-nemotron-ultra', name: '长文备用：Nemotron-3-Ultra-550B',
-    description: 'OpenRouter 免费档，550B MoE 大参数，长文综合强，但很慢，仅备用',
-    usageTag: '正文写作', provider: 'OpenRouter', model: 'nvidia/nemotron-3-ultra-550b-a55b:free',
-    temperature: 0.63, topP: 0.74, contextWindow: 128000, maxTokens: 3000,
-    presencePenalty: 1.02, frequencyPenalty: 1.03, color: 'emerald', icon: '🏆',
-  },
-  {
-    id: 'or-gemma4-31b', name: '备用：Gemma-4-31B',
-    description: 'OpenRouter 免费档，谷歌 31B，输出稳健合规，综合生成可用',
-    usageTag: '综合全能', provider: 'OpenRouter', model: 'google/gemma-4-31b-it:free',
-    temperature: 0.60, topP: 0.70, contextWindow: 128000, maxTokens: 3000,
-    presencePenalty: 1.00, frequencyPenalty: 1.00, color: 'blue', icon: '💎',
-  },
-  {
-    id: 'or-glm52', name: '备用：GLM-5.2',
-    description: 'OpenRouter 免费档，智谱 5.2，中文创意与推理均衡，正文/大纲均可（易 429）',
-    usageTag: '正文写作', provider: 'OpenRouter', model: 'z-ai/glm-5.2:free',
-    temperature: 0.60, topP: 0.72, contextWindow: 128000, maxTokens: 3000,
-    presencePenalty: 1.02, frequencyPenalty: 1.03, color: 'green', icon: '✨',
-  },
-  {
-    id: 'or-north-mini-code', name: '备用：North-Mini-Code',
-    description: 'OpenRouter 免费档，轻量模型，结构化/代码向辅助，极速响应',
-    usageTag: '极速轻量', provider: 'OpenRouter', model: 'cohere/north-mini-code:free',
-    temperature: 0.50, topP: 0.70, contextWindow: 128000, maxTokens: 2000,
-    presencePenalty: 1.00, frequencyPenalty: 1.00, color: 'cyan', icon: '🌬️',
-  },
-  {
-    id: 'or-gemma4-26b', name: '备用：Gemma-4-26B-A4B',
-    description: 'OpenRouter 免费档，26B 稀疏 MoE，大参数综合能力，大纲/正文备用',
-    usageTag: '大纲生成', provider: 'OpenRouter', model: 'google/gemma-4-26b-a4b-it:free',
-    temperature: 0.50, topP: 0.70, contextWindow: 128000, maxTokens: 4000,
-    presencePenalty: 1.00, frequencyPenalty: 1.00, color: 'purple', icon: '🚀',
-  },
-]
-
-// 2026-08-12：Groq 永久免费模型预设卡片（免费档有速率额度限制）
-const groqPresetPool: ModelPresetItem[] = [
-  {
-    id: 'groq-llama-33-70b', name: '综合全能：Llama-3.3-70B',
-    description: 'Groq 免费档，Meta 70B 极速推理，中文创意稳定，可作正文主力',
-    usageTag: '综合全能', provider: 'Groq', model: 'llama-3.3-70b-versatile',
-    temperature: 0.63, topP: 0.74, contextWindow: 128000, maxTokens: 4000,
-    presencePenalty: 1.02, frequencyPenalty: 1.03, color: 'blue', icon: '🎯',
-  },
-  {
-    id: 'groq-llama-31-8b', name: '极速：Llama-3.1-8B',
-    description: 'Groq 免费档，8B 毫秒级响应，大纲碎片/灵感捕捉专用',
-    usageTag: '极速轻量', provider: 'Groq', model: 'llama-3.1-8b-instant',
-    temperature: 0.40, topP: 0.60, contextWindow: 128000, maxTokens: 4000,
-    presencePenalty: 1.00, frequencyPenalty: 1.00, color: 'teal', icon: '⚡',
-  },
-  {
-    id: 'groq-ds-r1-70b', name: '强推理：DeepSeek-R1-Distill-70B',
-    description: 'Groq 免费档，R1 蒸馏 70B，权谋战争/大型战役智力交锋专业',
-    usageTag: '权谋战争', provider: 'Groq', model: 'deepseek-r1-distill-llama-70b',
-    temperature: 0.55, topP: 0.70, contextWindow: 128000, maxTokens: 3000,
-    presencePenalty: 1.05, frequencyPenalty: 1.04, color: 'red', icon: '⚔️',
-  },
-  {
-    id: 'groq-ds-r1-32b', name: '推理：DeepSeek-R1-Distill-32B',
-    description: 'Groq 免费档，R1 蒸馏 32B，大纲/角色/世界观等结构化规划步',
-    usageTag: '大纲生成', provider: 'Groq', model: 'deepseek-r1-distill-qwen-32b',
-    temperature: 0.55, topP: 0.70, contextWindow: 128000, maxTokens: 3000,
-    presencePenalty: 1.05, frequencyPenalty: 1.04, color: 'purple', icon: '🧠',
-  },
-  {
-    id: 'groq-qwen25-32b', name: '中文：Qwen2.5-32B',
-    description: 'Groq 免费档，阿里 32B，中文理解与叙事流畅，正文续写可用',
-    usageTag: '正文写作', provider: 'Groq', model: 'qwen-2.5-32b',
-    temperature: 0.63, topP: 0.74, contextWindow: 128000, maxTokens: 3000,
-    presencePenalty: 1.02, frequencyPenalty: 1.03, color: 'emerald', icon: '🏆',
-  },
-  {
-    id: 'groq-gemma2-9b', name: '稳健：Gemma2-9B',
-    description: 'Groq 免费档，谷歌 9B，输出稳健合规，轻量综合生成',
-    usageTag: '综合全能', provider: 'Groq', model: 'gemma2-9b-it',
-    temperature: 0.60, topP: 0.70, contextWindow: 128000, maxTokens: 3000,
-    presencePenalty: 1.00, frequencyPenalty: 1.00, color: 'green', icon: '💎',
-  },
-]
-
-// 2026-08-12：腾讯混元 永久免费模型预设卡片
-const hunyuanPresetPool: ModelPresetItem[] = [
-  {
-    id: 'hy-lite', name: '国产免费：Hunyuan-Lite',
-    description: '腾讯混元永久免费模型，国产大模型，中文创作与理解稳定，可作正文主力备选',
-    usageTag: '正文写作', provider: '腾讯混元', model: 'hunyuan-lite',
-    temperature: 0.63, topP: 0.74, contextWindow: 128000, maxTokens: 3000,
-    presencePenalty: 1.02, frequencyPenalty: 1.03, color: 'red', icon: '🐧',
-  },
-]
-
-// 🔥 2026-09-01 第20轮：商汤日日新 模型预设卡片（已配置 1 套：sensenova-6.8-flash-lite）
-const sensenovaPresetPool: ModelPresetItem[] = [
-  {
-    id: 'st-68-flash-lite', name: '极速轻量：SenseNova-6.8-Flash-Lite',
-    description: '商汤日日新免费档轻量模型，响应快、指令遵从好、结构化 JSON 输出干净，可作人物/大纲等结构化步备选',
-    usageTag: '综合备用', provider: '商汤 (SenseTime)', model: 'sensenova-6.8-flash-lite',
-    temperature: 0.50, topP: 0.70, contextWindow: 128000, maxTokens: 4000,
-    presencePenalty: 1.00, frequencyPenalty: 1.00, color: 'emerald', icon: '🌆',
-  },
-]
 
 const PRESET_COLOR_MAP: Record<string, { bg: string; border: string; text: string; badge: string }> = {
   blue: { bg: 'bg-blue-50', border: 'border-blue-200', text: 'text-blue-800', badge: 'bg-blue-100 text-blue-700' },
@@ -287,37 +146,74 @@ const PRESET_COLOR_MAP: Record<string, { bg: string; border: string; text: strin
   emerald: { bg: 'bg-emerald-50', border: 'border-emerald-200', text: 'text-emerald-800', badge: 'bg-emerald-100 text-emerald-700' },
 }
 
-function renderPresetCards(presets: ModelPresetItem[], isAdmin: boolean, aiModelBatch: AIModelItem[]) {
+function initPresetSelection(pool: ModelPresetItem[]): Record<string, boolean> {
+  const sel: Record<string, boolean> = {}
+  pool.forEach(function (p) { sel[p.id] = presetBilling(p.id) === 'free' })
+  return sel
+}
+
+const SILICONFLOW_PRESET_IDS = ['sf-qwen25-7b', 'sf-glm4-9b', 'sf-glmz1-9b', 'sf-qwen3-8b', 'sf-qwen35-4b', 'sf-hunyuan-7b', 'sf-kolors']
+
+const zhipuPresetPool: ModelPresetItem[] = modelPresetPool.filter(function (p) { return String(p.provider || '') === '智谱GLM' })
+
+function platformPoolFor(provider: string): ModelPresetItem[] {
+  // 🔥 2026-11-05 平台清理后：OpenRouter/Groq/腾讯混元/商汤/OpenVeer 已移除，仅保留硅基与智谱（走专用池）
+  return []
+}
+function siliconflowPresetPool(): ModelPresetItem[] {
+  return modelPresetPool.filter(function (p) { return SILICONFLOW_PRESET_IDS.indexOf(p.id) !== -1 })
+}
+
+// 🔥 2026-11-05 平台清理后：保留的预设全部为免费模型
+function presetBilling(_id: string): 'free' | 'paid' {
+  return 'free'
+}
+
+// 🔥 2026-09-24：按 billing 把预设池拆成「免费 / 收费」两组，供各导入弹窗分组勾选渲染
+function splitFreePaid(pool: ModelPresetItem[]): { free: ModelPresetItem[]; paid: ModelPresetItem[] } {
+  const free: ModelPresetItem[] = []
+  const paid: ModelPresetItem[] = []
+  pool.forEach(function (p) { if (presetBilling(p.id) === 'paid') paid.push(p); else free.push(p) })
+  return { free: free, paid: paid }
+}
+
+// 🔥 2026-09-24：将每分钟/每小时/每天字符串解析为 rateLimit 对象（仅保留 >0 的字段，全空返回 undefined）
+function buildRateLimit(pm?: string, ph?: string, pd?: string): { perMinute?: number; perHour?: number; perDay?: number } | undefined {
+  const nPm = pm ? parseInt(pm, 10) : NaN
+  const nPh = ph ? parseInt(ph, 10) : NaN
+  const nPd = pd ? parseInt(pd, 10) : NaN
+  const out: { perMinute?: number; perHour?: number; perDay?: number } = {}
+  if (!isNaN(nPm) && nPm > 0) out.perMinute = nPm
+  if (!isNaN(nPh) && nPh > 0) out.perHour = nPh
+  if (!isNaN(nPd) && nPd > 0) out.perDay = nPd
+  if (Object.keys(out).length === 0) return undefined
+  return out
+}
+const allPresetModels: ModelPresetItem[] = modelPresetPool.concat(
+  zhipuPresetPool
+)
+const freePresets: ModelPresetItem[] = allPresetModels.filter(function (p) { return presetBilling(p.id) === 'free' })
+const paidPresets: ModelPresetItem[] = allPresetModels.filter(function (p) { return presetBilling(p.id) === 'paid' })
+
+function renderPresetCards(presets: ModelPresetItem[], isAdmin: boolean, aiModelBatch: AIModelItem[], onToggle: (preset: ModelPresetItem, enable: boolean) => void) {
   return presets.map(function (preset) {
     const c = PRESET_COLOR_MAP[preset.color] || PRESET_COLOR_MAP.blue
-    const presetProvider = String(preset.provider || '').trim()
-    const presetModel = String(preset.model || '').trim()
-    const alreadyAdded = isAdmin
-      ? aiModelBatch.some(function (m) {
-          const mProvider = String(m.provider || '').trim()
-          const mModel = String(m.model || '').trim()
-          return mModel === presetModel && (
-            mProvider === presetProvider ||
-            (presetProvider === '硅基流动' && (mProvider === '硅基流动' || mProvider === '硅基流动 (SiliconFlow)')) ||
-            ((presetProvider === '硅基流动' || presetProvider === '硅基流动 (SiliconFlow)') && mProvider === '硅基流动')
-          )
-        })
-      : true
-      return (
+    const provider = String(preset.provider || '').trim()
+    const model = String(preset.model || '').trim()
+    const enabled = aiModelBatch.some(function (m) {
+      return String(m.provider || '').trim() === provider && String(m.model || '').trim() === model && m.status !== 'inactive'
+    })
+    return (
       <div key={preset.id} className="bg-white rounded-xl border border-gray-200 p-4 relative shadow-sm hover:shadow-md hover:border-gray-300 transition-all h-full flex flex-col">
-        {alreadyAdded ? (
-          <div className="absolute top-2.5 right-2.5" title="已添加：在「已配置模型」列表中已找到对应 provider+model 的记录">
-            <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-green-50 text-green-700 text-[10px] rounded-full font-medium border border-green-100">
-              <Check className="w-3 h-3" />已添加
-            </span>
-          </div>
-        ) : (
-          <div className="absolute top-2.5 right-2.5" title="未添加：点击上方「导入」按钮填入 Key 后启用">
-            <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-gray-50 text-gray-500 text-[10px] rounded-full font-medium border border-gray-100">
-              <span className="w-2.5 h-2.5 rounded-full border border-gray-400 border-dashed inline-block"></span>未添加
-            </span>
-          </div>
-        )}
+        <label className="absolute top-2.5 right-2.5 flex items-center gap-1.5 cursor-pointer select-none" title={enabled ? '已启用（勾选生效）' : '点击勾选以启用该模型'}>
+          <input
+            type="checkbox"
+            checked={enabled}
+            onChange={function (e) { onToggle(preset, e.target.checked) }}
+            className="w-4 h-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500 cursor-pointer"
+          />
+          <span className={'text-[10px] font-medium ' + (enabled ? 'text-green-700' : 'text-gray-500')}>{enabled ? '已启用' : '未启用'}</span>
+        </label>
         <div className="flex items-start gap-3 h-full">
           <span className="text-xl mt-0.5 shrink-0">{preset.icon}</span>
           <div className="flex-1 min-w-0 flex flex-col h-full">
@@ -349,8 +245,9 @@ const providerIconMap: Record<string, React.ElementType> = {
   '通义千问 (阿里)': Cloud, '文心一言 (百度)': Cloud, '智谱GLM': Cpu,
   '讯飞星火': Zap, '月之暗面 (Kimi)': Moon, '百川智能': Server,
   '零一万物 (Yi)': Sparkles, 'MiniMax': Cpu, '阶跃星辰 (Step)': Zap,
-  '腾讯混元': Cloud, '字节豆包': Cpu, '硅基流动 (SiliconFlow)': Zap, '硅基流动': Zap,
+  '腾讯混元': Cloud, '字节豆包': Cpu,   '硅基流动 (SiliconFlow)': Zap, '硅基流动': Zap,
   '商汤 (SenseTime)': Cpu,
+  'OpenVeer': Globe,
   '302.AI': Globe, 'AiHubMix': Globe, 'ChatAnywhere': Globe, 'gpt.ge': Globe, 'CloseAI': Globe, 'VoAPI': Globe, '无问芯穹 (Infini)': Server, '自定义中转 (OpenAI兼容)': Globe,
   'Ollama (本地)': Server, 'LM Studio (本地)': Server, 'vLLM (本地)': Server,
 }
@@ -380,6 +277,7 @@ const providerColorMap: Record<string, { bg: string; text: string; border: strin
   '硅基流动 (SiliconFlow)': { bg: 'bg-cyan-50', text: 'text-cyan-700', border: 'border-cyan-200' },
   '硅基流动': { bg: 'bg-cyan-50', text: 'text-cyan-700', border: 'border-cyan-200' },
   '商汤 (SenseTime)': { bg: 'bg-emerald-50', text: 'text-emerald-700', border: 'border-emerald-200' },
+  'OpenVeer': { bg: 'bg-orange-50', text: 'text-orange-700', border: 'border-orange-200' },
   '302.AI': { bg: 'bg-pink-50', text: 'text-pink-700', border: 'border-pink-200' },
   'AiHubMix': { bg: 'bg-indigo-50', text: 'text-indigo-700', border: 'border-indigo-200' },
   'ChatAnywhere': { bg: 'bg-blue-50', text: 'text-blue-700', border: 'border-blue-200' },
@@ -434,6 +332,8 @@ const providerPresetMap: Record<string, { baseUrl: string; models: string[]; def
   'CloseAI': { baseUrl: 'https://api.closeai-proxy.xyz/v1', models: ['gpt-4o', 'gpt-4o-mini', 'claude-3-5-sonnet-20241022', 'gemini-1.5-pro'], defaultModel: 'gpt-4o-mini' },
   'VoAPI': { baseUrl: 'https://api.voapi.re/v1', models: ['gpt-4o', 'gpt-4o-mini', 'claude-3-5-sonnet', 'gemini-2.5-pro', 'deepseek-chat'], defaultModel: 'gpt-4o-mini' },
   '无问芯穹 (Infini)': { baseUrl: 'https://cloud.infini-ai.com/maas/v1', models: ['deepseek-ai/DeepSeek-V3', 'deepseek-ai/DeepSeek-R1', 'Qwen/Qwen2.5-72B-Instruct', 'THUDM/glm-4-9b-chat'], defaultModel: 'deepseek-ai/DeepSeek-V3' },
+  // 🔥 2026-09-24：OpenVeer 中转平台（OpenAI 兼容，baseUrl 固定）
+  'OpenVeer': { baseUrl: 'https://api.openveer.com/v1', models: ['deepseek-v4-flash', 'deepseek-v4-pro', 'glm-4-flash', 'deepseek-reasoner', 'qwen-plus'], defaultModel: 'deepseek-v4-flash' },
   // ----- 国内 New-API/One-API 商业中转站·生产级（有主体/可谈商务扩容；Base URL 以官网为准，需自备 key）-----
   '词元之河': { baseUrl: '', models: _RELAY_MODELS, defaultModel: 'deepseek-v4-flash' },
   '词元无忧 (token5u)': { baseUrl: '', models: _RELAY_MODELS, defaultModel: 'deepseek-v4-flash' },
@@ -476,7 +376,13 @@ const continuationLengthPool = [
 // 重要：直接使用 PRESET_STYLES 作为 extendedStyles 主体（不重复定义相同风格，保持单源）
 const extendedStyles = PRESET_STYLES.slice()
 
-const styleCategories = ['全部', '古风', '现代', '科幻', '悬疑', '玄幻', '言情', '历史', '仙侠', '爽文', '同人']
+// 分类标签由风格数据动态生成，避免出现「点了没内容」的空分类
+const styleCategoryOrder = ['古风', '都市', '现代', '科幻', '悬疑', '玄幻', '奇幻', '仙侠', '历史', '言情', '爽文', '游戏', '末世', '军事', '灵异', '同人']
+const styleCategories = ['全部'].concat(
+  styleCategoryOrder.filter(function (cat) {
+    return extendedStyles.some(function (s) { return s.category === cat })
+  })
+)
 
 type TabType = 'ai-model' | 'writing-preference' | 'ai-detection' | 'account'
 
@@ -484,6 +390,12 @@ export default function SettingsPage() {
   const _activeTab = useState<TabType>('ai-model')
   const activeTab = _activeTab[0]
   const setActiveTab = _activeTab[1]
+
+  // 🔥 2026-10-20：写作偏好账号级同步（localStorage + 服务端），避免换浏览器/清缓存后丢失
+  const _prefsReady = useState(false)
+  const prefsReady = _prefsReady[0]
+  const setPrefsReady = _prefsReady[1]
+  const prefsSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const _writingStylePool = useState<{ id: string; name: string; description: string }[]>([])
   const writingStylePool = _writingStylePool[0]
   const setWritingStylePool = _writingStylePool[1]
@@ -492,9 +404,55 @@ export default function SettingsPage() {
   const isAdmin = _isAdmin[0]
   const setIsAdmin = _isAdmin[1]
 
+  // 🔥 2026-10-26：朱雀官方通道改造为「用户自填 Key」模式
+  //   Key 保存到两处：①账号偏好（服务端 user-preferences.json，跨设备可用）；②本浏览器 localStorage
+  //   （检测面板从中读取并随请求把 Key 传给后端，不存服务端环境变量）。
+  const _zhuqueKeyInput = useState('')
+  const zhuqueKeyInput = _zhuqueKeyInput[0]
+  const setZhuqueKeyInput = _zhuqueKeyInput[1]
+  const _zhuqueKeyHint = useState('')
+  const zhuqueKeyHint = _zhuqueKeyHint[0]
+  const setZhuqueKeyHint = _zhuqueKeyHint[1]
+
+  function execSaveZhuqueKey() {
+    const key = String(zhuqueKeyInput || '').trim()
+    if (!key) { alert('请先粘贴 Makers API Key'); return }
+    fetch('/tuzhong-wenshu/api/user/preferences', {
+      method: 'PUT',
+      headers: Object.assign({ 'Content-Type': 'application/json' }, getAuthHeaders()),
+      body: JSON.stringify({ data: { zhuqueApiKey: key } }),
+    }).then(function (res) { return res.json().then(function (j) { return { ok: res.ok, j: j } }) })
+      .then(function (r) {
+        if (!r.ok) { alert('保存失败：' + ((r.j && r.j.error) || '未知错误')); return }
+        setZhuqueKeyHint('****' + key.slice(-4))
+        setZhuqueKeyInput('')
+        // 同步留存一份到本浏览器：写作页检测面板从这里读取，检测请求由前端把 Key 传给后端
+        setLocalZhuqueApiKey(key)
+        setSaveSuccess(true)
+        setTimeout(function () { setSaveSuccess(false) }, 2000)
+      })
+      .catch(function (e) { alert('保存失败：' + String(e && e.message ? e.message : e)) })
+  }
+
+  // 🔥 2026-10-26：清除本浏览器留存的朱雀 Key（账号偏好里的 Key 仍保留，重新打开设置页会再同步回来）
+  function execClearLocalZhuqueKey() {
+    clearLocalZhuqueApiKey()
+    setZhuqueKeyHint('')
+    setSaveSuccess(true)
+    setTimeout(function () { setSaveSuccess(false) }, 2000)
+  }
+
   function getAuthHeaders(): Record<string, string> {
     const token = localStorage.getItem('token')
     return token ? { 'Authorization': 'Bearer ' + token } : {}
+  }
+
+  // 防抖写入服务端：输入过程中不频繁请求，停手 0.6 秒后同步
+  function persistPrefsSoon(prefs: Record<string, unknown>) {
+    if (prefsSaveTimer.current) clearTimeout(prefsSaveTimer.current)
+    prefsSaveTimer.current = setTimeout(function () {
+      pushServerPreferences(prefs)
+    }, 600)
   }
 
   function dedupeAndNormalizeModels(list: AIModelItem[]): AIModelItem[] {
@@ -544,7 +502,7 @@ export default function SettingsPage() {
         return !m || (m.name && m.apiKey && m.provider && m.model)
       })
       if (isValid) localStorage.setItem('tuzhong-ai-models', JSON.stringify(deduped))
-    } catch (_e) {}
+    } catch (_e) { console.error('[settings] 写入 tuzhong-ai-models 失败:', _e) }
     if (!silent && Array.isArray(resolved) && resolved.length > deduped.length) {
       console.log('[模型去重] 发现重复条目，已自动合并。输入=' + resolved.length + '条，去重后=' + deduped.length + '条')
     }
@@ -566,16 +524,22 @@ export default function SettingsPage() {
     localStorage.removeItem('tuzhong-model-presets')
     const hdrs = getAuthHeaders()
     fetch('/tuzhong-wenshu/api/settings/models', { headers: hdrs })
-      .then(function (r) { return r.json() })
+      .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j } }) })
       .then(function (resp) {
-        const backendModels = (resp.data || []) as AIModelItem[]
-        if (typeof resp.isAdmin === 'boolean') setIsAdmin(resp.isAdmin)
+        // 🔥 Bug修复：401/500 时静默清空模型列表并写坏 localStorage
+        if (!resp.ok || !resp.j || !Array.isArray(resp.j.data)) {
+          console.warn('[settings] 拉取模型列表失败')
+          safeSetAiModelBatch([]); setModelsInitDone(true); return
+        }
+        const backendModels = resp.j.data as AIModelItem[]
+        if (typeof resp.j.isAdmin === 'boolean') setIsAdmin(resp.j.isAdmin)
         // 修复：不过滤apiKey为***的管理员共享模型，这些模型应该显示给普通用户使用
         const filtered = backendModels.filter(function(m) {
           return m.name && m.provider && m.model
         })
         safeSetAiModelBatch(filtered)
-        localStorage.setItem('tuzhong-ai-models', JSON.stringify(_aiModelBatch[0]))
+        // 🔥 Bug修复：此前写入的是 setState 前读到的旧 _aiModelBatch[0]（首轮是 []）
+        localStorage.setItem('tuzhong-ai-models', JSON.stringify(filtered))
       })
       .catch(function () {
         safeSetAiModelBatch([])
@@ -612,7 +576,7 @@ export default function SettingsPage() {
       .then(function (respBody) {
         if (respBody.data && Array.isArray(respBody.data)) { setWritingStylePool(respBody.data) }
       })
-      .catch(function () {})
+      .catch(function (err) { console.error('[settings] 加载写作风格池失败:', err) })
   }, [])
 
   const _addModelModalOpen = useState(false)
@@ -623,13 +587,16 @@ export default function SettingsPage() {
   const setNewModelForm = _newModelForm[1]
 
   useEffect(function () {
+    const _emptyRl = { perMinute: '', perHour: '', perDay: '' }
     if (!addModelModalOpen) {
       setNewModelForm({ provider: '', apiKey: '', name: '', baseUrl: '', model: '' })
+      setNewModelRateLimit(_emptyRl)
       setEditingModelId(null)
       setLocalModelList([])
       setLocalModelErr('')
     } else if (!editingModelId) {
       setNewModelForm({ provider: '', apiKey: '', name: '', baseUrl: '', model: '' })
+      setNewModelRateLimit(_emptyRl)
     }
   }, [addModelModalOpen])
 
@@ -715,67 +682,129 @@ export default function SettingsPage() {
     { id: 'hotblood', label: '🔥 热血正义', tip: '兄弟义气，为朋友两肋插刀，燃爆全场' },
   ]
 
-  // 平台检测配置 - 增强版，包含详细检测标准
+  // 🔥 2026-10-18：按各平台公开运营口径给出差异化参考标准（可由用户在输入框自行微调）。
+  //   参考：番茄/晋江对 AI 内容审核最严；起点/纵横/七猫居中；飞卢重更新节奏较宽松；
+  //   朱雀＝腾讯朱雀实验室的「朱雀AI检测助手」，输出的是 AI 生成概率（%），不是平台判定线：
+  //   官方 FAQ 明示存在误报可能，且未公布合格百分比阈值。行业通行参考：网文 ≤30% 为安全线（≤25% 更稳），
+  //   公众号场景至少要拿到「绿标」（<50%）。番茄/七猫等按「疑似AI生成 / 低质水文」处理，不按固定百分比硬卡。
   const _platformConfigs = useState([
-    { 
-      key: 'tomato', name: '番茄小说', icon: '🍅', aiStandard: '< 5%', color: 'red', enabled: true, 
-      description: '番茄小说平台AI检测，要求AI检测率低于5%',
+    {
+      key: 'tomato', name: '番茄小说', icon: '🍅', aiStandard: '< 30%', color: 'red', enabled: true,
+      description: '番茄小说平台AI检测：平台用「AI鉴AI」等工具做初筛，命中后按「疑似AI生成 / 低质水文」处理（无公开百分比硬门槛）',
+      criteria: [
+        '真实口径：番茄未公布AI率百分比红线，命中即走「疑似AI生成/低质水文」，典型后果是停止推荐、流量下滑',
+        '自检线：投稿前用朱雀自检，AI生成概率 ≤30%（≤25% 更稳），越低越安全',
+        '举报项：书籍举报原因里明确含「AI水文」，被举报的作品会进人工复核',
+        '人工痕迹：AI文常见特征是无意义环境/心理描写、大量短句、「不是…而是…」句式、过多破折号',
+        '叙事留白：段落推进要留跳跃与闲笔，通篇衔接过紧反而被判 AI']
+      ,
       compliance: '内容合规：禁止低俗、色情、暴力、政治敏感、虚假宣传内容；鼓励正能量、轻松愉快的阅读体验',
-      signing: '签约评估：日更4000+字，完读率≥35%，收藏量≥5000，可申请签约；签约后有全勤奖',
+      signing: '签约评估：全勤需日更≥4000字；完读率≥35%、收藏增长稳定可申约；签约后广告分成',
       traffic: '流量推荐：新文前7天有新人扶持流量；完读率越高推荐越多；热门标签更容易获得推荐',
       revenue: '收益规则：广告分成（阅读时长）+ 签约全勤 + 打赏 + 版权运营；收益与阅读时长直接挂钩'
     },
-    { 
-      key: 'zhuque', name: '朱雀AI', icon: '🔴', aiStandard: '< 5%', color: 'rose', enabled: false, 
-      description: '朱雀AI平台检测，降低被识别为AI内容的风险',
-      compliance: '内容合规：严格禁止AI生成痕迹明显的内容；情节必须原创，禁止抄袭；禁止敏感题材',
-      signing: '签约评估：AI检测率必须低于5%；内容原创度≥90%；有完整的故事大纲和世界观设定',
-      traffic: '流量推荐：原创度越高推荐权重越大；作者互动率（回复评论）影响推荐；定期更新更稳定',
+    {
+      key: 'zhuque', name: '朱雀AI', icon: '🔴', aiStandard: '< 30%', color: 'rose', enabled: true,
+      description: '腾讯朱雀AI检测助手：输出「AI生成概率」百分比。官方无合格线且明示存在误报，行业通行 ≤30%；本栏数值＝平台执行标准，可自行加严（如 <5%），终检判定与生成时的改写目标都按它控',
+      criteria: [
+        '本栏＝执行标准：填多少，平台就按多少控朱雀AI率（终检判定、生成时的改写目标都取自这里，可以比行业线更严）',
+        '概率口径：朱雀给的是 AI 生成概率，不是「是否AI」的定论，官方FAQ明示存在误报可能',
+        '判定维度一（困惑度）：AI倾向使用高概率词，整段困惑度偏低，易被识别',
+        '判定维度二（语义连贯）：全文从开头到尾衔接过紧、无逻辑跳跃，反而更易被判 AI；人类写作天然有跳跃',
+        '判定维度三（词汇分布）：与主流大模型高频词库、句式习惯接近会加权，替换特征词最见效',
+        '判定维度四（结构特征）：段段推进、无闲笔无冗余、句长整齐＝结构过完美，同样触发判定',
+        '参考线：网文 AI概率 ≤30%（≤25% 更稳）；公众号场景至少要「绿标」（<50%）',
+        '配套指标：除AI率外还要盯同质化指数（建议<10%）与暗限流风险（建议<15%），这两项直接伤推荐'],
+      compliance: '平台口径：番茄等平台按「疑似AI生成 / 低质水文」处理，命中最常见后果是停止推荐；朱雀结论只作参考、须人工复核',
+      signing: '签约评估：朱雀存在误报，签约以编辑人审与合同约定为准；建议自留AI生成痕迹（大纲/对话记录/修改稿）',
+      traffic: '流量推荐：命中AI初筛的作品可能停止推荐或进观察队列，完读率与内容增量仍是推荐权重的主因',
       revenue: '收益规则：订阅分成 + 广告分成 + 版权销售；优秀作品可获得平台买断机会'
     },
-    { 
-      key: 'qidian', name: '起点中文', icon: '📖', aiStandard: '< 10%', color: 'blue', enabled: false, 
-      description: '起点中文网AI检测标准',
+    {
+      key: 'qidian', name: '起点中文', icon: '📖', aiStandard: '< 35%', color: 'blue', enabled: false,
+      description: '起点中文网AI检测标准：官方反AI声明明确，重点查创意雷同与量产账号',
+      criteria: [
+        'AI率参考：≤35%（起点未公开硬门槛，但2024起官方多轮反AI整治）',
+        '设定深度：世界观/金手指须有明确限制规则，反对「无代价变强」',
+        '章节体量：VIP章节均2.5-3千字，开篇30章定生死，日更≥2章',
+        '逻辑密度：推进靠因果链，禁用「巧合型推进」，重人物弧光',
+        '句子书面度：允许文言腔/成语密度较高，这反而是起点读者偏好']
+      ,
       compliance: '内容合规：禁止涉政、涉黄、暴力血腥；题材不限但需符合法律法规；历史题材需尊重历史',
       signing: '签约评估：文笔扎实，设定新颖，节奏紧凑；收藏≥10000，推荐票≥5000可申请签约',
       traffic: '流量推荐：新书期有试水推荐；分类频道推荐；月票榜、新书榜等榜单引流',
       revenue: '收益规则：VIP订阅分成（千字3分起）+ 全勤奖 + 打赏 + 版权改编（游戏、影视、漫画）'
     },
-    { 
-      key: 'feilu', name: '飞卢小说', icon: '⚡', aiStandard: '< 10%', color: 'yellow', enabled: false, 
-      description: '飞卢小说网AI检测标准',
+    {
+      key: 'feilu', name: '飞卢小说', icon: '⚡', aiStandard: '< 40%', color: 'yellow', enabled: false,
+      description: '飞卢小说网AI检测标准：重更新与爽点密度，对AI率相对宽松',
+      criteria: [
+        'AI率参考：≤40%（飞卢核心卡点是节奏而非文本特征）',
+        '章体量：800-1400字/章，日更≥10章者有流量扶持',
+        '爽点密度：每章必须≥1个即时爽点，结尾必留钩子',
+        '风格特征：短句、惊叹号、直接口播式对白反而 acceptable',
+        '风险点：同人设定须避开版权方雷区，敏感IP直接锁文']
+      ,
       compliance: '内容合规：允许脑洞大开的设定；禁止低俗、色情、政治敏感；强调爽点密集',
       signing: '签约评估：日更8000+字，爽点密集，节奏快；收藏≥3000即可申请签约',
       traffic: '流量推荐：热门题材（同人、综漫、无限流）推荐多；更新字数越多推荐越多',
       revenue: '收益规则：订阅分成 + 广告分成 + 打赏；同人作品收益较高但版权受限'
     },
-    { 
-      key: 'qimao', name: '七猫小说', icon: '🐱', aiStandard: '< 8%', color: 'orange', enabled: false, 
-      description: '七猫小说平台AI检测标准',
+    {
+      key: 'qimao', name: '七猫小说', icon: '🐱', aiStandard: '< 35%', color: 'orange', enabled: false,
+      description: '七猫小说平台AI检测标准：免费阅读大盘，重点看完读率与留存',
+      criteria: [
+        'AI率参考：≤35%（七猫未公开明确门槛，以完读率为核心杠杆）',
+        '完读优先：整体节奏必须「无废段」，每章结尾留钩子',
+        '人设直给：人物标签化（毒舌/腹黑/忠犬）比复杂内心戏更有效',
+        '章节体量：1200-2000字/章，日更≥2章',
+        'AI特征规避：减少深修辞，多用直白短句——大盘读者讨厌拗口']
+      ,
       compliance: '内容合规：禁止低俗色情、暴力血腥、政治敏感；主打免费阅读，内容需适合大众',
       signing: '签约评估：完读率≥40%，日更≥3000字；内容有趣味性和吸引力',
       traffic: '流量推荐：免费阅读模式，靠广告盈利；推荐位与完读率和留存率挂钩',
       revenue: '收益规则：广告分成 + 全勤奖 + 版权运营；免费阅读平台，收益与广告展示量相关'
     },
-    { 
-      key: 'jinjiang', name: '晋江文学', icon: '🌸', aiStandard: '< 8%', color: 'pink', enabled: false, 
-      description: '晋江文学城AI检测标准',
+    {
+      key: 'jinjiang', name: '晋江文学', icon: '🌸', aiStandard: '< 20%', color: 'pink', enabled: false,
+      description: '晋江文学城AI检测标准：全平台最严格，明确公示反AI立场',
+      criteria: [
+        'AI率红线：≤20%（晋江2024公告明确禁止「AI合成文学」，审核最严）',
+        '情感质感：细腻私语感、内心独白密度高——AI的「均质抒情」极易识别',
+        '逐段自查：描写不能全是形容词堆叠，需具体动作/感官细节支撑',
+        '章节体量：3000-5000字/章，日更≥3千字',
+        '签约灵审：签约编辑会抽查「改稿痕迹」——保持个人文风格一致性']
+      ,
       compliance: '内容合规：主打言情、耽美；禁止低俗色情；强调情感描写细腻；禁止抄袭',
       signing: '签约评估：文案精美，人设鲜明，情感线清晰；收藏≥3000可申请签约',
       traffic: '流量推荐：金榜、新晋榜、分类榜；话题热度影响推荐；读者互动率重要',
       revenue: '收益规则：VIP订阅分成 + 定制印刷 + 影视改编；言情题材收益较高'
     },
-    { 
-      key: 'zongheng', name: '纵横中文', icon: '🌊', aiStandard: '< 12%', color: 'cyan', enabled: false, 
-      description: '纵横中文网AI检测标准',
+    {
+      key: 'zongheng', name: '纵横中文', icon: '🌊', aiStandard: '< 35%', color: 'cyan', enabled: false,
+      description: '纵横中文网AI检测标准：男频向，重长线存稿与设定完整性',
+      criteria: [
+        'AI率参考：≤35%（纵横未公开硬门槛，以签约编辑人审为主）',
+        '体裁偏好：历史/玄幻/都市长篇，动辄百万字，看重大纲与存稿能力',
+        '章节体量：2500-3500字/章，上架后日更≥6千字',
+        '文字密度：可接受较高描写密度，但禁「分隔符式水文」',
+        'AI特征规避：AI式的「每章结构雷同」是编辑人审重点']
+      ,
       compliance: '内容合规：禁止涉政、涉黄、暴力；题材不限，鼓励创新；禁止抄袭',
       signing: '签约评估：字数≥50万字，节奏稳定，设定完整；收藏≥5000可申请签约',
       traffic: '流量推荐：新书推荐、分类推荐、榜单推荐；全勤更新更稳定获得推荐',
       revenue: '收益规则：订阅分成 + 全勤奖 + 版权运营；买断制为主，保底收入稳定'
     },
-    { 
-      key: 'yuedong', name: '阅动文化', icon: '📚', aiStandard: '< 10%', color: 'green', enabled: false, 
-      description: '阅动文化平台AI检测标准',
+    {
+      key: 'yuedong', name: '阅动文化', icon: '📚', aiStandard: '< 30%', color: 'green', enabled: false,
+      description: '阅动文化平台AI检测标准：精品IP导向，重剧本化改编潜力',
+      criteria: [
+        'AI率参考：≤30%（阅动重IP孵化，文本需具备改编脚本雏形）',
+        '场景可拍性：描写具体到空间/时序，避免抽象抒情——适配短剧/影视改编',
+        '章节体量：2000-3000字/章，日更≥4千字',
+        '人物弧光：主角每卷须有明确成长/反转变锚点',
+        '风险点：题材须为可过审剧集方向，涉黑/涉鬼怪需提前规避']
+      ,
       compliance: '内容合规：禁止低俗、色情、暴力、政治敏感；主打精品IP孵化',
       signing: '签约评估：内容质量高，有IP改编潜力；字数≥30万字，日更≥4000字',
       traffic: '流量推荐：精品推荐位；IP孵化项目重点扶持；多平台分发引流',
@@ -817,7 +846,7 @@ export default function SettingsPage() {
           localStorage.setItem('tuzhong-platform-configs', JSON.stringify(prefs.platformConfigs))
         }
       }
-    } catch (e) {}
+    } catch (e) { console.error('[settings] 加载平台配置（prefs.platformConfigs）失败:', e) }
 
     // 🔥 平台AI检测配置：使用独立 localStorage key，避免与其他偏好字段混写时丢失
     //    兼容从 prefs.platformConfigs 读取的旧数据
@@ -834,7 +863,7 @@ export default function SettingsPage() {
             const p2 = JSON.parse(pref2)
             if (p2.platformConfigs && Array.isArray(p2.platformConfigs)) platformSource = p2.platformConfigs
           }
-        } catch (_e) {}
+        } catch (_e) { console.error('[settings] 读取 tuzhong-preferences 平台配置失败:', _e) }
       }
       if (platformSource && Array.isArray(platformSource) && platformSource.length > 0) {
         const defaultCfg = _platformConfigs[0]
@@ -842,8 +871,14 @@ export default function SettingsPage() {
         platformSource.forEach(function (p) { if (p && p.key) byKey[p.key] = p })
         const merged = defaultCfg.map(function (def) {
           const s = byKey[def.key]
-          // 保留所有自定义字段（enabled/aiStandard），同时补全新增的 detail 字段（compliance/signing/traffic/revenue）
-          return s ? Object.assign({}, def, s) : def
+          if (!s) return def
+          // 🔥 2026-10-20：用户只改「AI检测标准/是否启用」；平台说明文案一律以代码内置的真实口径为准
+          //   （朱雀真实判定维度、番茄真实处理方式等），避免旧文案长期挂着误导用户。
+          const out: Record<string, unknown> = Object.assign({}, s, def)
+          out.aiStandard = (typeof s.aiStandard === 'string' && s.aiStandard.trim()) ? s.aiStandard : def.aiStandard
+          out.enabled = typeof s.enabled === 'boolean' ? s.enabled : def.enabled
+          out.name = (typeof s.name === 'string' && s.name) ? s.name : def.name
+          return out as typeof platformConfigs[number]
         })
         // 额外添加用户新增过但默认没有的平台
         Object.keys(byKey).forEach(function (k) {
@@ -851,11 +886,78 @@ export default function SettingsPage() {
         })
         setPlatformConfigs(merged)
       }
-    } catch (e) {}
+    } catch (e) { console.error('[settings] 合并平台配置失败:', e) }
   }, [])
 
-  // 🔥 写作偏好自动持久化：任何偏好变化自动保存到 localStorage + 后端
+  // 🔥 2026-10-20：账号级偏好读取——服务端更新则覆盖本机；本机更新则回传服务端
   useEffect(function () {
+    let cancelled = false
+    ;(async function () {
+      const res = await fetchServerPreferences()
+      if (cancelled) return
+      // 🔥 2026-10-26：朱雀 Key 用户自填模式——优先显示本浏览器留存 Key 的掩码；本机没有再看账号偏好
+      const localZhuqueKey = getLocalZhuqueApiKey()
+      if (localZhuqueKey) {
+        setZhuqueKeyHint('****' + localZhuqueKey.slice(-4))
+      } else if (res && res.hasZhuqueApiKey) {
+        setZhuqueKeyHint(String((res.data && res.data.zhuqueApiKey) || ''))
+      }
+      if (res && res.data) {
+        const localTs = getLocalPrefsUpdatedAt()
+        if (res.updatedAt >= localTs) {
+          const d = res.data as Record<string, any>
+          if (d.writingStyle) setPickedStyle(String(d.writingStyle))
+          if (d.continuationLength) setPickedLength(String(d.continuationLength))
+          if (d.customLength != null && Number(d.customLength) > 0) setCustomLenInput(String(d.customLength))
+          if (d.autoSaveInterval != null) setPickedInterval(String(d.autoSaveInterval))
+          if (typeof d.tomatoReminder === 'boolean') setTomatoCheckFlag(d.tomatoReminder)
+          if (typeof d.zhuqueReminder === 'boolean') setZhuqueCheckFlag(d.zhuqueReminder)
+          if (d.shuangDensityMode) setShuangDensityMode(String(d.shuangDensityMode))
+          if (d.faceSlapStyle) setFaceSlapStyle(String(d.faceSlapStyle))
+          if (d.rhythmIntensity) setRhythmIntensity(String(d.rhythmIntensity))
+          if (d.targetPlatform) setTargetPlatform(String(d.targetPlatform))
+          if (d.mcPersonality) setMcPersonality(String(d.mcPersonality))
+          if (Array.isArray(d.platformConfigs) && d.platformConfigs.length > 0) {
+            const defaultCfg = _platformConfigs[0]
+            const byKey: Record<string, typeof platformConfigs[number]> = {}
+            d.platformConfigs.forEach(function (p: any) { if (p && p.key) byKey[p.key] = p })
+            const merged = defaultCfg.map(function (def) {
+              const s = byKey[def.key]
+              if (!s) return def
+              const out: Record<string, unknown> = Object.assign({}, s, def)
+              out.aiStandard = (typeof s.aiStandard === 'string' && s.aiStandard.trim()) ? s.aiStandard : def.aiStandard
+              out.enabled = typeof s.enabled === 'boolean' ? s.enabled : def.enabled
+              out.name = (typeof s.name === 'string' && s.name) ? s.name : def.name
+              return out as typeof platformConfigs[number]
+            })
+            Object.keys(byKey).forEach(function (k) {
+              if (!merged.find(function (m) { return m.key === k })) merged.push(byKey[k])
+            })
+            setPlatformConfigs(merged)
+          }
+          applyPreferencesToLocalStorage(res.data, res.updatedAt)
+        } else {
+          try {
+            const raw = localStorage.getItem('tuzhong-preferences')
+            if (raw) await pushServerPreferences(JSON.parse(raw))
+          } catch (_e) { /* 本机数据异常时忽略，等下一次保存 */ }
+        }
+      } else {
+        // 服务端还没有偏好（老用户迁移）：把本机现有偏好上传一次
+        try {
+          const raw = localStorage.getItem('tuzhong-preferences')
+          if (raw) await pushServerPreferences(JSON.parse(raw))
+        } catch (_e) { /* ignore */ }
+      }
+      if (!cancelled) setPrefsReady(true)
+    })()
+    return function () { cancelled = true }
+  }, [])
+
+  // 🔥 写作偏好自动持久化：任何偏好变化自动保存到 localStorage + 服务端
+  //    注意：账号级数据未读取完成前不写入，避免用初始默认值覆盖已保存的 1% 标准/风格
+  useEffect(function () {
+    if (!prefsReady) return
     try {
       const prefs = {
         writingStyle: pickedStyle, continuationLength: pickedLength,
@@ -864,6 +966,7 @@ export default function SettingsPage() {
         platformConfigs: platformConfigs,
         shuangDensityMode: shuangDensityMode, faceSlapStyle: faceSlapStyle,
         rhythmIntensity: rhythmIntensity, targetPlatform: targetPlatform, mcPersonality: mcPersonality,
+        _updatedAt: Date.now(),
       }
       localStorage.setItem('tuzhong-preferences', JSON.stringify(prefs))
       // 🔥 修复：只在 platformConfigs 有实际内容时才保存独立的 key，避免覆盖已有数据
@@ -875,6 +978,7 @@ export default function SettingsPage() {
         rhythmIntensity: rhythmIntensity, targetPlatform: targetPlatform, mcPersonality: mcPersonality,
       }))
       const selectedStyle = extendedStyles.find(function (s) { return s.id === pickedStyle })
+        || writingStylePool.find(function (s) { return s.id === pickedStyle })
       if (selectedStyle) {
         localStorage.setItem('tuzhong-active-style', pickedStyle)
         localStorage.setItem('tuzhong-active-style-data', JSON.stringify(selectedStyle))
@@ -884,15 +988,13 @@ export default function SettingsPage() {
       else if (pickedLength === 'long') lenValue = 2000
       else if (pickedLength === 'custom') lenValue = parseInt(customLenInput) || 500
       localStorage.setItem('tuzhong-continue-length', String(lenValue))
-    } catch (_e) {}
-  }, [pickedStyle, pickedLength, customLenInput, pickedInterval, tomatoCheckFlag, zhuqueCheckFlag, platformConfigs, shuangDensityMode, faceSlapStyle, rhythmIntensity, targetPlatform, mcPersonality])
+      persistPrefsSoon(prefs)
+    } catch (_e) { console.error('[settings] 保存写作偏好失败:', _e) }
+  }, [pickedStyle, pickedLength, customLenInput, pickedInterval, tomatoCheckFlag, zhuqueCheckFlag, platformConfigs, shuangDensityMode, faceSlapStyle, rhythmIntensity, targetPlatform, mcPersonality, prefsReady])
 
   const _styleCategory = useState('全部')
   const styleCategory = _styleCategory[0]
   const setStyleCategory = _styleCategory[1]
-  const _styleSearch = useState('')
-  const styleSearch = _styleSearch[0]
-  const setStyleSearch = _styleSearch[1]
 
   const _acctUserMsg = useState({ username: '网文小筑', email: 'writer@example.com', avatar: '' })
   const _saveSuccess = useState(false)
@@ -930,9 +1032,29 @@ export default function SettingsPage() {
   const _siliconflowApiKeyInput = useState('')
   const siliconflowApiKeyInput = _siliconflowApiKeyInput[0]
   const setSiliconflowApiKeyInput = _siliconflowApiKeyInput[1]
+  const _sfKeyInputs = useState<string[]>([''])
+  const sfKeyInputs = _sfKeyInputs[0]
+  const setSfKeyInputs = _sfKeyInputs[1]
   const _sfModalOpen = useState(false)
   const sfModalOpen = _sfModalOpen[0]
   const setSfModalOpen = _sfModalOpen[1]
+  // 🔥 #212（2026-09-10）模型实时健康检测：key=provider::model，值={cls,reason,latencyMs,ok}
+  const _modelHealth = useState<Record<string, { cls: string, reason: string, latencyMs: number, ok: boolean }>>({})
+  const modelHealth = _modelHealth[0]
+  const setModelHealth = _modelHealth[1]
+  const _healthChecking = useState(false)
+  const healthChecking = _healthChecking[0]
+  const setHealthChecking = _healthChecking[1]
+  const _healthSummary = useState('')
+  const healthSummary = _healthSummary[0]
+  const setHealthSummary = _healthSummary[1]
+  const _healthAutoDone = useState(false)
+  const healthAutoDone = _healthAutoDone[0]
+  const setHealthAutoDone = _healthAutoDone[1]
+  // 🔥 #212b 推荐替代模型（后端探活通过的免费候选）
+  const _healthRecs = useState<Array<{ provider: string, model: string, name: string, cls: string, latencyMs: number, reason: string }>>([])
+  const healthRecs = _healthRecs[0]
+  const setHealthRecs = _healthRecs[1]
   const _sfImportFlag = useState(false)
   const sfImportFlag = _sfImportFlag[0]
   const setSfImportFlag = _sfImportFlag[1]
@@ -941,6 +1063,9 @@ export default function SettingsPage() {
   const _zhipuApiKeyInput = useState('')
   const zhipuApiKeyInput = _zhipuApiKeyInput[0]
   const setZhipuApiKeyInput = _zhipuApiKeyInput[1]
+  const _zhipuKeyInputs = useState<string[]>([''])
+  const zhipuKeyInputs = _zhipuKeyInputs[0]
+  const setZhipuKeyInputs = _zhipuKeyInputs[1]
   const _zhipuModalOpen = useState(false)
   const zhipuModalOpen = _zhipuModalOpen[0]
   const setZhipuModalOpen = _zhipuModalOpen[1]
@@ -951,6 +1076,23 @@ export default function SettingsPage() {
   // 2026-08-12：OpenRouter / Groq / 腾讯混元 通用导入状态（共用一套弹窗与导入逻辑）
   const _platformApiKeyInput = useState('')
   const platformApiKeyInput = _platformApiKeyInput[0]
+  const _platformRateLimit = useState({ perMinute: '', perHour: '', perDay: '' })
+  const platformRateLimit = _platformRateLimit[0]
+  const setPlatformRateLimit = _platformRateLimit[1]
+  // 🔥 2026-09-24：单个模型「添加/编辑」弹窗的调用频率限制（字符串输入，保存时由 buildRateLimit 解析）
+  const _newModelRateLimit = useState({ perMinute: '', perHour: '', perDay: '' })
+  const newModelRateLimit = _newModelRateLimit[0]
+  const setNewModelRateLimit = _newModelRateLimit[1]
+  // 🔥 2026-09-24：导入弹窗「按模型勾选」状态（免费默认全选、收费默认不选；用户可自行勾选要导入哪些）
+  const _platformSelectedPresets = useState<Record<string, boolean>>({})
+  const platformSelectedPresets = _platformSelectedPresets[0]
+  const setPlatformSelectedPresets = _platformSelectedPresets[1]
+  const _sfSelectedPresets = useState<Record<string, boolean>>({})
+  const sfSelectedPresets = _sfSelectedPresets[0]
+  const setSfSelectedPresets = _sfSelectedPresets[1]
+  const _zpSelectedPresets = useState<Record<string, boolean>>({})
+  const zpSelectedPresets = _zpSelectedPresets[0]
+  const setZpSelectedPresets = _zpSelectedPresets[1]
   const setPlatformApiKeyInput = _platformApiKeyInput[1]
   const _platformModalOpen = useState(false)
   const platformModalOpen = _platformModalOpen[0]
@@ -967,7 +1109,7 @@ export default function SettingsPage() {
     try {
       const saved = localStorage.getItem('tuzhong-cost-saving-mode')
       if (saved === 'true') setSavingModeFlag(true)
-    } catch (_e) {}
+    } catch (_e) { console.error('[settings] 读取省钱模式开关失败:', _e) }
   }, [])
 
   function pullLocalModels() {
@@ -985,7 +1127,101 @@ export default function SettingsPage() {
 
   // 同步模型配置到后端 models.json（确保AI生成路由能读取到最新配置）
   // 修复：普通用户不能误删/误改管理员共享的模型
-  function syncModelsToBackend(modelBatch: AIModelItem[]) {
+  // 🔥 #212（2026-09-10）实时健康检测：探活全部已配置模型，卡片挂健康徽章；已下架可一键停用
+  function execHealthCheck() {
+    if (healthChecking) return
+    setHealthChecking(true)
+    const hdrs = getAuthHeaders()
+    fetch('/tuzhong-wenshu/api/settings/models/health', {
+      method: 'POST',
+      headers: Object.assign({}, { 'Content-Type': 'application/json' }, hdrs),
+    })
+      .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, status: r.status, j: j } }) })
+      .then(function (resp) {
+        const data = resp.j && resp.j.data
+        const list = (data && data.results) || []
+        // 🔥 Bug修复：401/500 时 results 被静默清空而 summary 不变，UI 瞬间与数据不一致
+        if (!resp.ok || !data) {
+          setHealthSummary('检测失败（HTTP ' + resp.status + '），请重新登录后重试')
+          return
+        }
+        const map: Record<string, { cls: string, reason: string, latencyMs: number, ok: boolean }> = {}
+        for (let i = 0; i < list.length; i++) {
+          const it = list[i]
+          map[String(it.provider) + '::' + String(it.model)] = { cls: it.cls, reason: it.reason, latencyMs: it.latencyMs, ok: it.ok }
+        }
+        setModelHealth(map)
+        setHealthRecs((data && data.recommendations) || [])
+        const s = data && data.summary
+        if (s) {
+          setHealthSummary('共' + s.total + '款：可用 ' + s.ok + (s.dead ? '，已下架 ' + s.dead : '') + (s.keybad ? '，Key失效 ' + s.keybad : '') + (s.limited ? '，限流 ' + s.limited : '') + (s.other ? '，异常 ' + s.other : ''))
+        }
+      })
+      .catch(function (err) {
+        setHealthSummary('健康检测失败: ' + (err && err.message || '网络错误'))
+      })
+      .finally(function () { setHealthChecking(false) })
+  }
+
+  // 管理员进入设置页自动检测一次（服务端 60s 缓存，不重复打爆上游）
+  useEffect(function () {
+    if (isAdmin && !healthAutoDone) {
+      setHealthAutoDone(true)
+      execHealthCheck()
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isAdmin])
+
+  // 一键停用已下架模型（404 实锤下架才停用；Key失效/限流不停用，等 key 充值或限流窗口过去）
+  function execDisableDeadModels() {
+    const deadKeys: string[] = []
+    Object.keys(modelHealth).forEach(function (k) { if (modelHealth[k].cls === 'dead') deadKeys.push(k) })
+    if (deadKeys.length === 0) return
+    const updatedBatch = aiModelBatch.map(function (m) {
+      const k = String(m.provider) + '::' + String(m.model)
+      if (deadKeys.indexOf(k) !== -1 && m.status !== 'default') {
+        const copy = {} as AIModelItem
+        const keys = Object.keys(m) as (keyof AIModelItem)[]
+        for (let i = 0; i < keys.length; i++) { (copy as unknown as Record<string, unknown>)[keys[i]] = (m as unknown as Record<string, unknown>)[keys[i]] }
+        copy.status = 'inactive'
+        return copy
+      }
+      return m
+    })
+    const nb = safeSetAiModelBatch(updatedBatch, true)
+    syncModelsToBackend(nb)
+    setTimeout(function () { alert('已停用 ' + deadKeys.length + ' 个已下架模型（可随时手动重新启用）') }, 50)
+  }
+
+  // 🔥 #212b 一键添加推荐替代模型（复用该平台已配置条目的 Key/BaseURL，探活 ok 才被推荐）
+  function execAddRecommendedModel(rec: { provider: string, model: string, name: string, cls: string }) {
+    if (rec.cls !== 'ok' && rec.cls !== 'limited') return
+    const _k = String(rec.provider) + '::' + String(rec.model)
+    if (aiModelBatch.some(function (m) { return String(m.provider) + '::' + String(m.model) === _k })) {
+      setTimeout(function () { alert('该模型已存在，无需重复添加') }, 50)
+      return
+    }
+    const src = aiModelBatch.find(function (m) { return m.provider === rec.provider && m.apiKey })
+    if (!src) {
+      setTimeout(function () { alert('该平台暂无已配置 Key 的模型，请先在对应平台卡片导入 API Key') }, 50)
+      return
+    }
+    const add: AIModelItem = {
+      id: 'rec-' + Date.now(), name: rec.name.split('（')[0] || rec.model, provider: rec.provider,
+      apiKey: src.apiKey, baseUrl: src.baseUrl, model: rec.model,
+      status: 'active', usageTag: '备用正文', isAdminDefault: true,
+    }
+    const nb = safeSetAiModelBatch(aiModelBatch.concat([add]), true)
+    syncModelsToBackend(nb)
+    setHealthRecs(healthRecs.filter(function (r) { return !(r.provider === rec.provider && r.model === rec.model) }))
+    setTimeout(function () { alert('已添加替代模型：' + add.name + '（' + rec.provider + ' / ' + rec.model + '）') }, 50)
+  }
+
+  function syncModelsToBackend(modelBatch: AIModelItem[], opts?: { mode?: 'migrate' | 'full' }) {
+    // 🔥 修复（P1 覆盖/误删）：此前「进入设置页」就会用本机 localStorage 覆盖服务端配置，
+    //   并对「后端有、本地没有」的模型发 DELETE —— 换设备或清过缓存的用户只是打开设置页，
+    //   就可能删掉另一台机器配好的模型。现拆两档：migrate 只补齐缺失项，full 才全量同步。
+    const mode = opts && opts.mode === 'full' ? 'full' : 'migrate'
     const hdrs = getAuthHeaders()
     fetch('/tuzhong-wenshu/api/settings/models', { headers: hdrs })
       .then(function (r) { return r.json() })
@@ -996,7 +1232,9 @@ export default function SettingsPage() {
 
         // 修复：跳过apiKey为***的管理员共享模型，不回写到后端（防止把***覆盖真实key）
         const upsertPromises = modelBatch.filter(function (m) {
-          return m.apiKey && !String(m.apiKey).includes('*')
+          if (!(m.apiKey && !String(m.apiKey).includes('*'))) return false
+          // migrate 模式只创建后端没有的条目，不用本机旧值覆盖服务端已有配置
+          return mode === 'full' ? true : !backendIds.has(m.id)
         }).map(function (m) {
           const exists = backendIds.has(m.id)
           const method = exists ? 'PUT' : 'POST'
@@ -1010,6 +1248,7 @@ export default function SettingsPage() {
             baseUrl: m.baseUrl || '',
             model: m.model || '',
             isAdminDefault: m.isAdminDefault === true,
+            rateLimit: m.rateLimit || undefined,
           }
           if (exists) body.id = m.id
           return fetch(url, {
@@ -1022,13 +1261,13 @@ export default function SettingsPage() {
         })
 
         // 修复：只删除当前用户自己创建的模型，不删除管理员共享的模型
-        backendModels.forEach(function (bm) {
+        if (mode === 'full') backendModels.forEach(function (bm) {
           if (!localIds.has(bm.id) && !bm.isAdminDefault) {
             fetch('/tuzhong-wenshu/api/settings/models?id=' + encodeURIComponent(bm.id), {
               method: 'DELETE',
               headers: hdrs,
             })
-              .catch(function () {})
+              .catch(function (err) { console.error('[settings] 删除模型配置失败:', err) })
           }
         })
 
@@ -1042,6 +1281,7 @@ export default function SettingsPage() {
   function execAddModel() {
     if (!newModelForm.provider || !newModelForm.name.trim() || !newModelForm.apiKey.trim()) return
     const preset = providerPresetMap[newModelForm.provider]
+    const _rl = buildRateLimit(newModelRateLimit.perMinute, newModelRateLimit.perHour, newModelRateLimit.perDay)
     const modelItem: AIModelItem = {
       id: String(Date.now()), provider: newModelForm.provider, name: newModelForm.name,
       status: aiModelBatch.length === 0 ? 'default' : 'active',
@@ -1049,6 +1289,7 @@ export default function SettingsPage() {
       baseUrl: newModelForm.baseUrl || preset?.baseUrl || '',
       model: newModelForm.model || preset?.defaultModel || '',
       presetModels: preset?.models || [],
+      rateLimit: _rl,
     }
     const dupKey = String(modelItem.provider).trim() + '::' + String(modelItem.model).trim()
     const existed = aiModelBatch.find(function (m) {
@@ -1157,6 +1398,7 @@ export default function SettingsPage() {
   }
 
   function execImportSiliconflowPresets() {
+    setSfSelectedPresets(initPresetSelection(siliconflowPresetPool()))
     setSfModalOpen(true)
   }
 
@@ -1165,9 +1407,13 @@ export default function SettingsPage() {
     setSfImportFlag(true)
     try {
       const preset = providerPresetMap['硅基流动']
-      // 2026年8月：一键导入全部7套硅基流动9B及以下永久免费模型
-      const sfPresetIds = ['sf-qwen25-7b', 'sf-glm4-9b', 'sf-glmz1-9b', 'sf-qwen3-8b', 'sf-qwen35-4b', 'sf-hunyuan-7b', 'sf-kolors']
-      const targetPresets = modelPresetPool.filter(function (p) { return sfPresetIds.indexOf(p.id) !== -1 })
+      // 🔥 2026-09-24：只导入用户勾选的模型（免费默认全选、DeepSeek-V4-Flash 按量计费默认不勾）
+      const allPresets = siliconflowPresetPool()
+      const targetPresets = allPresets.filter(function (p) { return sfSelectedPresets[p.id] === true })
+      if (targetPresets.length === 0) {
+        alert('请至少勾选一个要导入的模型')
+        return
+      }
 
       const existingKeys2: Record<string, boolean> = {}
       for (let z1 = 0; z1 < aiModelBatch.length; z1++) {
@@ -1180,7 +1426,19 @@ export default function SettingsPage() {
       for (let t1 = 0; t1 < targetPresets.length; t1++) {
         const p = targetPresets[t1]
         const _k2 = '硅基流动::' + String(p.model).trim()
-        if (existingKeys2[_k2]) { skippedNames2.push(p.name); continue }
+        if (existingKeys2[_k2]) {
+          // 🔥 2026-11-05 修复：已存在但 status=inactive → 升级为 active；同时同步用户本次输入的 Key
+          for (let _pi = 0; _pi < aiModelBatch.length; _pi++) {
+            const _m = aiModelBatch[_pi]
+            if (String(_m.provider || '').trim() === '硅基流动' && String(_m.model || '').trim() === String(p.model).trim()) {
+              let _changed = false
+              if (_m.status === 'inactive') { _m.status = 'active'; _changed = true }
+              if (siliconflowApiKeyInput.trim() && String(_m.apiKey || '').trim() !== siliconflowApiKeyInput.trim()) { _m.apiKey = siliconflowApiKeyInput; _changed = true }
+              break
+            }
+          }
+          skippedNames2.push(p.name); continue
+        }
         existingKeys2[_k2] = true
         newModels.push({
           id: 'sf-preset-' + Date.now() + '-' + t1, name: p.name, provider: '硅基流动',
@@ -1241,7 +1499,7 @@ export default function SettingsPage() {
       if (skippedNames2.length > 0) {
         setTimeout(function () { alert('以下硅基流动模型已存在，自动跳过导入：' + skippedNames2.join('、') + (newModels.length ? '\n\n成功新增：' + newModels.map(function(n){return n.name}).join('、') : '')) }, 50)
       } else if (newModels.length) {
-        setTimeout(function () { alert('成功导入硅基流动全部' + newModels.length + '套永久免费模型') }, 50)
+        setTimeout(function () { alert('成功导入硅基流动 ' + newModels.length + ' 套模型（共勾选 ' + targetPresets.length + ' 套）') }, 50)
       }
     } catch (_e) {
       alert('硅基流动导入失败：' + (_e instanceof Error ? _e.message : '未知错误'))
@@ -1251,6 +1509,7 @@ export default function SettingsPage() {
   }
 
   function execImportZhipuPresets() {
+    setZpSelectedPresets(initPresetSelection(zhipuPresetPool))
     setZhipuModalOpen(true)
   }
 
@@ -1259,7 +1518,12 @@ export default function SettingsPage() {
     setZhipuImportFlag(true)
     try {
       const preset = providerPresetMap['智谱GLM']
-      const targetPresets = zhipuPresetPool
+      // 🔥 2026-09-24：只导入用户勾选的模型
+      const targetPresets = zhipuPresetPool.filter(function (p) { return zpSelectedPresets[p.id] === true })
+      if (targetPresets.length === 0) {
+        alert('请至少勾选一个要导入的模型')
+        return
+      }
 
       const existingKeys: Record<string, boolean> = {}
       for (let i = 0; i < aiModelBatch.length; i++) {
@@ -1269,10 +1533,24 @@ export default function SettingsPage() {
 
       const newModels: AIModelItem[] = []
       const skippedNames: string[] = []
+      const _patchedIdx: number[] = []
       for (let t = 0; t < targetPresets.length; t++) {
         const p = targetPresets[t]
         const _k = '智谱GLM::' + String(p.model).trim()
-        if (existingKeys[_k]) { skippedNames.push(p.name); continue }
+        if (existingKeys[_k]) {
+          // 🔥 2026-11-05 修复：已存在但 status=inactive → 升级为 active；同时同步用户本次输入的 Key
+          for (let _pi = 0; _pi < aiModelBatch.length; _pi++) {
+            const _m = aiModelBatch[_pi]
+            if (String(_m.provider || '').trim() === '智谱GLM' && String(_m.model || '').trim() === String(p.model).trim()) {
+              let _changed = false
+              if (_m.status === 'inactive') { _m.status = 'active'; _changed = true }
+              if (zhipuApiKeyInput.trim() && String(_m.apiKey || '').trim() !== zhipuApiKeyInput.trim()) { _m.apiKey = zhipuApiKeyInput; _changed = true }
+              if (_changed) _patchedIdx.push(_pi)
+              break
+            }
+          }
+          skippedNames.push(p.name); continue
+        }
         existingKeys[_k] = true
         newModels.push({
           id: 'zhipu-preset-' + Date.now() + '-' + t, name: p.name, provider: '智谱GLM',
@@ -1287,17 +1565,18 @@ export default function SettingsPage() {
         })
       }
 
+      // 🔥 patched 项（status 升级/Key 同步）已在 aiModelBatch 原对象上修改，concat 后一并保存
       const allModels = safeSetAiModelBatch(aiModelBatch.concat(newModels), true)
       localStorage.setItem('tuzhong-zhipu-api-key', zhipuApiKeyInput)
       setZhipuModalOpen(false)
       setZhipuApiKeyInput('')
       syncModelsToBackend(allModels)
       if (skippedNames.length > 0) {
-        setTimeout(function () { alert('以下智谱模型已存在，自动跳过导入：' + skippedNames.join('、') + (newModels.length ? '\n\n成功新增：' + newModels.map(function(n){return n.name}).join('、') : '')) }, 50)
+        setTimeout(function () { alert('以下智谱模型已存在：' + skippedNames.join('、') + (_patchedIdx.length ? '\n\n其中 ' + _patchedIdx.length + ' 套已从「未启用」升级为「已启用」并同步了本次输入的 Key' : '') + (newModels.length ? '\n\n成功新增：' + newModels.map(function(n){return n.name}).join('、') : '')) }, 50)
       } else if (newModels.length) {
-        setTimeout(function () { alert('成功导入智谱全部' + newModels.length + '套永久免费模型') }, 50)
+        setTimeout(function () { alert('成功导入智谱 ' + newModels.length + ' 套模型（共勾选 ' + targetPresets.length + ' 套）') }, 50)
       } else {
-        setTimeout(function () { alert('智谱3套模型均已存在，未做任何更改') }, 50)
+        setTimeout(function () { alert('智谱 ' + targetPresets.length + ' 套模型均已存在，未做任何更改') }, 50)
       }
     } catch (_e) {
       alert('智谱导入失败：' + (_e instanceof Error ? _e.message : '未知错误'))
@@ -1316,8 +1595,15 @@ export default function SettingsPage() {
     try {
       const targetProvider = platformImportTarget
       const preset = providerPresetMap[targetProvider]
-      const pool = targetProvider === 'OpenRouter' ? openrouterPresetPool : targetProvider === 'Groq' ? groqPresetPool : targetProvider === '商汤 (SenseTime)' ? sensenovaPresetPool : hunyuanPresetPool
-      const targetModels = pool.map(function (p) { return String(p.model).trim() })
+      const pool = platformPoolFor(targetProvider)
+      // 🔥 2026-09-24：只导入用户勾选的模型（免费默认全选、收费默认不选）
+      const selectedPool = pool.filter(function (p) { return platformSelectedPresets[p.id] === true })
+      if (selectedPool.length === 0) {
+        alert('请至少勾选一个要导入的模型')
+        return
+      }
+      const targetModels = selectedPool.map(function (p) { return String(p.model).trim() })
+      const rl = buildRateLimit(platformRateLimit.perMinute, platformRateLimit.perHour, platformRateLimit.perDay)
 
       const existingSet: Record<string, boolean> = {}
       const updatedBatch = aiModelBatch.map(function (m) {
@@ -1328,12 +1614,13 @@ export default function SettingsPage() {
           return Object.assign({}, m, {
             apiKey: platformApiKeyInput,
             baseUrl: m.baseUrl || preset?.baseUrl || '',
+            rateLimit: rl,
           })
         }
         return m
       })
 
-      const missing = pool.filter(function (p) { return !existingSet[targetProvider + '::' + String(p.model).trim()] })
+      const missing = selectedPool.filter(function (p) { return !existingSet[targetProvider + '::' + String(p.model).trim()] })
       const newModels: AIModelItem[] = missing.map(function (p, i) {
         return {
           id: 'preset-' + targetProvider + '-' + Date.now() + '-' + i, name: p.name, provider: targetProvider,
@@ -1345,6 +1632,7 @@ export default function SettingsPage() {
           maxTokens: p.maxTokens, presencePenalty: p.presencePenalty, frequencyPenalty: p.frequencyPenalty,
           usageTag: p.usageTag,
           isAdminDefault: true,
+          rateLimit: rl,
         }
       })
 
@@ -1352,6 +1640,7 @@ export default function SettingsPage() {
       localStorage.setItem('tuzhong-' + targetProvider + '-api-key', platformApiKeyInput)
       setPlatformModalOpen(false)
       setPlatformApiKeyInput('')
+      setPlatformRateLimit({ perMinute: '', perHour: '', perDay: '' })
       setPlatformImportTarget(null)
       syncModelsToBackend(allModels)
       setTimeout(function () {
@@ -1362,6 +1651,128 @@ export default function SettingsPage() {
     } finally {
       setPlatformImportFlag(false)
     }
+  }
+
+  // 🔥 2026-09-21：勾选即生效 —— 切换预设模型的启用/停用（复用既有导入弹窗补齐 Key）
+  function getProviderApiKey(provider: string): string {
+    const target = String(provider || '').trim()
+    const found = aiModelBatch.find(function (m) {
+      return String(m.provider || '').trim() === target && m.apiKey && !String(m.apiKey).includes('*')
+    })
+    return found ? String(found.apiKey) : ''
+  }
+
+  // 🔥 2026-10-20：平台状态以“实际可用的模型”为准。
+  //   服务端返回的 Key 是掩码（sk-****），旧逻辑只认明文 Key，导致已启用免费模型的平台全显示“未配置”。
+  function isProviderConfigured(provider: string): boolean {
+    if (getProviderApiKey(provider).trim().length > 0) return true
+    const norm = function (s: string) { return String(s || '').replace(/\s*\([^)]*\)\s*/g, '').trim().toLowerCase() }
+    const target = norm(provider)
+    if (!target) return false
+    return aiModelBatch.some(function (m) {
+      const st = String(m.status || '').toLowerCase()
+      if (st !== 'active' && st !== 'default') return false
+      const p = norm(m.provider)
+      return !!p && (p === target || p.indexOf(target) >= 0 || target.indexOf(p) >= 0)
+    })
+  }
+
+  // 🔥 2026-09-24：打开第三方平台导入弹窗（平台入口按钮 / 勾选未配置 Key 的预设卡共用）
+  // 初始化勾选状态（免费默认全选、收费默认不选）+ 预填该平台已有 Key（若有）
+  function openPlatformImport(provider: string) {
+    setPlatformSelectedPresets(initPresetSelection(platformPoolFor(provider)))
+    setPlatformRateLimit({ perMinute: '', perHour: '', perDay: '' })
+    setPlatformApiKeyInput(getProviderApiKey(provider) || '')
+    setPlatformImportTarget(provider)
+    setPlatformModalOpen(true)
+  }
+
+  // 🔥 2026-09-24：导入弹窗内「免费 / 收费」分组勾选列表（所有平台导入弹窗共用渲染器）
+  function renderImportGroup(items: ModelPresetItem[], isPaid: boolean, selected: Record<string, boolean>, setSelected: (s: Record<string, boolean>) => void) {
+    if (!items || items.length === 0) return null
+    const allChecked = items.every(function (p) { return selected[p.id] === true })
+    return (
+      <div className="mb-3 last:mb-0">
+        <div className="flex items-center justify-between mb-1.5">
+          <span className={'text-xs font-bold ' + (isPaid ? 'text-amber-800' : 'text-green-800')}>
+            {isPaid ? '💰 收费模型（按量计费，谨慎勾选）' : '🆓 免费模型（永久免费）'}
+          </span>
+          <label className="flex items-center gap-1 cursor-pointer text-[10px] text-gray-500 select-none">
+            <input type="checkbox" checked={allChecked} onChange={function (e) { const s = Object.assign({}, selected); items.forEach(function (p) { s[p.id] = e.target.checked }); setSelected(s) }} className="w-3 h-3 rounded border-gray-300 text-blue-600 cursor-pointer" />
+            本组全选
+          </label>
+        </div>
+        <div className={'rounded-lg border p-2 space-y-1 max-h-44 overflow-y-auto ' + (isPaid ? 'border-amber-200 bg-amber-50/60' : 'border-green-200 bg-green-50/60')}>
+          {items.map(function (p) {
+            const checked = selected[p.id] === true
+            return (
+              <label key={p.id} className="flex items-center gap-2 text-sm cursor-pointer rounded px-1 py-0.5 hover:bg-white/70">
+                <input type="checkbox" checked={checked} onChange={function (e) { const s = Object.assign({}, selected); s[p.id] = e.target.checked; setSelected(s) }} className="w-4 h-4 rounded border-gray-300 text-blue-600 cursor-pointer shrink-0" />
+                <span className="shrink-0">{p.icon}</span>
+                <span className={'font-medium shrink-0 ' + (isPaid ? 'text-amber-800' : 'text-green-800')}>{p.name}</span>
+                <span className="text-gray-400 shrink-0">—</span>
+                <span className="font-mono text-xs text-gray-500 truncate" title={p.model}>{p.model}</span>
+              </label>
+            )
+          })}
+        </div>
+      </div>
+    )
+  }
+
+  function togglePreset(preset: ModelPresetItem, enable: boolean) {
+    const provider = String(preset.provider || '').trim()
+    const model = String(preset.model || '').trim()
+    const key = getProviderApiKey(provider)
+    if (enable && !key) {
+      // 该平台尚未配置 API Key：打开对应导入弹窗引导用户先填 Key
+      if (provider === '硅基流动') { execImportSiliconflowPresets(); return }
+      if (provider === '智谱GLM') { execImportZhipuPresets(); return }
+      openPlatformImport(provider); return
+    }
+    const updated: AIModelItem[] = aiModelBatch.map(function (m) {
+      const copy: AIModelItem = {} as AIModelItem
+      const keys = Object.keys(m) as (keyof AIModelItem)[]
+      for (let i = 0; i < keys.length; i++) { (copy as unknown as Record<string, unknown>)[keys[i]] = (m as unknown as Record<string, unknown>)[keys[i]] }
+      return copy
+    })
+    const existingIdx = updated.findIndex(function (m) {
+      return String(m.provider || '').trim() === provider && String(m.model || '').trim() === model
+    })
+    if (enable) {
+      if (existingIdx >= 0) {
+        if (updated[existingIdx].status === 'inactive') updated[existingIdx].status = 'active'
+      } else {
+        const presetEntry = providerPresetMap[provider]
+        updated.push({
+          id: 'preset-' + provider + '-' + Date.now(), name: preset.name, provider: provider,
+          apiKey: key, baseUrl: presetEntry ? presetEntry.baseUrl : '', model: model, presetModels: [],
+          status: 'active', temperature: preset.temperature, topP: preset.topP,
+          contextWindow: preset.contextWindow, maxTokens: preset.maxTokens,
+          presencePenalty: preset.presencePenalty, frequencyPenalty: preset.frequencyPenalty,
+          usageTag: preset.usageTag, isAdminDefault: true,
+        })
+      }
+    } else {
+      if (existingIdx >= 0) updated[existingIdx].status = 'inactive'
+    }
+    // 保证至少有一个 default（若被停用，则把首个 active 设为 default）
+    const hasDefault = updated.some(function (m) { return m.status === 'default' })
+    const hasActive = updated.some(function (m) { return m.status === 'active' || m.status === 'default' })
+    if (!hasDefault && hasActive) {
+      const firstActive = updated.find(function (m) { return m.status === 'active' })
+      if (firstActive) firstActive.status = 'default'
+    }
+    const saved = safeSetAiModelBatch(updated, true)
+    const def = saved.find(function (m) { return m.status === 'default' }) || saved.find(function (m) { return m.status === 'active' })
+    if (def) {
+      localStorage.setItem('tuzhong-llm-config', JSON.stringify({
+        provider: String(def.provider || '').replace(/\s*\([^)]*\)\s*/g, '').trim(),
+        apiKey: def.apiKey, baseUrl: String(def.baseUrl || '').replace(/[`'"]/g, '').trim(),
+        model: def.model, modelId: def.id,
+      }))
+    }
+    syncModelsToBackend(saved)
   }
 
   function execSetDefaultModel(modelId: string) {
@@ -1420,6 +1831,11 @@ export default function SettingsPage() {
       return
     }
     setNewModelForm({ provider: m.provider, apiKey: m.apiKey || '', name: m.name, baseUrl: m.baseUrl || '', model: m.model || '' })
+    setNewModelRateLimit({
+      perMinute: m.rateLimit && m.rateLimit.perMinute != null ? String(m.rateLimit.perMinute) : '',
+      perHour: m.rateLimit && m.rateLimit.perHour != null ? String(m.rateLimit.perHour) : '',
+      perDay: m.rateLimit && m.rateLimit.perDay != null ? String(m.rateLimit.perDay) : '',
+    })
     setEditingModelId(modelId)
     setAddModelModalOpen(true)
   }
@@ -1434,6 +1850,7 @@ export default function SettingsPage() {
       copy.provider = newModelForm.provider; copy.name = newModelForm.name; copy.apiKey = newModelForm.apiKey
       copy.baseUrl = newModelForm.baseUrl || providerPresetMap[newModelForm.provider]?.baseUrl || ''
       copy.model = newModelForm.model || providerPresetMap[newModelForm.provider]?.defaultModel || ''
+      copy.rateLimit = buildRateLimit(newModelRateLimit.perMinute, newModelRateLimit.perHour, newModelRateLimit.perDay)
       return copy
     })
     setAiModelBatch(updatedBatch)
@@ -1465,13 +1882,17 @@ export default function SettingsPage() {
       rhythmIntensity: rhythmIntensity,
       targetPlatform: targetPlatform,
       mcPersonality: mcPersonality,
+      _updatedAt: Date.now(),
     }
     localStorage.setItem('tuzhong-preferences', JSON.stringify(prefs))
+    // 🔥 2026-10-20：同步到账号级存储，换浏览器/设备登录后仍是这套偏好
+    if (prefsSaveTimer.current) clearTimeout(prefsSaveTimer.current)
+    pushServerPreferences(prefs)
 
     // 🔥 平台AI检测配置 - 独立 key 持久化（避免与其他字段混写导致修改丢失）
     try {
       localStorage.setItem('tuzhong-platform-configs', JSON.stringify(platformConfigs))
-    } catch (_e) {}
+    } catch (_e) { console.error('[settings] 保存 tuzhong-platform-configs 失败:', _e) }
 
     // 🔥 同步白金爆款参数到独立 localStorage key，供 AI 生成向导读取
     localStorage.setItem('tuzhong-bestseller-prefs', JSON.stringify({
@@ -1509,11 +1930,17 @@ export default function SettingsPage() {
 
   function execExportData() {
     setExportProcessFlag(true)
-    const p1 = fetch('/tuzhong-wenshu/api/novels').then(function (r) { return r.json() })
-    const p2 = fetch('/tuzhong-wenshu/api/characters').then(function (r) { return r.json() })
+    const hdrs = getAuthHeaders()
+    const p1 = fetch('/tuzhong-wenshu/api/novels', { headers: hdrs }).then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j } }) })
+    const p2 = fetch('/tuzhong-wenshu/api/characters', { headers: hdrs }).then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j } }) })
     Promise.all([p1, p2]).then(function (results) {
-      const novelData = (results[0].data || results[0].novels || [])
-      const charData = (results[1].data || results[1].characters || [])
+      // 🔥 Bug修复：此前 401/失败时也导出一个空 novels:[] 的“成功”备份
+      if (!results[0].ok || !results[1].ok || !results[1].ok) {
+        alert('导出失败：服务端返回异常，请重新登录后重试')
+        return
+      }
+      const novelData = (results[0].j.data || results[0].j.novels || [])
+      const charData = (results[1].j.data || results[1].j.characters || [])
       const exportData = {
         exportDate: new Date().toISOString(),
         preferences: { writingStyle: pickedStyle, continuationLength: pickedLength, autoSaveInterval: pickedInterval, tomatoReminder: tomatoCheckFlag },
@@ -1530,7 +1957,7 @@ export default function SettingsPage() {
       document.body.removeChild(a)
       URL.revokeObjectURL(url)
       setExportModalOpen(false)
-    }).catch(function () {}).finally(function () { setExportProcessFlag(false) })
+    }).catch(function (err) { console.error('[settings] 导出作品数据失败:', err) }).finally(function () { setExportProcessFlag(false) })
   }
 
   function execDeleteAcct() {
@@ -1588,239 +2015,137 @@ export default function SettingsPage() {
         {activeTab === 'ai-model' && (
           <div>
             {/* 路由卡片仅管理员可见，普通用户无需了解后台配置 */}
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+{/* 🔥 2026-09-24：平台一键导入入口 —— 所有平台常驻可见入口，点击打开对应导入弹窗（免费/收费分组勾选） */}
             {isAdmin && (
-            <div className="bg-white rounded-2xl border border-gray-200 shadow-sm hover:shadow-md transition-shadow h-full flex flex-col overflow-hidden border-t-4 border-t-cyan-500">
-              <div className="flex items-start justify-between gap-4 p-6 pb-4">
-                <div className="min-w-0">
-                  <div className="flex items-center gap-2">
-                    <span className="text-2xl">🎯</span>
-                    <h2 className="text-base font-bold text-gray-900 truncate">硅基流动（8套）</h2>
-                    <span className="px-2 py-0.5 text-[10px] rounded-full bg-cyan-50 text-cyan-700 border border-cyan-100 font-medium">8 models</span>
-                  </div>
-                  <p className="text-xs text-gray-500 mt-1.5 truncate">7 款永久免费（正文/大纲/权谋/备用/润色/封面）+ DeepSeek-V4-Flash 开局分析</p>
+              <section className="bg-white rounded-2xl border border-gray-200 shadow-sm overflow-hidden border-t-4 border-t-blue-500">
+                <div className="flex items-center gap-2 p-6 pb-4">
+                  <span className="text-2xl">🔌</span>
+                  <h2 className="text-base font-bold text-gray-900">平台一键导入入口</h2>
+                  <span className="px-2 py-0.5 text-[10px] rounded-full bg-blue-50 text-blue-700 border border-blue-100 font-medium">点击打开导入弹窗 · 免费/收费可分别勾选</span>
                 </div>
-                <button
-                  onClick={function () { execImportSiliconflowPresets() }}
-                  className="shrink-0 flex items-center gap-1.5 px-3 py-2 text-cyan-700 bg-cyan-50 hover:bg-cyan-100 border border-cyan-200 rounded-lg text-xs font-medium transition-colors"
-                >
-                  <Zap className="w-3.5 h-3.5" />
-                  导入
-                </button>
-              </div>
-
-              <div className="grid grid-cols-2 gap-3 flex-1 px-6 pb-6 items-stretch">
-                {modelPresetPool.map(function (preset) {
-                  const colorMap: Record<string, { bg: string; border: string; text: string; badge: string }> = {
-                    blue: { bg: 'bg-blue-50', border: 'border-blue-200', text: 'text-blue-800', badge: 'bg-blue-100 text-blue-700' },
-                    red: { bg: 'bg-red-50', border: 'border-red-200', text: 'text-red-800', badge: 'bg-red-100 text-red-700' },
-                    purple: { bg: 'bg-purple-50', border: 'border-purple-200', text: 'text-purple-800', badge: 'bg-purple-100 text-purple-700' },
-                    green: { bg: 'bg-green-50', border: 'border-green-200', text: 'text-green-800', badge: 'bg-green-100 text-green-700' },
-                    cyan: { bg: 'bg-cyan-50', border: 'border-cyan-200', text: 'text-cyan-800', badge: 'bg-cyan-100 text-cyan-700' },
-                    teal: { bg: 'bg-teal-50', border: 'border-teal-200', text: 'text-teal-800', badge: 'bg-teal-100 text-teal-700' },
-                    emerald: { bg: 'bg-emerald-50', border: 'border-emerald-200', text: 'text-emerald-800', badge: 'bg-emerald-100 text-emerald-700' },
-                  }
-                  const c = colorMap[preset.color] || colorMap.blue
-                  const presetProvider = String(preset.provider || '').trim()
-                  const presetModel = String(preset.model || '').trim()
-                  // 修复：普通用户始终看到预设模型为"已添加"状态（使用管理员配置的默认模型）
-                  const alreadyAdded = isAdmin
-                    ? aiModelBatch.some(function (m) {
-                        const mProvider = String(m.provider || '').trim()
-                        const mModel = String(m.model || '').trim()
-                        return mModel === presetModel && (
-                          mProvider === presetProvider ||
-                          (presetProvider === '硅基流动' && (mProvider === '硅基流动' || mProvider === '硅基流动 (SiliconFlow)')) ||
-                          ((presetProvider === '硅基流动' || presetProvider === '硅基流动 (SiliconFlow)') && mProvider === '硅基流动')
-                        )
-                      })
-                    : true
-                  return (
-                    <div key={preset.id} className="bg-white rounded-xl border border-gray-200 p-4 relative shadow-sm hover:shadow-md hover:border-gray-300 transition-all h-full flex flex-col">
-                      {alreadyAdded ? (
-                        <div className="absolute top-2.5 right-2.5" title="已添加：在「已配置模型」列表中已找到对应 provider+model 的记录">
-                          <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-green-50 text-green-700 text-[10px] rounded-full font-medium border border-green-100">
-                            <Check className="w-3 h-3" />已添加
-                          </span>
-                        </div>
-                      ) : (
-                        <div className="absolute top-2.5 right-2.5" title="未添加：点击上方「导入」按钮填入 Key 后启用">
-                          <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-gray-50 text-gray-500 text-[10px] rounded-full font-medium border border-gray-100">
-                            <span className="w-2.5 h-2.5 rounded-full border border-gray-400 border-dashed inline-block"></span>未添加
-                          </span>
-                        </div>
-                      )}
-                      <div className="flex items-start gap-3 h-full">
-                        <span className="text-xl mt-0.5 shrink-0">{preset.icon}</span>
-                        <div className="flex-1 min-w-0 flex flex-col h-full">
-                          <h3 className="font-semibold text-sm text-gray-900 leading-snug pr-14">{preset.name}</h3>
-                          <div className="flex flex-wrap items-center gap-2 mt-1">
-                            <span className={'px-1.5 py-0.5 text-[10px] rounded font-medium ' + c.badge}>{preset.usageTag}</span>
-                            <span className="text-[10px] text-gray-400 font-mono truncate max-w-[130px]" title={preset.model}>{preset.model}</span>
-                          </div>
-                          <p className="text-[11px] text-gray-500 mt-1.5 line-clamp-2 min-h-[2.5em] leading-[1.25em]">{preset.description}</p>
-                          <div className="pt-3 grid grid-cols-2 gap-x-3 gap-y-1 text-[10px] text-gray-500">
-                            <span>温度 <b className="text-gray-700">{preset.temperature}</b></span>
-                            <span>TopP <b className="text-gray-700">{preset.topP}</b></span>
-                            <span>上下文 <b className="text-gray-700">{preset.contextWindow >= 1000000 ? preset.contextWindow / 1000000 + 'M' : preset.contextWindow / 1000 + 'K'}</b></span>
-                            <span>最大长度 <b className="text-gray-700">{preset.maxTokens}</b></span>
-                            <span>存在惩罚 <b className="text-gray-700">{preset.presencePenalty}</b></span>
-                            <span>频率惩罚 <b className="text-gray-700">{preset.frequencyPenalty}</b></span>
-                          </div>
-                        </div>
-                      </div>
-                    </div>
-                  )
-                })}
-              </div>
-            </div>
+                <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3 px-6 pb-6">
+                  {[
+                    { name: '硅基流动', icon: providerIconMap['硅基流动'], action: execImportSiliconflowPresets },
+                    { name: '智谱GLM', icon: providerIconMap['智谱GLM'], action: execImportZhipuPresets },
+                  ].map(function (plat) {
+                    const colors = providerColorMap[plat.name] || { bg: 'bg-gray-50', text: 'text-gray-700', border: 'border-gray-200' }
+                    const IconComp = plat.icon || Cpu
+                    const configured = isProviderConfigured(plat.name)
+                    return (
+                      <button key={plat.name} onClick={plat.action}
+                        className={'flex items-center justify-center gap-2 px-3 py-3 rounded-xl border ' + colors.bg + ' ' + colors.border + ' ' + colors.text + ' hover:shadow-md transition-all text-sm font-medium'}>
+                        <IconComp className="w-4 h-4" />
+                        <span>{plat.name}</span>
+                        <span className={'ml-auto text-[10px] px-1.5 py-0.5 rounded-full ' + (configured ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-500')}>{configured ? '已配置' : '未配置'}</span>
+                      </button>
+                    )
+                  })}
+                </div>
+              </section>
             )}
-
-            {/* 智谱 BigModel 免费模型卡片（仅管理员可见） */}
+            {/* 🔥 2026-09-21：免费大模型 / 收费大模型 分组 + 勾选即生效 */}
+            <div className="space-y-8">
             {isAdmin && (
-            <div className="bg-white rounded-2xl border border-gray-200 shadow-sm hover:shadow-md transition-shadow h-full flex flex-col overflow-hidden border-t-4 border-t-indigo-500">
-              <div className="flex items-start justify-between gap-4 p-6 pb-4">
-                <div className="min-w-0">
-                  <div className="flex items-center gap-2">
-                    <span className="text-2xl">🧪</span>
-                    <h2 className="text-base font-bold text-gray-900 truncate">智谱 BigModel 免费（3套）</h2>
-                    <span className="px-2 py-0.5 text-[10px] rounded-full bg-indigo-50 text-indigo-700 border border-indigo-100 font-medium">3 models</span>
-                  </div>
-                  <p className="text-xs text-gray-500 mt-1.5 truncate">GLM-4.7-Flash / GLM-Z1-Flash / GLM-4-Flash 并行备选</p>
+              <section className="bg-white rounded-2xl border border-gray-200 shadow-sm overflow-hidden border-t-4 border-t-green-500">
+                <div className="flex items-center gap-2 p-6 pb-4">
+                  <span className="text-2xl">🆓</span>
+                  <h2 className="text-base font-bold text-gray-900">免费大模型</h2>
+                  <span className="px-2 py-0.5 text-[10px] rounded-full bg-green-50 text-green-700 border border-green-100 font-medium">勾选即生效 · 永久免费</span>
                 </div>
-                <button
-                  onClick={function () { execImportZhipuPresets() }}
-                  className="shrink-0 flex items-center gap-1.5 px-3 py-2 text-indigo-700 bg-indigo-50 hover:bg-indigo-100 border border-indigo-200 rounded-lg text-xs font-medium transition-colors"
-                >
-                  <Zap className="w-3.5 h-3.5" />
-                  导入
-                </button>
-              </div>
-
-              <div className="grid grid-cols-2 gap-3 flex-1 px-6 pb-6 items-stretch">
-                {renderPresetCards(zhipuPresetPool, isAdmin, aiModelBatch)}
-              </div>
-            </div>
+                <div className="grid grid-cols-2 gap-3 flex-1 px-6 pb-6 items-stretch">
+                  {renderPresetCards(freePresets, isAdmin, aiModelBatch, togglePreset)}
+                </div>
+              </section>
             )}
-
-            {/* OpenRouter 永久免费模型卡片（仅管理员可见） */}
             {isAdmin && (
-            <div className="bg-white rounded-2xl border border-gray-200 shadow-sm hover:shadow-md transition-shadow h-full flex flex-col overflow-hidden border-t-4 border-t-orange-500">
-              <div className="flex items-start justify-between gap-4 p-6 pb-4">
-                <div className="min-w-0">
-                  <div className="flex items-center gap-2">
-                    <span className="text-2xl">🌐</span>
-                    <h2 className="text-base font-bold text-gray-900 truncate">OpenRouter 免费（10套）</h2>
-                    <span className="px-2 py-0.5 text-[10px] rounded-full bg-orange-50 text-orange-700 border border-orange-100 font-medium">10 models</span>
-                  </div>
-                  <p className="text-xs text-gray-500 mt-1.5 truncate">GPT-OSS / DeepSeek-R1-Distill / Llama / Qwen 跨厂商聚合</p>
+              <section className="bg-white rounded-2xl border border-gray-200 shadow-sm overflow-hidden border-t-4 border-t-amber-500">
+                <div className="flex items-center gap-2 p-6 pb-4">
+                  <span className="text-2xl">💰</span>
+                  <h2 className="text-base font-bold text-gray-900">收费大模型</h2>
+                  <span className="px-2 py-0.5 text-[10px] rounded-full bg-amber-50 text-amber-700 border border-amber-100 font-medium">按量计费 · 谨慎勾选</span>
                 </div>
-                <button
-                  onClick={function () { setPlatformImportTarget('OpenRouter'); setPlatformModalOpen(true) }}
-                  className="shrink-0 flex items-center gap-1.5 px-3 py-2 text-orange-700 bg-orange-50 hover:bg-orange-100 border border-orange-200 rounded-lg text-xs font-medium transition-colors"
-                >
-                  <Zap className="w-3.5 h-3.5" />
-                  导入
-                </button>
-              </div>
-              <div className="grid grid-cols-2 gap-3 flex-1 px-6 pb-6 items-stretch">
-                {renderPresetCards(openrouterPresetPool, isAdmin, aiModelBatch)}
-              </div>
-            </div>
-            )}
-
-            {/* Groq 永久免费模型卡片（仅管理员可见） */}
-            {isAdmin && (
-            <div className="bg-white rounded-2xl border border-gray-200 shadow-sm hover:shadow-md transition-shadow h-full flex flex-col overflow-hidden border-t-4 border-t-lime-500">
-              <div className="flex items-start justify-between gap-4 p-6 pb-4">
-                <div className="min-w-0">
-                  <div className="flex items-center gap-2">
-                    <span className="text-2xl">⚡</span>
-                    <h2 className="text-base font-bold text-gray-900 truncate">Groq 免费（6套）</h2>
-                    <span className="px-2 py-0.5 text-[10px] rounded-full bg-lime-50 text-lime-700 border border-lime-100 font-medium">6 models</span>
-                  </div>
-                  <p className="text-xs text-gray-500 mt-1.5 truncate">Llama / DeepSeek / Qwen / Gemma 极速推理</p>
+                <div className="grid grid-cols-2 gap-3 flex-1 px-6 pb-6 items-stretch">
+                  {renderPresetCards(paidPresets, isAdmin, aiModelBatch, togglePreset)}
                 </div>
-                <button
-                  onClick={function () { setPlatformImportTarget('Groq'); setPlatformModalOpen(true) }}
-                  className="shrink-0 flex items-center gap-1.5 px-3 py-2 text-lime-700 bg-lime-50 hover:bg-lime-100 border border-lime-200 rounded-lg text-xs font-medium transition-colors"
-                >
-                  <Zap className="w-3.5 h-3.5" />
-                  导入
-                </button>
-              </div>
-              <div className="grid grid-cols-2 gap-3 flex-1 px-6 pb-6 items-stretch">
-                {renderPresetCards(groqPresetPool, isAdmin, aiModelBatch)}
-              </div>
-            </div>
-            )}
-
-            {/* 腾讯混元 永久免费模型卡片（仅管理员可见） */}
-            {isAdmin && (
-            <div className="bg-white rounded-2xl border border-gray-200 shadow-sm hover:shadow-md transition-shadow h-full flex flex-col overflow-hidden border-t-4 border-t-rose-500">
-              <div className="flex items-start justify-between gap-4 p-6 pb-4">
-                <div className="min-w-0">
-                  <div className="flex items-center gap-2">
-                    <span className="text-2xl">🐧</span>
-                    <h2 className="text-base font-bold text-gray-900 truncate">腾讯混元 免费（1套）</h2>
-                    <span className="px-2 py-0.5 text-[10px] rounded-full bg-rose-50 text-rose-700 border border-rose-100 font-medium">1 model</span>
-                  </div>
-                  <p className="text-xs text-gray-500 mt-1.5 truncate">hunyuan-lite 永久免费，中文创作稳定</p>
-                </div>
-                <button
-                  onClick={function () { setPlatformImportTarget('腾讯混元'); setPlatformModalOpen(true) }}
-                  className="shrink-0 flex items-center gap-1.5 px-3 py-2 text-rose-700 bg-rose-50 hover:bg-rose-100 border border-rose-200 rounded-lg text-xs font-medium transition-colors"
-                >
-                  <Zap className="w-3.5 h-3.5" />
-                  导入
-                </button>
-              </div>
-              <div className="grid grid-cols-2 gap-3 flex-1 px-6 pb-6 items-stretch">
-                {renderPresetCards(hunyuanPresetPool, isAdmin, aiModelBatch)}
-              </div>
-            </div>
-            )}
-
-            {/* 🔥 2026-09-01 第20轮：商汤日日新 模型卡片（仅管理员可见） */}
-            {isAdmin && (
-            <div className="bg-white rounded-2xl border border-gray-200 shadow-sm hover:shadow-md transition-shadow h-full flex flex-col overflow-hidden border-t-4 border-t-emerald-500">
-              <div className="flex items-start justify-between gap-4 p-6 pb-4">
-                <div className="min-w-0">
-                  <div className="flex items-center gap-2">
-                    <span className="text-2xl">🌆</span>
-                    <h2 className="text-base font-bold text-gray-900 truncate">商汤日日新（1套）</h2>
-                    <span className="px-2 py-0.5 text-[10px] rounded-full bg-emerald-50 text-emerald-700 border border-emerald-100 font-medium">1 model</span>
-                  </div>
-                  <p className="text-xs text-gray-500 mt-1.5 truncate">sensenova-6.8-flash-lite，响应快、JSON 输出干净</p>
-                </div>
-                <button
-                  onClick={function () { setPlatformImportTarget('商汤 (SenseTime)'); setPlatformModalOpen(true) }}
-                  className="shrink-0 flex items-center gap-1.5 px-3 py-2 text-emerald-700 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 rounded-lg text-xs font-medium transition-colors"
-                >
-                  <Zap className="w-3.5 h-3.5" />
-                  导入
-                </button>
-              </div>
-              <div className="grid grid-cols-2 gap-3 flex-1 px-6 pb-6 items-stretch">
-                {renderPresetCards(sensenovaPresetPool, isAdmin, aiModelBatch)}
-              </div>
-            </div>
+              </section>
             )}
             </div>
 
-            <div className="flex items-center justify-between mb-6">
+            <div className="flex items-center justify-between mb-3">
               <div>
                 <h2 className="text-lg font-semibold text-gray-900">已配置模型</h2>
                 <p className="text-sm text-gray-500 mt-1">管理您的AI写作模型，设置默认模型用于日常写作</p>
               </div>
-              <button
-                onClick={function () { setEditingModelId(null); setNewModelForm({ provider: '', apiKey: '', name: '', baseUrl: '', model: '' }); setLocalModelList([]); setLocalModelErr(''); setAddModelModalOpen(true) }}
-                className="flex items-center space-x-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors"
-              >
-                <Plus className="w-4 h-4" />
-                <span>添加模型</span>
-              </button>
+              <div className="flex items-center space-x-2">
+                {(function () {
+                  let _deadN = 0
+                  Object.keys(modelHealth).forEach(function (k) { if (modelHealth[k].cls === 'dead') _deadN++ })
+                  if (_deadN === 0) return null
+                  return (
+                    <button onClick={execDisableDeadModels}
+                      className="flex items-center space-x-2 px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 transition-colors text-sm">
+                      一键停用已下架（{_deadN}）
+                    </button>
+                  )
+                })()}
+                <button onClick={execHealthCheck} disabled={healthChecking || !isAdmin}
+                  title={isAdmin ? '探活全部已配置模型（下架/Key失效/限流实时识别）' : '仅管理员可执行健康检测'}
+                  className="flex items-center space-x-2 px-4 py-2 border border-blue-500 text-blue-600 rounded-lg hover:bg-blue-50 transition-colors text-sm disabled:opacity-50 disabled:cursor-not-allowed">
+                  {healthChecking ? '检测中...' : '实时健康检测'}
+                </button>
+                <button
+                  onClick={function () { setEditingModelId(null); setNewModelForm({ provider: '', apiKey: '', name: '', baseUrl: '', model: '' }); setLocalModelList([]); setLocalModelErr(''); setAddModelModalOpen(true) }}
+                  className="flex items-center space-x-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors"
+                >
+                  <Plus className="w-4 h-4" />
+                  <span>添加模型</span>
+                </button>
+              </div>
             </div>
+            {healthSummary && (
+              <div className="mb-4 px-4 py-2 bg-gray-50 border border-gray-200 rounded-lg text-sm text-gray-600">
+                健康状态：{healthSummary}{healthChecking ? '（检测中...）' : ''}
+              </div>
+            )}
+            {/* 🔥 #212b 推荐替代模型：发现下架/限流时给出探活通过的免费候选，一键添加 */}
+            {healthRecs.length > 0 && (
+              <div className="mb-4 px-4 py-3 bg-cyan-50/60 border border-cyan-200 rounded-lg">
+                <div className="flex items-center gap-2 mb-2">
+                  <span className="text-sm font-semibold text-cyan-800">💡 推荐替代模型</span>
+                  <span className="text-xs text-cyan-600">已实时探活验证 · 点击「添加」即启用（自动复用该平台已配置的 Key）</span>
+                </div>
+                <div className="space-y-1.5">
+                  {healthRecs.map(function (rec) {
+                    const recOk = rec.cls === 'ok' || rec.cls === 'limited'
+                    return (
+                      <div key={rec.provider + '::' + rec.model} className="flex items-center justify-between gap-3 bg-white rounded-lg border border-cyan-100 px-3 py-2">
+                        <div className="min-w-0">
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <span className="text-sm font-medium text-gray-900 truncate max-w-[280px]" title={rec.model}>{rec.name}</span>
+                            <span className="px-1.5 py-0.5 text-[10px] rounded bg-gray-100 text-gray-500 font-mono truncate max-w-[180px]" title={rec.model}>{rec.model}</span>
+                            <span className="px-1.5 py-0.5 text-[10px] rounded bg-gray-50 text-gray-400">{rec.provider}</span>
+                            {recOk ? (
+                              <span className={'px-1.5 py-0.5 text-[10px] rounded-full font-medium ' + (rec.cls === 'ok' ? 'bg-green-50 text-green-700' : 'bg-orange-50 text-orange-700')}>
+                                {rec.cls === 'ok' ? '可用 ' + rec.latencyMs + 'ms' : '可用（间歇限流）'}
+                              </span>
+                            ) : (
+                              <span className="px-1.5 py-0.5 text-[10px] rounded-full font-medium bg-amber-50 text-amber-700" title={rec.reason}>需换平台 Key</span>
+                            )}
+                          </div>
+                          {!recOk && <p className="text-[11px] text-amber-600 mt-0.5">{rec.reason}</p>}
+                        </div>
+                        {recOk && (
+                          <button onClick={function () { execAddRecommendedModel(rec) }}
+                            className="shrink-0 px-3 py-1.5 bg-cyan-600 text-white rounded-lg hover:bg-cyan-700 transition-colors text-xs font-medium">
+                            添加
+                          </button>
+                        )}
+                      </div>
+                    )
+                  })}
+                </div>
+              </div>
+            )}
 
             {/* VIP引导 */}
             <div className="mb-6 bg-gradient-to-r from-blue-50 to-purple-50 border border-blue-100 rounded-[8px] p-4 flex items-center justify-between">
@@ -1880,6 +2205,16 @@ export default function SettingsPage() {
                                  modelItem.usageTag === '权谋战争' ? 'bg-red-50 text-red-700' :
                                  modelItem.usageTag === '大纲校验' ? 'bg-purple-50 text-purple-700' :
                                  modelItem.usageTag === '草稿速写' ? 'bg-green-50 text-green-700' : 'bg-gray-50 text-gray-700')}>{modelItem.usageTag}</span>)}
+                            {(function () {
+                              const _h = modelHealth[String(modelItem.provider) + '::' + String(modelItem.model)]
+                              if (!_h) return null
+                              if (_h.cls === 'ok') return <span className="px-2 py-0.5 bg-green-50 text-green-700 text-xs rounded-full font-medium" title={'健康探活通过，延迟 ' + _h.latencyMs + 'ms'}>可用 {_h.latencyMs}ms</span>
+                              if (_h.cls === 'dead') return <span className="px-2 py-0.5 bg-red-50 text-red-700 text-xs rounded-full font-medium" title="健康探活返回 404：模型已下架，建议停用或替换">已下架</span>
+                              if (_h.cls === 'keybad') return <span className="px-2 py-0.5 bg-amber-50 text-amber-700 text-xs rounded-full font-medium" title="健康探活返回 401/403：该平台 API Key 失效，请更换 Key">Key失效</span>
+                              if (_h.cls === 'limited') return <span className="px-2 py-0.5 bg-orange-50 text-orange-700 text-xs rounded-full font-medium" title="健康探活返回 429：间歇限流/日限，运行时会自动冷却跳过">限流</span>
+                              if (_h.cls === 'image') return <span className="px-2 py-0.5 bg-gray-50 text-gray-500 text-xs rounded-full font-medium" title="图像生成模型，不适用文本探活">图像模型</span>
+                              return <span className="px-2 py-0.5 bg-gray-50 text-gray-600 text-xs rounded-full font-medium" title={_h.reason}>异常</span>
+                            })()}
                           </div>
                           <span className={'inline-block px-2 py-0.5 text-xs rounded-full mt-1 border ' + colors.bg + ' ' + colors.text + ' ' + colors.border}>{modelItem.provider}</span>
                         </div>
@@ -2013,33 +2348,26 @@ export default function SettingsPage() {
                     </button>
                   )
                 })}
-                <div className="relative ml-auto">
-                  <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-gray-400" />
-                  <input type="text" placeholder="搜索风格..." value={styleSearch}
-                    onChange={function (e) { setStyleSearch(e.target.value) }}
-                    className="pl-8 pr-3 py-1.5 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 text-xs w-36" />
-                </div>
               </div>
 
               {/* 风格网格 - 扩大到三列布局 */}
               <div className="mt-4 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
                 {extendedStyles.filter(function (style) {
-                  const matchCat = styleCategory === '全部' || style.category === styleCategory
-                  const matchSearch = !styleSearch || style.name.indexOf(styleSearch) >= 0 || (style.description || '').indexOf(styleSearch) >= 0
-                  return matchCat && matchSearch
+                  return styleCategory === '全部' || style.category === styleCategory
                 }).map(function (style) {
                   const isPicked = pickedStyle === style.id
                   return (
                     <div key={style.id} onClick={function () { setPickedStyle(style.id) }}
                       className={'rounded-xl border-2 transition-all cursor-pointer overflow-hidden ' + (isPicked ? 'border-blue-500 bg-blue-50 shadow-md' : 'border-gray-200 hover:border-blue-300 hover:shadow')}>
-                      <div className="h-16 bg-gradient-to-br from-blue-500 to-purple-600 relative">
+                      <div className="h-16 bg-gradient-to-br from-blue-500 to-purple-600 relative flex items-center justify-center">
+                        {/* 🔥 2026-10-18：风格名称移入标题条居中显示（原在正文区左上） */}
+                        <span className="px-6 text-white font-semibold text-sm truncate max-w-full text-center">{style.name}</span>
                         <div className="absolute bottom-2 left-3">
                           <span className="px-2 py-0.5 bg-white/20 backdrop-blur text-white text-xs rounded-full">{style.category}</span>
                         </div>
                         {isPicked && <div className="absolute top-2 right-2 w-6 h-6 bg-blue-600 rounded-full flex items-center justify-center"><Check className="w-3.5 h-3.5 text-white" /></div>}
                       </div>
                       <div className="p-4">
-                        <h4 className="font-semibold text-sm text-gray-900 mb-1">{style.name}</h4>
                         <p className="text-xs text-gray-500 line-clamp-2 mb-3">{typeof style.description === 'string' ? style.description : ''}</p>
                         <div className="space-y-1.5">
                           {[
@@ -2143,7 +2471,28 @@ export default function SettingsPage() {
 
             <div className="bg-white rounded-xl border border-gray-200 p-6">
               <h3 className="font-semibold text-gray-900 mb-4">平台AI检测配置</h3>
-              <p className="text-sm text-gray-500 mb-6">配置各平台的AI检测标准，开启后AI生成的内容将自动进行对应平台的检测评分</p>
+              <p className="text-sm text-gray-500 mb-2">配置各平台的AI检测标准，开启后AI生成的内容将自动进行对应平台的检测评分</p>
+              <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 mb-6">口径提示：本栏数值＝平台执行标准（填多少，生成与终检就按多少控）；平台的判定依据是<strong className="mx-1">自建的「朱雀口径标准」</strong>（困惑度 / 语义连贯 / 词汇分布 / 结构特征 四维 + 段落级判定，输出「疑似AI占比」，目标 ≤5%）。朱雀官方模型的结果<strong className="mx-1">仅作参考、不作为闸门</strong>，两者口径不同，不可互相替代。</p>
+
+              <div className="mb-6 rounded-lg border border-gray-200 bg-gray-50 p-4">
+                <h4 className="text-sm font-semibold text-gray-800 mb-1">朱雀官方检测通道（用户自填 API Key）</h4>
+                <p className="text-xs text-gray-500 mb-3">填写腾讯 EdgeOne Makers 的 API Key 后，检测面板会调用朱雀官方模型（@makers/zhuque-text）做真实 AIGC 检测：判定口径为「疑似AI占比」，目标 ≤5%。<strong>未填 Key 不报错</strong>——默认走站内AI检测（朱雀口径四维估测）。Key 保存到你的用户偏好，并在检测请求中由前端传入后端，<strong>不存服务端环境变量</strong>。</p>
+                <div className="flex flex-wrap items-center gap-2">
+                  <input
+                    type="password"
+                    value={zhuqueKeyInput}
+                    onChange={function (e) { setZhuqueKeyInput(e.target.value) }}
+                    placeholder={zhuqueKeyHint || '粘贴 Makers API Key（如 sk-xxxx）'}
+                    className="flex-1 min-w-[240px] px-3 py-2 text-sm border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  />
+                  <button onClick={execSaveZhuqueKey} className="px-4 py-2 bg-gray-900 text-white text-sm rounded-lg hover:bg-black transition-colors">保存 Key</button>
+                  {zhuqueKeyHint && (
+                    <button onClick={execClearLocalZhuqueKey} className="px-4 py-2 bg-white text-gray-700 text-sm rounded-lg border border-gray-300 hover:bg-gray-100 transition-colors">本机清除</button>
+                  )}
+                  <span className="text-xs text-gray-500">当前状态：{zhuqueKeyHint ? ('已配置 ' + zhuqueKeyHint) : '未配置（默认站内AI检测）'}</span>
+                </div>
+                <p className="text-[11px] text-gray-400 mt-2">获取方式：腾讯云 EdgeOne 控制台 → Makers → Models → API Key → 创建（每月免费 50 万 token，够全站章节反复复检）。保存后 Key 存于账号偏好与本浏览器，写作页「番茄检测」面板将自动切换为朱雀官方检测。</p>
+              </div>
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4 flex-1">
                 {platformConfigs.map(function (platform) {
                   const colorMap: Record<string, { bg: string; border: string; text: string }> = {
@@ -2201,6 +2550,17 @@ export default function SettingsPage() {
                       </div>
                       {expanded && (
                         <div className="px-4 pb-4 space-y-2 border-t border-gray-200 pt-3">
+                          {/* 🔥 2026-10-18：按平台真实运营口径的详细检测标准 */}
+                          {Array.isArray((platform as Record<string, unknown>).criteria) && (
+                            <div className="text-xs bg-blue-50 border border-blue-100 rounded p-2">
+                              <span className="font-medium text-blue-700">🎯 平台检测维度：</span>
+                              <ul className="mt-1 space-y-1">
+                                {((platform as Record<string, unknown>).criteria as string[]).map(function (c, ci) {
+                                  return <li key={ci} className="text-gray-600">· {c}</li>
+                                })}
+                              </ul>
+                            </div>
+                          )}
                           {platform.compliance && (
                             <div className="text-xs bg-gray-100 rounded p-2">
                               <span className="font-medium text-gray-700">📋 内容合规：</span>
@@ -2376,6 +2736,17 @@ export default function SettingsPage() {
                 <Save className="w-4 h-4" /><span>{saveSuccess ? '已保存！' : '保存偏好设置'}</span>
               </button>
             </div>
+
+            {/* 🔥 2026-10-18：保存成功的页面级 Toast（应用户要求改为页面正中显示） */}
+            {saveSuccess && (
+              <div className="fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-[999] flex items-center gap-3 px-6 py-4 bg-green-600 text-white rounded-2xl shadow-2xl" role="status">
+                <Check className="w-6 h-6" />
+                <div>
+                  <p className="text-base font-bold">偏好设置已保存</p>
+                  <p className="text-sm text-green-100 mt-0.5">已同步应用到本机，续写/生成将自动使用新偏好</p>
+                </div>
+              </div>
+            )}
           </div>
         )}
 
@@ -2385,7 +2756,10 @@ export default function SettingsPage() {
         {/* 账户管理 */}
         {activeTab === 'account' && (
           <UserProfileCard
-            onLogout={function () { localStorage.removeItem('token'); localStorage.removeItem('user'); window.location.href = '/tuzhong-wenshu/login' }}
+            onLogout={function () {
+              // 修复 Bug#1：退出必须同时清 cookie（middleware 从 cookie 读登录态）
+              import('@/lib/auth-logout').then(function (m) { m.logoutAndGoHome() })
+            }}
             hideLogout
             onExportClick={function () { setExportModalOpen(true) }}
             onDeleteAccountClick={function () { setDeleteAcctModalOpen(true) }}
@@ -2427,6 +2801,9 @@ export default function SettingsPage() {
                   </optgroup>
                   <optgroup label="国内中转站·社区(仅测试)">
                     {['PackyAPI', '柏拉图 AI (bltcy)', '小爱中转 (xiaoai.plus)', 'Laozhang.ai', 'Apiyi', '88code', 'mnapi', '一步 API (yibuapi)', 'jiekou.ai', '0011.ai', 'Privnode'].map(function (p) { return <option key={p} value={p}>{p}</option> })}
+                  </optgroup>
+                  <optgroup label="中转平台·OpenVeer">
+                    {['OpenVeer'].map(function (p) { return <option key={p} value={p}>{p}</option> })}
                   </optgroup>
                   <optgroup label="自定义">
                     {['自定义中转 (OpenAI兼容)'].map(function (p) { return <option key={p} value={p}>{p}</option> })}
@@ -2486,11 +2863,31 @@ export default function SettingsPage() {
               </div>
               <div>
                 <label className="block text-sm font-medium text-gray-700 mb-1">API Key</label>
-                <input type="password" value={newModelForm.apiKey} onChange={function (e) { setNewModelForm({ provider: newModelForm.provider, apiKey: e.target.value, name: newModelForm.name, baseUrl: newModelForm.baseUrl, model: newModelForm.model }) }} className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 text-sm" placeholder="输入您的API Key" autoComplete="new-password" name="model-api-key-input" />
+                <input type="password" value={newModelForm.apiKey} onChange={function (e) { setNewModelForm({ provider: newModelForm.provider, apiKey: e.target.value, name: newModelForm.name, baseUrl: newModelForm.baseUrl, model: newModelForm.model }) }} className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 text-sm" placeholder="输入 API Key（支持多 Key：英文逗号分隔，系统自动轮询分摊配额）" autoComplete="new-password" name="model-api-key-input" />
               </div>
               <div>
                 <label className="block text-sm font-medium text-gray-700 mb-1">Base URL <span className="text-gray-400">(已自动填充，可修改)</span></label>
                 <input type="text" value={newModelForm.baseUrl} onChange={function (e) { setNewModelForm({ provider: newModelForm.provider, apiKey: newModelForm.apiKey, name: newModelForm.name, baseUrl: e.target.value, model: newModelForm.model }) }} className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 text-sm" placeholder="例如：https://api.openai.com/v1" autoComplete="off" name="model-base-url" />
+              </div>
+
+              {/* 🔥 2026-09-24：单个模型的调用频率限制（可选） */}
+              <div className="pt-1">
+                <label className="block text-sm font-medium text-gray-700 mb-1">调用频率限制（可选，留空表示不限制）</label>
+                <div className="grid grid-cols-3 gap-2">
+                  <div>
+                    <span className="text-xs text-gray-500">每分钟</span>
+                    <input type="number" min="0" value={newModelRateLimit.perMinute} onChange={function (e) { setNewModelRateLimit({ perMinute: e.target.value, perHour: newModelRateLimit.perHour, perDay: newModelRateLimit.perDay }) }} className="w-full px-2 py-1.5 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500" placeholder="如 10" />
+                  </div>
+                  <div>
+                    <span className="text-xs text-gray-500">每小时</span>
+                    <input type="number" min="0" value={newModelRateLimit.perHour} onChange={function (e) { setNewModelRateLimit({ perMinute: newModelRateLimit.perMinute, perHour: e.target.value, perDay: newModelRateLimit.perDay }) }} className="w-full px-2 py-1.5 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500" placeholder="如 100" />
+                  </div>
+                  <div>
+                    <span className="text-xs text-gray-500">每天</span>
+                    <input type="number" min="0" value={newModelRateLimit.perDay} onChange={function (e) { setNewModelRateLimit({ perMinute: newModelRateLimit.perMinute, perHour: newModelRateLimit.perHour, perDay: e.target.value }) }} className="w-full px-2 py-1.5 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500" placeholder="如 1200" />
+                  </div>
+                </div>
+                <p className="text-xs text-gray-400 mt-1">仅当模型带此配置时后端才会按模型限流（默认全局按 provider 限流已关闭）。</p>
               </div>
 
               <div className="flex space-x-3 pt-4">
@@ -2526,43 +2923,62 @@ export default function SettingsPage() {
         </div>
       )}
 
-      {/* 一键导入硅基7套永久免费弹窗 */}
+      {/* 一键导入硅基8套模型弹窗 */}
       {sfModalOpen && (
         <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
           <div className="bg-white rounded-2xl w-full max-w-lg mx-4 p-6">
             <div className="flex items-center justify-between mb-6">
-              <div className="flex items-center gap-2"><span className="text-2xl">🆓</span><h3 className="text-xl font-bold text-gray-900">一键导入硅基流动7套永久免费模型</h3></div>
-              <button onClick={function () { setSfModalOpen(false); setSiliconflowApiKeyInput('') }} className="p-2 hover:bg-gray-100 rounded-lg transition-colors"><X className="w-5 h-5 text-gray-500" /></button>
+              <div className="flex items-center gap-2"><span className="text-2xl">🆓</span><h3 className="text-xl font-bold text-gray-900">一键导入硅基流动8套模型</h3></div>
+              <button onClick={function () { setSfModalOpen(false); setSiliconflowApiKeyInput(''); setSfKeyInputs(['']) }} className="p-2 hover:bg-gray-100 rounded-lg transition-colors"><X className="w-5 h-5 text-gray-500" /></button>
             </div>
             <div className="space-y-4">
               <div className="bg-teal-50 rounded-xl border border-teal-100 p-4">
-                <p className="text-sm font-medium text-teal-800 mb-2">将自动添加以下7套硅基流动永久免费模型（9B及以下，成本为零）：</p>
-                <div className="space-y-2 max-h-48 overflow-y-auto pr-1">
-                  {modelPresetPool.filter(function (p) { return ['sf-qwen25-7b', 'sf-glm4-9b', 'sf-glmz1-9b', 'sf-qwen3-8b', 'sf-qwen35-4b', 'sf-hunyuan-7b', 'sf-kolors'].indexOf(p.id) !== -1 }).map(function (p) {
-                    return (
-                      <div key={p.id} className="flex items-center gap-2 text-sm text-teal-700">
-                        <span>{p.icon}</span><span className="font-medium">{p.name}</span>
-                        <span className="text-teal-500">—</span>
-                        <span className="font-mono text-xs">{p.model}</span>
-                      </div>
-                    )
-                  })}
-                </div>
+                <p className="text-sm font-medium text-teal-800 mb-2">请勾选要导入的硅基流动模型：<span className="text-teal-600">免费模型已默认勾选，按量计费的 DeepSeek-V4-Flash（开局分析用）需您手动勾选。</span></p>
+                {(() => {
+                  const sp = splitFreePaid(siliconflowPresetPool())
+                  return (<>
+                    {renderImportGroup(sp.free, false, sfSelectedPresets, setSfSelectedPresets)}
+                    {renderImportGroup(sp.paid, true, sfSelectedPresets, setSfSelectedPresets)}
+                  </>)
+                })()}
                 <p className="text-xs mt-3 text-teal-600">
-                  首选正文：Qwen2.5-7B｜大纲权谋：GLM-4-9B-0414｜权谋战争：GLM-Z1-9B｜备用正文：Qwen3-8B｜极速轻量：Qwen3.5-4B｜翻译润色：Hunyuan-MT-7B｜封面绘图：Kwai-Kolors（完全免费无限制）
+                  首选正文：Qwen2.5-7B｜大纲权谋：GLM-4-9B-0414｜权谋战争：GLM-Z1-9B｜备用正文：Qwen3-8B｜极速轻量：Qwen3.5-4B｜翻译润色：Hunyuan-MT-7B｜封面绘图：Kwai-Kolors（完全免费无限制）｜开局分析：DeepSeek-V4-Flash（按量计费）
                 </p>
               </div>
               <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">硅基流动 API Key <span className="text-red-500">*</span></label>
-                <input type="password" value={siliconflowApiKeyInput} onChange={function (e) { setSiliconflowApiKeyInput(e.target.value) }}
-                  className="w-full px-4 py-2.5 border border-gray-300 rounded-lg focus:ring-2 focus:ring-teal-500 focus:border-teal-500 text-sm"
-                  placeholder="输入您的硅基流动 API Key（7套永久免费模型共用）" />
+                <label className="block text-sm font-medium text-gray-700 mb-1">硅基流动 API Key（可填多个，自动轮询分摊配额）<span className="text-red-500">*</span></label>
+                                {(sfKeyInputs.length ? sfKeyInputs : ['']).map(function (kv: string, ki: number) {
+                  return (
+                    <div key={ki} className="flex gap-2 mb-2">
+                      <input type="password" value={kv}
+                        onChange={function (e) {
+                          const arr = sfKeyInputs.length ? sfKeyInputs.slice() : ['']
+                          arr[ki] = e.target.value
+                          setSfKeyInputs(arr)
+                          setSiliconflowApiKeyInput(arr.map(function (s: string) { return s.trim() }).filter(Boolean).join(','))
+                        }}
+                        className="flex-1 px-4 py-2.5 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 text-sm"
+                        placeholder={'硅基流动 API Key #' + (ki + 1)} />
+                      {sfKeyInputs.length > 1 && (
+                        <button type="button" onClick={function () {
+                          const arr = sfKeyInputs.slice(); arr.splice(ki, 1)
+                          setSfKeyInputs(arr)
+                          setSiliconflowApiKeyInput(arr.map(function (s: string) { return s.trim() }).filter(Boolean).join(','))
+                        }} className="px-3 text-gray-400 hover:text-red-500 text-lg leading-none">×</button>
+                      )}
+                    </div>
+                  )
+                })}
+                {(sfKeyInputs.length ? sfKeyInputs : ['']).length < 5 && (
+                  <button type="button" onClick={function () { setSfKeyInputs(sfKeyInputs.length ? sfKeyInputs.concat('') : ['', '']) }}
+                    className="text-xs text-indigo-600 hover:underline mb-1">+ 添加 Key（多个 Key 自动轮询分摊配额）</button>
+                )}
                 <p className="text-xs text-gray-500 mt-1">
                   还没有API Key？前往 <a href="https://cloud.siliconflow.cn" target="_blank" rel="noopener noreferrer" className="hover:underline text-teal-600">硅基流动控制台</a> 免费注册获取（9B以下模型永久免费，无需充值）
                 </p>
               </div>
               <div className="flex space-x-3 pt-2">
-                <button onClick={function () { setSfModalOpen(false); setSiliconflowApiKeyInput('') }} className="flex-1 px-4 py-2.5 border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 transition-colors">取消</button>
+                <button onClick={function () { setSfModalOpen(false); setSiliconflowApiKeyInput(''); setSfKeyInputs(['']) }} className="flex-1 px-4 py-2.5 border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 transition-colors">取消</button>
                 <button onClick={execImportSiliconflow} disabled={!siliconflowApiKeyInput.trim() || sfImportFlag}
                   className="flex-1 px-4 py-2.5 text-white rounded-lg transition-all disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2 bg-gradient-to-r from-cyan-600 to-teal-600 hover:from-cyan-700 hover:to-teal-700">
                   {sfImportFlag ? (
@@ -2583,37 +2999,50 @@ export default function SettingsPage() {
           <div className="bg-white rounded-2xl w-full max-w-lg mx-4 p-6">
             <div className="flex items-center justify-between mb-6">
               <div className="flex items-center gap-2"><span className="text-2xl">🧪</span><h3 className="text-xl font-bold text-gray-900">一键导入智谱3套永久免费模型</h3></div>
-              <button onClick={function () { setZhipuModalOpen(false); setZhipuApiKeyInput('') }} className="p-2 hover:bg-gray-100 rounded-lg transition-colors"><X className="w-5 h-5 text-gray-500" /></button>
+              <button onClick={function () { setZhipuModalOpen(false); setZhipuApiKeyInput(''); setZhipuKeyInputs(['']) }} className="p-2 hover:bg-gray-100 rounded-lg transition-colors"><X className="w-5 h-5 text-gray-500" /></button>
             </div>
             <div className="space-y-4">
               <div className="bg-indigo-50 rounded-xl border border-indigo-100 p-4">
-                <p className="text-sm font-medium text-indigo-800 mb-2">将自动添加以下3套智谱 BigModel 定价页显示免费模型：</p>
-                <div className="space-y-2 max-h-48 overflow-y-auto pr-1">
-                  {zhipuPresetPool.map(function (p) {
-                    return (
-                      <div key={p.id} className="flex items-center gap-2 text-sm text-indigo-700">
-                        <span>{p.icon}</span><span className="font-medium">{p.name}</span>
-                        <span className="text-indigo-500">—</span>
-                        <span className="font-mono text-xs">{p.model}</span>
-                      </div>
-                    )
-                  })}
-                </div>
+                <p className="text-sm font-medium text-indigo-800 mb-2">请勾选要导入的智谱模型（以下 3 套均为永久免费，已默认勾选）：</p>
+                {renderImportGroup(zhipuPresetPool, false, zpSelectedPresets, setZpSelectedPresets)}
                 <p className="text-xs mt-3 text-indigo-600">
                   超高速正文：GLM-4.7-Flash（200K上下文）｜推理规划：GLM-Z1-Flash｜综合全能：GLM-4-Flash（建议正文主力）
                 </p>
               </div>
               <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">智谱 BigModel API Key <span className="text-red-500">*</span></label>
-                <input type="password" value={zhipuApiKeyInput} onChange={function (e) { setZhipuApiKeyInput(e.target.value) }}
-                  className="w-full px-4 py-2.5 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 text-sm"
-                  placeholder="输入您的智谱 BigModel API Key（3套免费模型共用）" />
+                <label className="block text-sm font-medium text-gray-700 mb-1">智谱 BigModel API Key（可填多个，自动轮询分摊配额）<span className="text-red-500">*</span></label>
+                {(zhipuKeyInputs.length ? zhipuKeyInputs : ['']).map(function (kv: string, ki: number) {
+                  return (
+                    <div key={ki} className="flex gap-2 mb-2">
+                      <input type="password" value={kv}
+                        onChange={function (e) {
+                          const arr = zhipuKeyInputs.length ? zhipuKeyInputs.slice() : ['']
+                          arr[ki] = e.target.value
+                          setZhipuKeyInputs(arr)
+                          setZhipuApiKeyInput(arr.map(function (s: string) { return s.trim() }).filter(Boolean).join(','))
+                        }}
+                        className="flex-1 px-4 py-2.5 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 text-sm"
+                        placeholder={'智谱 API Key #' + (ki + 1)} />
+                      {zhipuKeyInputs.length > 1 && (
+                        <button type="button" onClick={function () {
+                          const arr = zhipuKeyInputs.slice(); arr.splice(ki, 1)
+                          setZhipuKeyInputs(arr)
+                          setZhipuApiKeyInput(arr.map(function (s: string) { return s.trim() }).filter(Boolean).join(','))
+                        }} className="px-3 text-gray-400 hover:text-red-500 text-lg leading-none">×</button>
+                      )}
+                    </div>
+                  )
+                })}
+                {(zhipuKeyInputs.length ? zhipuKeyInputs : ['']).length < 5 && (
+                  <button type="button" onClick={function () { setZhipuKeyInputs(zhipuKeyInputs.length ? zhipuKeyInputs.concat('') : ['', '']) }}
+                    className="text-xs text-indigo-600 hover:underline mb-1">+ 添加 Key（多个 Key 自动轮询分摊配额）</button>
+                )}
                 <p className="text-xs text-gray-500 mt-1">
-                  还没有API Key？前往 <a href="https://open.bigmodel.cn/" target="_blank" rel="noopener noreferrer" className="hover:underline text-indigo-600">智谱 BigModel 控制台</a> 免费注册获取
+                  还没有API Key？前往 <a href="https://open.bigmodel.cn/" target="_blank" rel="noopener noreferrer" className="hover:underline text-indigo-600">智谱 BigModel 控制台</a> 免费注册获取（每个账号一套免费 Key，多账号 Key 填入后自动轮询）
                 </p>
               </div>
               <div className="flex space-x-3 pt-2">
-                <button onClick={function () { setZhipuModalOpen(false); setZhipuApiKeyInput('') }} className="flex-1 px-4 py-2.5 border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 transition-colors">取消</button>
+                <button onClick={function () { setZhipuModalOpen(false); setZhipuApiKeyInput(''); setZhipuKeyInputs(['']) }} className="flex-1 px-4 py-2.5 border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 transition-colors">取消</button>
                 <button onClick={execImportZhipu} disabled={!zhipuApiKeyInput.trim() || zhipuImportFlag}
                   className="flex-1 px-4 py-2.5 text-white rounded-lg transition-all disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2 bg-gradient-to-r from-indigo-600 to-blue-600 hover:from-indigo-700 hover:to-blue-700">
                   {zhipuImportFlag ? (
@@ -2633,84 +3062,47 @@ export default function SettingsPage() {
         <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
           <div className="bg-white rounded-2xl w-full max-w-lg mx-4 p-6">
             <div className="flex items-center justify-between mb-6">
-              <div className="flex items-center gap-2"><span className="text-2xl">🔑</span><h3 className="text-xl font-bold text-gray-900">一键导入 {platformImportTarget} 免费模型</h3></div>
-              <button onClick={function () { setPlatformModalOpen(false); setPlatformApiKeyInput(''); setPlatformImportTarget(null) }} className="p-2 hover:bg-gray-100 rounded-lg transition-colors"><X className="w-5 h-5 text-gray-500" /></button>
+              <div className="flex items-center gap-2"><span className="text-2xl">🔑</span><h3 className="text-xl font-bold text-gray-900">一键导入 {platformImportTarget} 模型</h3></div>
+              <button onClick={function () { setPlatformModalOpen(false); setPlatformApiKeyInput(''); setPlatformRateLimit({ perMinute: '', perHour: '', perDay: '' }); setPlatformImportTarget(null) }} className="p-2 hover:bg-gray-100 rounded-lg transition-colors"><X className="w-5 h-5 text-gray-500" /></button>
             </div>
             <div className="space-y-4">
               <div className="bg-amber-50 rounded-xl border border-amber-100 p-4">
-                {platformImportTarget === 'OpenRouter' && (
-                  <>
-                    <p className="text-sm font-medium text-amber-800 mb-2">将自动为以下 {openrouterPresetPool.length} 个 OpenRouter 免费模型填入 Key 并启用：</p>
-                    <div className="space-y-2 max-h-48 overflow-y-auto pr-1">
-                      {openrouterPresetPool.map(function (p) {
-                        return (
-                          <div key={p.id} className="flex items-center gap-2 text-sm text-amber-700">
-                            <span>{p.icon}</span><span className="font-medium">{p.name}</span>
-                            <span className="text-amber-500">—</span>
-                            <span className="font-mono text-xs">{p.model}</span>
-                          </div>
-                        )
-                      })}
+                <p className="text-sm font-medium text-amber-800 mb-2">请勾选要导入的 {platformImportTarget} 模型：<span className="text-amber-600">免费模型已默认勾选，收费模型需您手动勾选。</span></p>
+                {(() => {
+                  const pp = splitFreePaid(platformPoolFor(platformImportTarget))
+                  return (<>
+                    {renderImportGroup(pp.free, false, platformSelectedPresets, setPlatformSelectedPresets)}
+                    {renderImportGroup(pp.paid, true, platformSelectedPresets, setPlatformSelectedPresets)}
+                  </>)
+                })()}
+                {platformImportTarget === 'OpenVeer' && (
+                  <div className="mt-3 pt-3 border-t border-amber-200">
+                    <p className="text-xs font-medium text-amber-800 mb-2">调用次数 / 频率限制（可选，留空则不限制）</p>
+                    <div className="grid grid-cols-3 gap-2">
+                      <div>
+                        <label className="block text-[11px] text-amber-700 mb-1">每分钟</label>
+                        <input type="number" min="0" value={platformRateLimit.perMinute} onChange={function (e) { setPlatformRateLimit({ perMinute: e.target.value, perHour: platformRateLimit.perHour, perDay: platformRateLimit.perDay }) }} className="w-full px-2 py-1.5 border border-amber-300 rounded-lg text-sm focus:ring-2 focus:ring-amber-500" placeholder="如 10" />
+                      </div>
+                      <div>
+                        <label className="block text-[11px] text-amber-700 mb-1">每小时</label>
+                        <input type="number" min="0" value={platformRateLimit.perHour} onChange={function (e) { setPlatformRateLimit({ perMinute: platformRateLimit.perMinute, perHour: e.target.value, perDay: platformRateLimit.perDay }) }} className="w-full px-2 py-1.5 border border-amber-300 rounded-lg text-sm focus:ring-2 focus:ring-amber-500" placeholder="如 100" />
+                      </div>
+                      <div>
+                        <label className="block text-[11px] text-amber-700 mb-1">每天</label>
+                        <input type="number" min="0" value={platformRateLimit.perDay} onChange={function (e) { setPlatformRateLimit({ perMinute: platformRateLimit.perMinute, perHour: platformRateLimit.perHour, perDay: e.target.value }) }} className="w-full px-2 py-1.5 border border-amber-300 rounded-lg text-sm focus:ring-2 focus:ring-amber-500" placeholder="如 1200" />
+                      </div>
                     </div>
-                  </>
-                )}
-                {platformImportTarget === 'Groq' && (
-                  <>
-                    <p className="text-sm font-medium text-amber-800 mb-2">将自动为以下 {groqPresetPool.length} 个 Groq 免费模型填入 Key 并启用：</p>
-                    <div className="space-y-2 max-h-48 overflow-y-auto pr-1">
-                      {groqPresetPool.map(function (p) {
-                        return (
-                          <div key={p.id} className="flex items-center gap-2 text-sm text-amber-700">
-                            <span>{p.icon}</span><span className="font-medium">{p.name}</span>
-                            <span className="text-amber-500">—</span>
-                            <span className="font-mono text-xs">{p.model}</span>
-                          </div>
-                        )
-                      })}
-                    </div>
-                  </>
-                )}
-                {platformImportTarget === '腾讯混元' && (
-                  <>
-                    <p className="text-sm font-medium text-amber-800 mb-2">将自动为以下 {hunyuanPresetPool.length} 个腾讯混元免费模型填入 Key 并启用：</p>
-                    <div className="space-y-2 max-h-48 overflow-y-auto pr-1">
-                      {hunyuanPresetPool.map(function (p) {
-                        return (
-                          <div key={p.id} className="flex items-center gap-2 text-sm text-amber-700">
-                            <span>{p.icon}</span><span className="font-medium">{p.name}</span>
-                            <span className="text-amber-500">—</span>
-                            <span className="font-mono text-xs">{p.model}</span>
-                          </div>
-                        )
-                      })}
-                    </div>
-                  </>
-                )}
-                {platformImportTarget === '商汤 (SenseTime)' && (
-                  <>
-                    <p className="text-sm font-medium text-amber-800 mb-2">将自动为以下 {sensenovaPresetPool.length} 个商汤日日新模型填入 Key 并启用：</p>
-                    <div className="space-y-2 max-h-48 overflow-y-auto pr-1">
-                      {sensenovaPresetPool.map(function (p) {
-                        return (
-                          <div key={p.id} className="flex items-center gap-2 text-sm text-amber-700">
-                            <span>{p.icon}</span><span className="font-medium">{p.name}</span>
-                            <span className="text-amber-500">—</span>
-                            <span className="font-mono text-xs">{p.model}</span>
-                          </div>
-                        )
-                      })}
-                    </div>
-                  </>
+                  </div>
                 )}
               </div>
               <div>
                 <label className="block text-sm font-medium text-gray-700 mb-1">{platformImportTarget} API Key <span className="text-red-500">*</span></label>
                 <input type="password" value={platformApiKeyInput} onChange={function (e) { setPlatformApiKeyInput(e.target.value) }}
                   className="w-full px-4 py-2.5 border border-gray-300 rounded-lg focus:ring-2 focus:ring-amber-500 focus:border-amber-500 text-sm"
-                  placeholder={'输入您的 ' + platformImportTarget + ' API Key（该平台免费模型共用）'} />
+                  placeholder={'输入您的 ' + platformImportTarget + ' API Key（该平台所选模型共用）'} />
               </div>
               <div className="flex space-x-3 pt-2">
-                <button onClick={function () { setPlatformModalOpen(false); setPlatformApiKeyInput(''); setPlatformImportTarget(null) }} className="flex-1 px-4 py-2.5 border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 transition-colors">取消</button>
+                <button onClick={function () { setPlatformModalOpen(false); setPlatformApiKeyInput(''); setPlatformRateLimit({ perMinute: '', perHour: '', perDay: '' }); setPlatformImportTarget(null) }} className="flex-1 px-4 py-2.5 border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 transition-colors">取消</button>
                 <button onClick={execImportPlatformPresets} disabled={!platformApiKeyInput.trim() || platformImportFlag}
                   className="flex-1 px-4 py-2.5 text-white rounded-lg transition-all disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2 bg-gradient-to-r from-orange-600 to-amber-600 hover:from-orange-700 hover:to-amber-700">
                   {platformImportFlag ? (

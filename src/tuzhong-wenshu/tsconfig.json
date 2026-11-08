@@ -35,14 +35,20 @@
     ".next/types/**/*.ts",
     ".next/dev/types/**/*.ts",
     "**/*.mts",
-    ".next2/types/**/*.ts",
-    ".next2/dev/types/**/*.ts",
-    ".next3/types/**/*.ts",
-    ".next3/dev/types/**/*.ts",
-    ".next4/types/**/*.ts",
-    ".next4/dev/types/**/*.ts",
-    ".nextdev/types/**/*.ts",
-    ".nextdev/dev/types/**/*.ts"
+    ".next-verify/types/**/*.ts",
+    ".next-verify/dev/types/**/*.ts",
+    ".next-verify2/types/**/*.ts",
+    ".next-verify2/dev/types/**/*.ts",
+    ".next-verify3/types/**/*.ts",
+    ".next-verify3/dev/types/**/*.ts",
+    ".next-verify4/types/**/*.ts",
+    ".next-verify4/dev/types/**/*.ts",
+    ".next-verify5/types/**/*.ts",
+    ".next-verify5/dev/types/**/*.ts",
+    ".next-verify6/types/**/*.ts",
+    ".next-verify6/dev/types/**/*.ts",
+    ".next-verify7/types/**/*.ts",
+    ".next-verify7/dev/types/**/*.ts"
   ],
   "exclude": [
     "node_modules"

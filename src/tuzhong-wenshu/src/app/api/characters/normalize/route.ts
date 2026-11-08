@@ -3,30 +3,10 @@ import { getRequestActor } from '@/lib/permissions'
 import { normalizeCharactersTitlesAndRoles, dedupeCharactersByName, isTitleLike } from '@/lib/character-normalize'
 import { applyHistoricalTitles, isKnownHistoricalFigure, lookupTitlesOnline, isHistoricalGenre } from '@/lib/historical-titles'
 import { callLLMWithFallback, extractJSONFromText, type LLMConfig } from '@/lib/ai/llm'
+import { loadDefaultLlmConfig } from '@/lib/ai/model-config'
 
 export const runtime = 'nodejs'
 export const maxDuration = 180
-
-/** 读取 models.json 里管理员默认模型（与 ai-generate 同一策略：default 优先，无 key 则取首个有效 key） */
-function loadDefaultLlmConfig(): LLMConfig | null {
-  try {
-    const fs = require('fs')
-    const pathMod = require('path')
-    const p = pathMod.join(process.cwd(), '.tuzhong-data', 'models.json')
-    if (!fs.existsSync(p)) return null
-    const list = JSON.parse(fs.readFileSync(p, 'utf-8'))
-    const hasKey = function (m: any) { return m && m.apiKey && !String(m.apiKey).includes('*') }
-    const arr = Array.isArray(list) ? list : []
-    const picked = arr.find(function (m: any) { return m && m.status === 'default' && hasKey(m) }) || arr.find(hasKey)
-    if (!picked || !picked.model) return null
-    return {
-      provider: picked.provider || '硅基流动',
-      apiKey: String(picked.apiKey).replace(/[`'"]/g, '').trim(),
-      baseUrl: String(picked.baseUrl || 'https://api.siliconflow.cn/v1').replace(/[`'"]/g, '').trim(),
-      model: String(picked.model),
-    }
-  } catch (_e) { return null }
-}
 
 /**
  * 徽章兜底补全：规范化后仍拿不到合法头衔的角色（"大西军将领"这类群体描述被拒后徽章为空），
@@ -82,7 +62,7 @@ async function backfillTitles(llm: LLMConfig, pending: Array<{ name: string; cam
       const candidates = [rawStr, String(rawStr || '').replace(/,\s*([}\]])/g, '$1'), String(rawStr || '').replace(/'/g, '"')]
       for (const cand of candidates) {
         if (!cand || typeof cand !== 'string') continue
-        try { parsed = JSON.parse(cand); break } catch (_e) { /* 试下一种容错 */ }
+        try { parsed = JSON.parse(cand); break } catch (_e) { console.error('[characters/normalize] JSON容错解析一种候选失败，尝试下一种:', _e) }
       }
       if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
         Object.keys(parsed).forEach(function (k) {

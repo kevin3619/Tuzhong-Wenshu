@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { prisma } from '@/lib/prisma'
 import { verifyAdmin } from '@/lib/permissions'
+import { countActiveVipUsers } from '@/lib/vip'
 
 export async function GET(request: NextRequest) {
   const admin = await verifyAdmin(request)
@@ -8,11 +9,7 @@ export async function GET(request: NextRequest) {
 
   try {
     const totalUsers = await prisma.user.count()
-    const vipUsers = await prisma.user.count({
-      where: { subscriptionTier: 'pro', subscriptionExpiresAt: { not: null },
-        // subscriptionExpiresAt > now (not supported in SQLite Prisma well, so we check in JS)
-      },
-    })
+    const vipUsers = await countActiveVipUsers(prisma)
     const totalNovels = await prisma.novel.count()
     const todayStart = new Date()
     todayStart.setHours(0, 0, 0, 0)

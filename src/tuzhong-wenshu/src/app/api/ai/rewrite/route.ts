@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server'
 import { callLLMWithFallback, type LLMConfig, type LLMMessage } from '@/lib/ai/llm'
 import { resolveLLMConfig } from '@/lib/resolve-llm-config'
 import { verifyToken } from '@/lib/auth'
+import { guardAiEndpoint, chargeAiUsage } from '@/lib/quota'
 
 const DEFAULT_DE_AI_PROMPT = `
 【去AI化写作要求 - 默认始终生效】：
@@ -704,7 +705,22 @@ export async function POST(request: Request) {
       }
     } catch (_e) {}
 
-    const resolvedCfg = llmConfig ? resolveLLMConfig(llmConfig as any, userId, 'polish') : null
+    // 🔥 修复（P1 计量缺失）：AI 接口此前不限频、不计额，注册即可无限调用；
+    //   dailyQuotaUsed/dailyQuotaLimit/ai_daily_free_quota 全仓零写入零校验。
+    { const _g = await guardAiEndpoint(request, 'rewrite', userId || null, false, 1)
+      if (!_g.ok) return NextResponse.json({ error: _g.message, code: _g.status }, { status: _g.status })
+      await chargeAiUsage(_g.userId, false, 1) }
+
+    let resolvedCfg: any = llmConfig ? resolveLLMConfig(llmConfig as any, userId, 'polish') : null
+    // 🔥 修复：客户端不再被要求携带平台 Key（那是泄漏面）。按用户/步骤没匹配上时，
+    //   再兜底一次 models.json 里的默认可用模型，让未自配 Key 的用户也能用平台默认模型。
+    if ((!resolvedCfg || !resolvedCfg.apiKey)) {
+      try {
+        const { loadDefaultLlmConfig } = require('@/lib/ai/model-config')
+        const _def = loadDefaultLlmConfig()
+        if (_def && _def.apiKey) resolvedCfg = { ...(_def as any), ...(resolvedCfg && resolvedCfg.apiKey ? resolvedCfg : {}) }
+      } catch (e) { console.error('[ai/polish] 兜底默认模型失败:', e) }
+    }
     if (!resolvedCfg || !resolvedCfg.apiKey) {
       return NextResponse.json(
         { error: '缺少必要参数：llmConfig（需要包含有效的 apiKey）' },

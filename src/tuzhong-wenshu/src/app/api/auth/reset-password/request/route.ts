@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { prisma } from '@/lib/prisma'
 import { createToken, verifyToken, hashPassword } from '@/lib/auth'
 import { randomBytes } from 'crypto'
+import { getMailConfig, sendPasswordResetEmail } from '@/lib/email'
 
 // 密码重置token存储（使用内存map + DB持久化）
 interface ResetTokenStore {
@@ -78,61 +79,45 @@ export async function POST(request: NextRequest) {
           updatedAt: new Date().toISOString(),
         },
       })
-    } catch (_e) { /* ignore */ }
+    } catch (_e) { console.error('[reset-password] 创建重置token失败:', _e) }
 
     // 构建重置链接
     const origin = request.nextUrl.origin || 'http://localhost:3000'
-    const resetLink = `${origin}/tuzhong-wenshu/reset-password?token=${resetToken}`
+    // 🔥 修复：此前链接指向 /reset-password，但该页面不存在（只有 /forgot-password），
+    //   用户点邮件链接必然 404；现指向真实存在的页面。
+    const resetLink = `${origin}/tuzhong-wenshu/forgot-password?token=${resetToken}`
 
     // 检查是否配置了邮件服务
     const mailConfig = await getMailConfig()
-    const isDemoMode = !mailConfig || !mailConfig.host
+    const isDemoMode = !mailConfig
 
     if (!isDemoMode) {
-      // TODO: 实现邮件发送
-      // 当邮件服务配置完成后，在这里发送邮件
-      console.log('[密码重置] 邮件发送功能待实现，重置链接:', resetLink)
+      const sent = await sendPasswordResetEmail(user.email, resetLink)
+      if (sent.ok) {
+        console.log('[密码重置] 重置邮件已发送至', user.email)
+      } else {
+        // 发送失败（SMTP 不可用/凭据错误）不阻断流程：链接回退进服务器日志，管理员可检索
+        console.error('[密码重置] 邮件发送失败，回退到日志。错误:', sent.error)
+        console.log('[密码重置] 重置链接:', resetLink)
+      }
     } else {
-      console.log('[密码重置] 演示模式，重置链接:', resetLink)
+      console.log('[密码重置] 演示模式（未配置 SMTP），重置链接:', resetLink)
     }
 
     return NextResponse.json({
       code: 200,
+      // 🔥 安全修复：响应体绝不下发 resetLink（此前演示模式把重置链接返回给任何知道邮箱的访客，
+      //   等于开放任意账号接管）。链接只进服务器日志；管理员在服务器 shell 找 reset_token_ 前缀的 key。
       message: isDemoMode
         ? '演示模式：重置链接已生成（请查看服务器日志）'
         : '如果该邮箱已注册，重置链接将发送到邮箱',
       data: {
         demoMode: isDemoMode,
-        resetLink: isDemoMode ? resetLink : undefined,
       },
     })
   } catch (error) {
     console.error('密码重置请求失败:', error)
     return NextResponse.json({ code: 500, message: '服务器错误' }, { status: 500 })
-  }
-}
-
-// 获取邮件配置
-async function getMailConfig(): Promise<{ host?: string; port?: number; user?: string; pass?: string } | null> {
-  try {
-    const configs = await prisma.systemConfig.findMany({
-      where: { configKey: { in: ['mail_host', 'mail_port', 'mail_user', 'mail_pass'] } },
-    })
-    const cfgMap: Record<string, string> = {}
-    for (const cfg of configs) {
-      cfgMap[cfg.configKey] = cfg.configValue || ''
-    }
-    if (cfgMap.mail_host) {
-      return {
-        host: cfgMap.mail_host,
-        port: parseInt(cfgMap.mail_port || '587'),
-        user: cfgMap.mail_user,
-        pass: cfgMap.mail_pass,
-      }
-    }
-    return null
-  } catch {
-    return null
   }
 }
 
@@ -168,7 +153,7 @@ export async function GET(request: NextRequest) {
             resetTokenMap.set(token, tokenStore)
           }
         }
-      } catch (_e) { /* ignore */ }
+      } catch (_e) { console.error('[reset-password] 解析重置token存储失败:', _e) }
     }
 
     if (!tokenStore) {
@@ -180,7 +165,7 @@ export async function GET(request: NextRequest) {
       resetTokenMap.delete(token)
       try {
         await prisma.systemConfig.delete({ where: { configKey: `reset_token_${token}` } })
-      } catch (_e) { /* ignore */ }
+      } catch (_e) { console.error('[reset-password] 清理过期重置token失败:', _e) }
       return NextResponse.json({ code: 400, message: '重置链接已过期' }, { status: 400 })
     }
 
@@ -208,7 +193,7 @@ export async function DELETE(request: NextRequest) {
     resetTokenMap.delete(token)
     try {
       await prisma.systemConfig.delete({ where: { configKey: `reset_token_${token}` } })
-    } catch (_e) { /* ignore */ }
+    } catch (_e) { console.error('[reset-password] 撤销删除重置token失败:', _e) }
 
     return NextResponse.json({ code: 200, message: '重置已撤销' })
   } catch {

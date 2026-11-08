@@ -1,9 +1,10 @@
 'use client'
 
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { Trash2 } from 'lucide-react'
 import { extractText } from '@/lib/text-utils'
 import type { GeneratedData } from '../ai-generate-wizard'
+import { autoResize } from '@/hooks/useAutoResize'
 
 interface CharacterData {
   name?: string
@@ -75,11 +76,6 @@ function CharacterCard({ character, role, roleLabel, roleColor, onChange, onDele
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [character && character.role])
 
-  const autoResize = function(e: React.FormEvent<HTMLTextAreaElement>) {
-    const ta = e.currentTarget
-    ta.style.height = 'auto'
-    ta.style.height = ta.scrollHeight + 'px'
-  }
 
   useEffect(function() {
     const timer = setTimeout(function() {
@@ -131,7 +127,7 @@ function CharacterCard({ character, role, roleLabel, roleColor, onChange, onDele
     supporting: '配角', '女配': '女配', '后宫': '后宫', '红颜': '红颜',
     neutral: '中立', mentor: '师父/导师', rival: '竞争对手',
     'supervillain': '大反派/终极Boss', 'camero': '路人/龙套',
-    '朋友': '朋友/挚友', '恋人': '恋人', '青梅竹马': '青梅竹马',
+    '恋人': '恋人', '青梅竹马': '青梅竹马',
     '死党': '死党', '搭档': '搭档/伙伴',
     '兄弟': '兄弟', '姐妹': '姐妹', '长辈': '长辈',
     '幕后黑手': '幕后黑手', '宿敌': '宿敌', '背叛者': '背叛者', '野心家': '野心家',
@@ -338,6 +334,11 @@ function CharacterCard({ character, role, roleLabel, roleColor, onChange, onDele
     if (field === 'arcNodes') {
       const nodes = Array.isArray(value) ? (value as Array<{ stage?: string; event?: string; change?: string; powerLevel?: string }>) : []
       return onChange({ ...character, arcNodes: dedupeArcNodes(nodes) } as CharacterData)
+    }
+    // 🔥 #219：用户手动修改「角色定位」时置 roleConfirmed=true——服务端 normalize 尊重该权威定位、
+    //   粘性守卫对「旧标签页无 roleConfirmed 的回写」保服务端值，用户的新选择以 confirmed+新值放行
+    if (field === 'role') {
+      return onChange({ ...character, role: value, rolePosition: value, roleConfirmed: true } as CharacterData)
     }
     onChange({ ...character, [field]: value } as CharacterData)
   }
@@ -1222,11 +1223,48 @@ export default function StepCharacters({
       setNormalizing(false)
     }
   }
-  const autoResize = function(e: React.FormEvent<HTMLTextAreaElement>) {
-    const ta = e.currentTarget
-    ta.style.height = 'auto'
-    ta.style.height = ta.scrollHeight + 'px'
-  }
+  // 🔥 QA-徽章前置自动校正：角色数据就绪后自动执行一次与「一键校正」同接口的校正，无需用户手点；
+  //   按钮保留为最终补救。以「主角名+各数组长度」为签名去重，生成中（isGenerating）不触发，避免与分批写入竞态。
+  const _autoNormSigRef = useRef<string>('')
+  useEffect(function() {
+    if (isGenerating) return
+    if (!data || !data.protagonist || !data.protagonist.name) return
+    var _fl = (data as any).femaleLeads && Array.isArray((data as any).femaleLeads) ? (data as any).femaleLeads : []
+    var _sup = (data as any).supportingCharacters || []
+    var _ant = (data as any).antagonists || []
+    var _vil = (data as any).villains || []
+    if (_sup.length + _ant.length + _vil.length + _fl.length < 1) return
+    var sig = [
+      data.protagonist.name || '',
+      (_fl[0] && _fl[0].name) || '',
+      (data as any).femaleLead && (data as any).femaleLead.name || '',
+      _fl.length, _sup.length, _ant.length, _vil.length,
+    ].join('#')
+    if (_autoNormSigRef.current === sig) return
+    _autoNormSigRef.current = sig
+    var _aborted = false
+    var _done = false
+    ;(async function() {
+      try {
+        const res = await fetch('/tuzhong-wenshu/api/characters/normalize', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + (typeof localStorage !== 'undefined' ? (localStorage.getItem('token') || '') : '') },
+          body: JSON.stringify({ characters: data, detailedDesignInput: detailedDesignInput || '', genre: genre || '', keywords: keywords || '' }),
+        })
+        const json = await res.json()
+        if (_aborted) return
+        _done = true
+        if (res.ok && json && json.success === true && json.data && json.data.characters) {
+          var changed: Array<{ name: string; field: string; from: string; to: string }> = json.data.changed || []
+          if (changed.length > 0) {
+            onChange(json.data.characters)
+            setNormalizeMsg('✅ 已自动校正徽章与定位 ' + changed.length + ' 处：' + changed.slice(0, 4).map(function (c) { return c.name + '·' + c.field }).join('，') + (changed.length > 4 ? ' 等' : ''))
+          }
+        }
+      } catch (e) { console.error('[StepCharacters] 自动校正徽章与定位失败（按钮仍可手动补救）:', e) }
+    })()
+    return function() { _aborted = true; if (!_done) _autoNormSigRef.current = '' }
+  }, [data, isGenerating])
 
   useEffect(function() {
     const timer = setTimeout(function() {
@@ -1302,6 +1340,45 @@ export default function StepCharacters({
       </div>
     )
   }
+
+  // 🔥 任务#16（2026-09-17）：反派区从「只渲染单数 antagonist」改为「遍历渲染全部 antagonists[]」。
+  //   生产实测：antagonists[] = [吴三桂(34), 多尔衮(34), 孙可望(21)] 三张完整卡，但旧实现只渲染 data.antagonist(吴三桂)，
+  //   导致 多尔衮/孙可望 有数据却不在 DOM（QA 真渲 多尔衮===null）。用户明确要求：全部反派都要渲染出来。
+  //   兼容：antagonists[] 为空但单数 antagonist 有值时仍渲染（不回归）；两者同名时按名字去重，避免同一角色渲染两次。
+  //   srcIdx = 该卡在 antagonists[] 中的下标（写回目标）；-1 = 来自单数 antagonist 的兜底卡。
+  const _antagonistItems: Array<{ char: CharacterData; srcIdx: number }> = (function () {
+    const items: Array<{ char: CharacterData; srcIdx: number }> = []
+    const seen: Record<string, boolean> = {}
+    const _ants: CharacterData[] = Array.isArray((data as any).antagonists) ? ((data as any).antagonists as CharacterData[]) : []
+    for (let _ai = 0; _ai < _ants.length; _ai++) {
+      const c = _ants[_ai]
+      if (!c) continue
+      const nm = (typeof c.name === 'string') ? c.name.trim() : ''
+      if (!nm) continue        // 与配角卡一致：无 name 的空槽位不渲染
+      if (seen[nm]) continue   // 按名字去重（同名角色只渲染一次）
+      seen[nm] = true
+      items.push({ char: c, srcIdx: _ai })
+    }
+    // 兼容单数 antagonist：antagonists[] 为空、或未包含该 name 时补渲染一张兜底卡
+    const _single = data?.antagonist as CharacterData | undefined
+    if (_single) {
+      const _nm = (typeof _single.name === 'string') ? _single.name.trim() : ''
+      if (_nm && !seen[_nm]) { seen[_nm] = true; items.push({ char: _single, srcIdx: -1 }) }
+    }
+    return items
+  })()
+  // 🔥 #16：配角区按名字去重——normalizeCharactersData 会把 antagonists[1:] 也并入 supporting，
+  //   若不在配角区跳过这些名字，同一反派会同时以「反派卡」与「配角卡」渲染两次。
+  const _renderedTopNames: Record<string, boolean> = {}
+  ;(function () {
+    const _mark = function (c: CharacterData | undefined) {
+      const nm = c && typeof c.name === 'string' ? c.name.trim() : ''
+      if (nm) _renderedTopNames[nm] = true
+    }
+    _mark(data?.protagonist as CharacterData | undefined)
+    _mark(data?.femaleLead as CharacterData | undefined)
+    _antagonistItems.forEach(function (it) { _mark(it.char) })
+  })()
 
   return (
     <div className="space-y-6">
@@ -1406,14 +1483,33 @@ export default function StepCharacters({
           onChange={(updated) => onChange({ ...data, femaleLead: updated })}
         />
 
-        {/* 反派卡片 */}
-        <CharacterCard
-          character={data?.antagonist}
-          role="antagonist"
-          roleLabel="反派"
-          roleColor="red"
-          onChange={(updated) => onChange({ ...data, antagonist: updated })}
-        />
+        {/* 反派卡片：遍历渲染全部 antagonists[]（任务#16）；antagonists[] 为空时回退单数 antagonist。
+            编辑字段写回 antagonists[srcIdx]（权威存储），并令单数 antagonist 与 antagonists[0] 保持同步。 */}
+        {_antagonistItems.map(function (it, i) {
+          return (
+            <CharacterCard
+              key={'antagonist-' + (it.srcIdx >= 0 ? it.srcIdx : 'single') + '-' + (it.char.name || i)}
+              character={it.char}
+              role="antagonist"
+              roleLabel="反派"
+              roleColor="red"
+              onChange={(updated) => {
+                if (it.srcIdx >= 0) {
+                  // 🔥 #16：写回 antagonists[srcIdx]，而不是写回单数 antagonist
+                  const _ants = Array.isArray((data as any).antagonists) ? ((data as any).antagonists as CharacterData[]).slice() : []
+                  _ants[it.srcIdx] = updated
+                  const _next: any = { ...data, antagonists: _ants }
+                  // 单数 antagonist 恒等于 antagonists[0]（下游环节读取单数时保持一致）
+                  if (it.srcIdx === 0) _next.antagonist = updated
+                  onChange(_next)
+                } else {
+                  // 单数兜底卡：直接写回 antagonist
+                  onChange({ ...data, antagonist: updated })
+                }
+              }}
+            />
+          )
+        })}
 
         {/* 其他角色卡片 */}
         {data?.supporting?.map((char, index: number) => {
@@ -1425,6 +1521,8 @@ export default function StepCharacters({
           if (!char) return null
           var _charName = (char && typeof char.name === 'string') ? char.name.trim() : ''
           if (!_charName) return null
+          // 🔥 #16：跳过已在 主角/女主/反派 区渲染过的同名角色，保证同一角色只渲染一次（不重复）
+          if (_renderedTopNames[_charName]) return null
           const isExtraFL = /^女主\d+$/.test(char.role || '')
           const isVillain = char && /反派|antagonist|villain/i.test(char.role || '')
           const cardColor: 'blue' | 'red' | 'pink' | 'green' | 'gray' | 'purple' = isExtraFL ? 'pink' : (isVillain ? 'red' : 'gray')

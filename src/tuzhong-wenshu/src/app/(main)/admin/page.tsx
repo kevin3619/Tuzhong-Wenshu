@@ -240,7 +240,8 @@ function AdminPageContent() {
     if (!t) return null
     if (/^\d+$/.test(t)) {
       let num = Number(t)
-      if (num > 1e12) num = num
+      // 🔥 Bug修复：秒级时间戳（≤1e12）此前被当毫秒解析成 1970 年（原 if 分支是 no-op）
+      if (num > 0 && num <= 1e12) num = num * 1000
       const dd = new Date(num)
       if (!isNaN(dd.getTime())) return dd
     }
@@ -503,7 +504,7 @@ function AdminPageContent() {
           for (let j = 0; j < wpKeys.length; j++) { const k = wpKeys[j]; wp[k] = String(respBody.data[k] || '') }
           setWechatPaySetup(wp)
         }
-      }).catch(function () {})
+      }).catch(function (err) { console.error('[admin] 加载微信支付配置失败:', err) })
   }
 
   function pullUserBatch() {
@@ -539,7 +540,7 @@ function AdminPageContent() {
       .then(function (respBody) {
         if (respBody && respBody.success) setDashboardMetrics(respBody.data)
       })
-      .catch(function () {})
+      .catch(function (err) { console.error('[admin] 加载仪表盘指标失败:', err) })
   }
 
   function execRemoveLogo() {
@@ -656,11 +657,15 @@ function AdminPageContent() {
       method: 'POST',
       headers: { Authorization: 'Bearer ' + authToken, 'Content-Type': 'application/json' },
       body: JSON.stringify(sysParamStore)
-    }).then(function () {
-      setLoadProcessFlag(false)
-      alert('系统设置已保存')
-      pullSysConfig()
-    }).catch(function () { setLoadProcessFlag(false); alert('保存失败') })
+    })
+      .then(function (r) { return r.json() })
+      .then(function (b) {
+        setLoadProcessFlag(false)
+        // 🔥 Bug修复：此前不解析响应，保存失败也弹「已保存」
+        if (b && (b.success || b.code === 200)) { alert('系统设置已保存'); pullSysConfig() }
+        else { alert('保存失败：' + (b && (b.message || b.error) || '未知错误')) }
+      })
+      .catch(function () { setLoadProcessFlag(false); alert('保存失败') })
   }
 
   function execCertUpload(e: React.ChangeEvent<HTMLInputElement>) {
@@ -719,7 +724,14 @@ function AdminPageContent() {
       method: 'PATCH',
       headers: { Authorization: 'Bearer ' + authToken, 'Content-Type': 'application/json' },
       body: JSON.stringify({ status: currentStatus === 1 ? 0 : 1 })
-    }).then(function () { pullUserBatch() }).catch(function () { alert('操作失败') })
+    })
+      .then(function (r) { return r.json().catch(function () { return null }) })
+      // 🔥 Bug修复：此前不解析响应，封禁失败也静默刷新列表
+      .then(function (b) {
+        if (b && (b.success || b.code === 200 || b.data)) { pullUserBatch() }
+        else { pullUserBatch(); alert('操作可能未生效：' + (b && (b.message || b.error) || '请稍后重试')) }
+      })
+      .catch(function () { alert('操作失败') })
   }
 
   function execDeleteUser(userId: string, isAdmin: boolean, nickname: string) {

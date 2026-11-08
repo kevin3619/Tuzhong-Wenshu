@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { QRCodeCanvas } from 'qrcode.react'
 import { Crown, Check, Loader2, Clock, QrCode, RefreshCw } from 'lucide-react'
 import Link from 'next/link'
@@ -102,9 +102,9 @@ export default function VipPage() {
   const _wechatPayOrderNo = useState('')
   const wechatPayOrderNo = _wechatPayOrderNo[0]
   const setWechatPayOrderNo = _wechatPayOrderNo[1]
-  const _wechatPollInterval = useState<NodeJS.Timeout | null>(null)
-  const wechatPollInterval = _wechatPollInterval[0]
-  const setWechatPollInterval = _wechatPollInterval[1]
+  // 🔥 Bug修复：定时器句柄必须用 useRef——useState 存句柄会让闭包拿到旧值（null），
+  //   导致支付成功后 clearInterval 停不掉真实 interval（持续轮询+重复提示），且重复发起支付会叠加 interval
+  const wechatPollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
   // 订单倒计时
   const _orderExpireAt = useState<string>('')
@@ -113,16 +113,14 @@ export default function VipPage() {
   const _orderCountdown = useState(0)
   const orderCountdown = _orderCountdown[0]
   const setOrderCountdown = _orderCountdown[1]
-  const _orderCountdownTimer = useState<ReturnType<typeof setInterval> | null>(null)
-  const orderCountdownTimer = _orderCountdownTimer[0]
-  const setOrderCountdownTimer = _orderCountdownTimer[1]
+  const orderCountdownTimerRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
   useEffect(function () {
     pullSysConfig()
     pullPayRecords()
     return function () {
-      if (wechatPollInterval) clearInterval(wechatPollInterval)
-      if (orderCountdownTimer) clearInterval(orderCountdownTimer)
+      if (wechatPollIntervalRef.current) clearInterval(wechatPollIntervalRef.current)
+      if (orderCountdownTimerRef.current) clearInterval(orderCountdownTimerRef.current)
     }
   }, [])
 
@@ -136,15 +134,16 @@ export default function VipPage() {
       const remain = Math.floor((new Date(orderExpireAt).getTime() - Date.now()) / 1000)
       if (remain <= 0) {
         setOrderCountdown(0)
-        if (orderCountdownTimer) clearInterval(orderCountdownTimer)
+        // 🔥 Bug修复：直接清本闭包创建的 timer（此前读 stale state 清不掉）
+        if (timer) clearInterval(timer)
       } else {
         setOrderCountdown(remain)
       }
     }
     updateCountdown()
     const timer = setInterval(updateCountdown, 1000)
-    setOrderCountdownTimer(timer)
-    return function () { clearInterval(timer) }
+    orderCountdownTimerRef.current = timer
+    return function () { if (timer) clearInterval(timer) }
   }, [orderExpireAt])
 
   function pullSysConfig() {
@@ -164,7 +163,7 @@ export default function VipPage() {
         })
         setPlanPriceList(newPlans)
       })
-      .catch(function () {})
+      .catch(function (err) { console.error('[vip] 加载价格方案失败:', err) })
   }
 
   function pullPayRecords() {
@@ -174,7 +173,7 @@ export default function VipPage() {
       .then(function (respBody) {
         if (respBody.code === 200) setPayRecGroup(respBody.data)
       })
-      .catch(function () {})
+      .catch(function (err) { console.error('[vip] 加载支付推荐分组失败:', err) })
   }
 
   function getPickedPlan() {
@@ -199,14 +198,15 @@ export default function VipPage() {
     })
       .then(function (res) { return res.json() })
       .then(function (respBody) {
-        if (respBody.code === 200) {
+        // 🔥 Bug修复：data null 时直接取字段抛 TypeError（此前文案还是误导性的"发起支付失败"）
+        if (respBody.code === 200 && respBody.data && respBody.data.codeUrl) {
           setWechatQrCodeUrl(respBody.data.codeUrl)
           setWechatPayOrderNo(respBody.data.orderNo)
           setOrderExpireAt(respBody.data.expireAt || '')
           setActiveStep('wechat_qr')
           beginOrderPolling(respBody.data.orderNo)
         } else {
-          setNotifyMsg(respBody.message || '生成二维码失败')
+          setNotifyMsg(respBody.message || (respBody.code === 200 && !respBody.data ? '创建订单为空，请重试' : '生成二维码失败'))
         }
       })
       .catch(function () { setNotifyMsg('网络错误') })
@@ -215,10 +215,12 @@ export default function VipPage() {
 
   // 轮询订单状态
   function beginOrderPolling(orderNo: string) {
+    // 🔥 Bug修复：先清旧轮询再建新的（此前重复发起支付会叠加 interval）
+    if (wechatPollIntervalRef.current) clearInterval(wechatPollIntervalRef.current)
     const timer = setInterval(function () {
       checkOrderStatus(orderNo)
     }, 3000)
-    setWechatPollInterval(timer)
+    wechatPollIntervalRef.current = timer
   }
 
   function checkOrderStatus(orderNo: string) {
@@ -233,25 +235,29 @@ export default function VipPage() {
     })
       .then(function (res) { return res.json() })
       .then(function (respBody) {
-        if (respBody.code !== 200) return
+        // 🔥 Bug修复：code 200 但 data null（如订单查询为空）此前直接取字段抛 TypeError
+        if (respBody.code !== 200 || !respBody.data) return
         if (respBody.data.status === 1) {
-          if (wechatPollInterval) clearInterval(wechatPollInterval)
+          if (wechatPollIntervalRef.current) clearInterval(wechatPollIntervalRef.current)
+          wechatPollIntervalRef.current = null
           setOrderExpireAt('')
           setNotifyMsg('支付成功！VIP会员已自动开通，页面将在3秒后刷新...')
           setTimeout(function () { window.location.reload() }, 3000)
         } else if (respBody.data.expired || respBody.data.status === 2) {
-          if (wechatPollInterval) clearInterval(wechatPollInterval)
+          if (wechatPollIntervalRef.current) clearInterval(wechatPollIntervalRef.current)
+          wechatPollIntervalRef.current = null
           setOrderExpireAt('')
           setNotifyMsg('订单已过期，请重新发起支付')
           setActiveStep('select')
           pullPayRecords()
         }
       })
-      .catch(function () {})
+      .catch(function (err) { console.error('[vip] 查询订单状态失败:', err) })
   }
 
   function cancelPayFlow() {
-    if (wechatPollInterval) clearInterval(wechatPollInterval)
+    if (wechatPollIntervalRef.current) clearInterval(wechatPollIntervalRef.current)
+    wechatPollIntervalRef.current = null
     setOrderExpireAt('')
     setActiveStep('select')
     setNotifyMsg('')
@@ -260,8 +266,10 @@ export default function VipPage() {
   function getPayStatusLabel(status: number) {
     if (status === 0) return { text: '待支付', color: 'text-amber-700 bg-amber-50' }
     if (status === 1) return { text: '支付成功', color: 'text-[var(--jade)] bg-[rgba(107,142,123,0.12)]' }
-    if (status === 2) return { text: '已失效', color: 'text-stone-600 bg-stone-100' }
-    return { text: '未知', color: 'text-stone-600 bg-stone-100' }
+    if (status === 2) return { text: '已超时未支付', color: 'text-stone-600 bg-stone-100' }
+    // 🔥 修复：订单清理还会写 status=3，此前一律显示「未知」
+    if (status === 3) return { text: '已取消', color: 'text-stone-600 bg-stone-100' }
+    return { text: '状态#' + status, color: 'text-stone-600 bg-stone-100' }
   }
 
   function getNotifyMsgClass() {

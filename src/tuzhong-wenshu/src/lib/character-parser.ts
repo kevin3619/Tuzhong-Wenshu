@@ -212,35 +212,9 @@ function parseOneCharacter(block: string): ParsedCharacter | null {
     result.role = inferRoleFromText(roleText)
   }
 
-  // 强制规则：只有 name === '朱由榔' 的角色可以标记为"主角"
-  // 其余角色一律修正为：文臣、武将、忠诚部将、智囊军师、敌方将领、盟友、中立人物
-  if (result.role === '主角' || result.role === 'protagonist' || result.role === '男主') {
-    if (result.name !== '朱由榔') {
-      // 回退到 inferRoleFromText 推断
-      result.role = inferRoleFromText(roleText)
-      // 如果推断结果仍是通用的 supporting，尝试更精确的推断
-      if (result.role === 'supporting') {
-        const lowerText = roleText.toLowerCase()
-        if (lowerText.indexOf('文臣') >= 0 || lowerText.indexOf('文官') >= 0 || lowerText.indexOf('阁老') >= 0 || lowerText.indexOf('首辅') >= 0) {
-          result.role = '文臣'
-        } else if (lowerText.indexOf('武将') >= 0 || lowerText.indexOf('将军') >= 0 || lowerText.indexOf('都督') >= 0 || lowerText.indexOf('总兵') >= 0) {
-          result.role = '武将'
-        } else if (lowerText.indexOf('部将') >= 0 || lowerText.indexOf('亲随') >= 0 || lowerText.indexOf('护卫') >= 0 || lowerText.indexOf('忠诚') >= 0) {
-          result.role = '忠诚部将'
-        } else if (lowerText.indexOf('军师') >= 0 || lowerText.indexOf('谋士') >= 0 || lowerText.indexOf('智囊') >= 0) {
-          result.role = '智囊军师'
-        } else if (lowerText.indexOf('敌方') >= 0 || lowerText.indexOf('敌将') >= 0 || lowerText.indexOf('反派') >= 0 || lowerText.indexOf('奸臣') >= 0) {
-          result.role = '敌方将领'
-        } else if (lowerText.indexOf('盟友') >= 0 || lowerText.indexOf('同盟') >= 0) {
-          result.role = '盟友'
-        } else if (lowerText.indexOf('中立') >= 0) {
-          result.role = '中立人物'
-        } else {
-          result.role = '文臣' // 默认修正为文臣
-        }
-      }
-    }
-  }
+  // 🔥 2026-11-06 修复：删除「只有朱由榔可标记为主角」的硬编码规则。
+  //   该规则把《永历中兴》的主角名写死进通用解析器，其它作品的主角会被错误降级为文臣/武将。
+  //   主角定位应以 AI 生成/用户编辑的结果为准，解析器不再按姓名做强制修正。
 
   return result
 }

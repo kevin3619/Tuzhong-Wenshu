@@ -146,7 +146,6 @@ function parseNovelsDatabase(content: string): NovelRecord[] {
     lastId = parseInt(match[1], 10)
     lastIndex = match.index + match[0].length
   }
-  // 最后一个块
   if (lastId > 0) {
     const blockContent = content.substring(lastIndex)
     blocks.push({ id: lastId, content: blockContent })
@@ -184,7 +183,7 @@ function resolveDatabasePath(): string | null {
     try {
       if (fs.existsSync(p)) return p
     } catch (e) {
-      // 继续尝试下一个路径
+      console.error('[novels-database] 探测数据文件候选路径失败，继续下一个:', p, e)
     }
   }
   return null

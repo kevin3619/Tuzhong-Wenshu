@@ -141,10 +141,16 @@ export default function StyleWorkshop() {
     let active = true
     const fetchSysDefaults = async () => {
       try {
-        const resp = await fetch('/tuzhong-wenshu/api/config/public')
+        const token = typeof window !== 'undefined' ? localStorage.getItem('token') || '' : ''
+        // 🔥 安全修复配套：AI 默认配置只对已登录用户下发，需带 token 并声明需要 AI 配置
+        const _hdrs: Record<string, string> = { 'x-want-ai-config': '1' }
+        if (token) _hdrs.Authorization = 'Bearer ' + token
+        const resp = await fetch('/tuzhong-wenshu/api/config/public', { headers: _hdrs })
         if (!resp.ok) return
         const json = await resp.json()
-        if (json?.code === 200 && json?.data?.ai_default_config && active) {
+        // 🔥 修复（P1 泄漏）：此前会把平台级 ai_api_key 取回浏览器并写进 localStorage；
+        //   注册是自助的，等于任何用户都能白拿平台 Key。服务端现只回「有无可用默认模型」。
+        if (false && json?.code === 200 && json?.data?.ai_default_config && active) {
           const cfg = json.data.ai_default_config as LLMConfig
           // 只在有有效 apiKey 时才采纳
           if (cfg?.apiKey && String(cfg.apiKey).length > 5) {
@@ -156,11 +162,11 @@ export default function StyleWorkshop() {
             })
             // localStorage 没有就写入一次，用户后续修改不受影响
             if (!getLLMConfig()?.apiKey) {
-              try { saveLLMConfig(cfg) } catch {}
+              try { saveLLMConfig(cfg) } catch (e) { console.error('[style] 首次写入 LLM 配置失败:', e) }
             }
           }
         }
-      } catch (_err) { /* ignore */ }
+      } catch (_err) { console.error('[style] 解析系统默认 LLM 配置失败:', _err) }
     }
     fetchSysDefaults()
     return () => { active = false }
@@ -359,7 +365,7 @@ export default function StyleWorkshop() {
             const refreshData = await refreshResp.json()
             setUserStyles(refreshData.data || [])
           }
-        } catch {}
+        } catch (e) { console.error('[style] 刷新风格列表失败:', e) }
       } else {
         const errData = await response.json().catch(() => ({}))
         setTrainerError(errData.message || '保存失败，请重试')
@@ -384,10 +390,8 @@ export default function StyleWorkshop() {
 
   const handleGeneratePreview = async () => {
     const llmConfig = effectiveLlmConfig()
-    if (!llmConfig?.apiKey) {
-      setPreviewError('未配置AI模型API Key。请在管理后台「系统设置→基本设置→AI模型配置」中填写，或登录后在个人设置中配置您自己的API Key。')
-      return
-    }
+    // 🔥 修复：不再要求浏览器持有平台 Key —— 没配自有模型时交给服务端按
+    //   「用户自有模型 > 管理员共享默认」解析（/api/ai/continue 已支持），Key 不出服务端。
     setIsGeneratingPreview(true)
     setPreviewError('')
     setPreviewText('')
@@ -397,9 +401,10 @@ export default function StyleWorkshop() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           context: '一个少年站在悬崖边，望着远方的家族演武场，他曾经被认为是废材，但今天一切都变了。',
-          style: 'fanqie-shuangwen',
+          // 🔥 修复：旧实现写死 fanqie-shuangwen + 写死样例，用户改任何参数点预览结果都不变
+          style: (function () { try { const raw = localStorage.getItem('tuzhong-active-style-data'); if (!raw) return 'fanqie-shuangwen'; const s = JSON.parse(raw); return String((s && (s.id || s.key || s.name)) || 'fanqie-shuangwen') } catch { return 'fanqie-shuangwen' } })(),
           length: 'medium',
-          llmConfig,
+          ...(llmConfig?.apiKey ? { llmConfig } : {}),
         }),
       })
       if (res.ok) {
@@ -422,7 +427,7 @@ export default function StyleWorkshop() {
         try {
           const errData = await res.json()
           errorMsg = errData.error || errorMsg
-        } catch {}
+        } catch (e) { console.error('[style] 解析错误响应体失败:', e) }
         setPreviewError(`${errorMsg}（HTTP ${res.status}）`)
       }
     } catch (err) {

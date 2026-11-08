@@ -517,6 +517,207 @@ export const PRESET_STYLES = [
       rhetoricFrequency: 55, pacing: 70, languageDensity: 65, eraFeel: 50, excitementDensity: 80
     }
   },
+  // ===== 2026-10-22：补充热门赛道风格 =====
+  {
+    id: 'urban-yishen',
+    name: '都市神医下山风',
+    category: '都市',
+    description: '扮猪吃虎+医武双修，主角低调藏拙，被轻视后一招翻盘，打脸节奏密',
+    parameters: {
+      formality: 35, emotionIntensity: 90, descriptionDensity: 55, dialogueRatio: 78,
+      rhetoricFrequency: 40, pacing: 92, languageDensity: 55, eraFeel: 20, excitementDensity: 95
+    }
+  },
+  {
+    id: 'urban-zongcai',
+    name: '都市豪门总裁风',
+    category: '都市',
+    description: '豪门恩怨+商战+强强对峙，场面体面、台词锋利，情绪张力靠关系拉扯',
+    parameters: {
+      formality: 65, emotionIntensity: 85, descriptionDensity: 70, dialogueRatio: 72,
+      rhetoricFrequency: 60, pacing: 70, languageDensity: 62, eraFeel: 25, excitementDensity: 78
+    }
+  },
+  {
+    id: 'urban-chongsheng',
+    name: '都市重生逆袭风',
+    category: '都市',
+    description: '带着前世记忆回到关键节点，先知先手布局，踩准风口、报复旧敌',
+    parameters: {
+      formality: 45, emotionIntensity: 88, descriptionDensity: 60, dialogueRatio: 70,
+      rhetoricFrequency: 45, pacing: 88, languageDensity: 65, eraFeel: 30, excitementDensity: 90
+    }
+  },
+  {
+    id: 'urban-yineng',
+    name: '都市异能觉醒风',
+    category: '都市',
+    description: '现代都市隐藏异能体系，日常与超常交错，能力有代价、有规则',
+    parameters: {
+      formality: 50, emotionIntensity: 82, descriptionDensity: 72, dialogueRatio: 68,
+      rhetoricFrequency: 55, pacing: 80, languageDensity: 68, eraFeel: 25, excitementDensity: 85
+    }
+  },
+  {
+    id: 'fantasy-lord',
+    name: '西幻领主种田风',
+    category: '奇幻',
+    description: '领主经营+领民养成+战争扩张，制度、税收、兵源写得实，成长线扎实',
+    parameters: {
+      formality: 60, emotionIntensity: 72, descriptionDensity: 85, dialogueRatio: 58,
+      rhetoricFrequency: 60, pacing: 62, languageDensity: 75, eraFeel: 70, excitementDensity: 72
+    }
+  },
+  {
+    id: 'fantasy-academy',
+    name: '魔法学院成长风',
+    category: '奇幻',
+    description: '学院派西幻，天赋测试→导师→试炼→竞赛，体系清晰，少年感与友情线并重',
+    parameters: {
+      formality: 52, emotionIntensity: 80, descriptionDensity: 78, dialogueRatio: 70,
+      rhetoricFrequency: 62, pacing: 75, languageDensity: 68, eraFeel: 65, excitementDensity: 82
+    }
+  },
+  {
+    id: 'fantasy-xuanhuan',
+    name: '传统玄幻升级风',
+    category: '玄幻',
+    description: '废柴逆袭+境界体系+宗门争斗，一章一小升、三章一大爽，节奏稳准狠',
+    parameters: {
+      formality: 45, emotionIntensity: 88, descriptionDensity: 72, dialogueRatio: 66,
+      rhetoricFrequency: 58, pacing: 90, languageDensity: 65, eraFeel: 60, excitementDensity: 92
+    }
+  },
+  {
+    id: 'xianxia-gudian',
+    name: '古典仙侠问道风',
+    category: '仙侠',
+    description: '文言气韵、洞府清修、因果道心，写景空灵，斗法讲究章法而非堆数值',
+    parameters: {
+      formality: 82, emotionIntensity: 62, descriptionDensity: 88, dialogueRatio: 48,
+      rhetoricFrequency: 86, pacing: 52, languageDensity: 82, eraFeel: 95, excitementDensity: 62
+    }
+  },
+  {
+    id: 'xianxia-fanren',
+    name: '凡人流稳健修仙风',
+    category: '仙侠',
+    description: '小人物步步为营，谨慎、算计、留后手，资源与寿元压力贯穿全书',
+    parameters: {
+      formality: 62, emotionIntensity: 70, descriptionDensity: 80, dialogueRatio: 55,
+      rhetoricFrequency: 62, pacing: 68, languageDensity: 78, eraFeel: 85, excitementDensity: 74
+    }
+  },
+  {
+    id: 'guofeng-gongdou',
+    name: '古风宫廷宅斗风',
+    category: '古风',
+    description: '深宅内院权谋，话里藏刀、礼数即武器，胜负落在规矩与人心细处',
+    parameters: {
+      formality: 88, emotionIntensity: 72, descriptionDensity: 88, dialogueRatio: 62,
+      rhetoricFrequency: 82, pacing: 58, languageDensity: 82, eraFeel: 96, excitementDensity: 66
+    }
+  },
+  {
+    id: 'history-quanmou',
+    name: '历史权谋朝堂风',
+    category: '历史',
+    description: '朝堂博弈+军政调度，文书、粮道、党争写得实，胜负靠制度与人心',
+    parameters: {
+      formality: 85, emotionIntensity: 68, descriptionDensity: 88, dialogueRatio: 55,
+      rhetoricFrequency: 70, pacing: 62, languageDensity: 85, eraFeel: 92, excitementDensity: 68
+    }
+  },
+  {
+    id: 'history-niandai',
+    name: '年代生活流风',
+    category: '历史',
+    description: '七八十年代烟火气，票证、物价、街坊、家宴皆有质感，靠日常与温情推进',
+    parameters: {
+      formality: 45, emotionIntensity: 78, descriptionDensity: 86, dialogueRatio: 70,
+      rhetoricFrequency: 50, pacing: 60, languageDensity: 70, eraFeel: 88, excitementDensity: 62
+    }
+  },
+  {
+    id: 'suspense-xingzhen',
+    name: '刑侦悬疑推理风',
+    category: '悬疑',
+    description: '案件驱动，现场取证、审讯交锋、线索闭环，逻辑严密不靠巧合',
+    parameters: {
+      formality: 60, emotionIntensity: 75, descriptionDensity: 78, dialogueRatio: 62,
+      rhetoricFrequency: 52, pacing: 82, languageDensity: 75, eraFeel: 40, excitementDensity: 78
+    }
+  },
+  {
+    id: 'lingyi-minsu',
+    name: '民俗灵异怪谈风',
+    category: '灵异',
+    description: '乡土怪谈+规矩禁忌，越日常越渗人，恐怖来自细节与不可解释',
+    parameters: {
+      formality: 55, emotionIntensity: 80, descriptionDensity: 85, dialogueRatio: 55,
+      rhetoricFrequency: 62, pacing: 66, languageDensity: 72, eraFeel: 72, excitementDensity: 72
+    }
+  },
+  {
+    id: 'military-tiexue',
+    name: '铁血军事战争风',
+    category: '军事',
+    description: '战术与后勤并重，地图、兵力、弹药、命令链写得实，牺牲有重量',
+    parameters: {
+      formality: 78, emotionIntensity: 82, descriptionDensity: 85, dialogueRatio: 55,
+      rhetoricFrequency: 55, pacing: 80, languageDensity: 82, eraFeel: 70, excitementDensity: 78
+    }
+  },
+  {
+    id: 'modu-shengcun',
+    name: '末世求生基建风',
+    category: '末世',
+    description: '灾难降临后资源匮乏，队伍管理、物资账目、营地建设，生存压力持续',
+    parameters: {
+      formality: 48, emotionIntensity: 85, descriptionDensity: 78, dialogueRatio: 62,
+      rhetoricFrequency: 48, pacing: 86, languageDensity: 72, eraFeel: 30, excitementDensity: 84
+    }
+  },
+  {
+    id: 'game-wuxian',
+    name: '无限流副本闯关风',
+    category: '游戏',
+    description: '规则怪谈式副本，规则解读即战斗，团队博弈+死亡倒计时',
+    parameters: {
+      formality: 52, emotionIntensity: 86, descriptionDensity: 72, dialogueRatio: 66,
+      rhetoricFrequency: 50, pacing: 90, languageDensity: 74, eraFeel: 35, excitementDensity: 90
+    }
+  },
+  {
+    id: 'yanqing-tianchong',
+    name: '甜宠日常恋爱风',
+    category: '言情',
+    description: '轻喜剧甜宠，误会不过夜，糖点密集，对白俏皮，情绪暖而不腻',
+    parameters: {
+      formality: 35, emotionIntensity: 90, descriptionDensity: 62, dialogueRatio: 82,
+      rhetoricFrequency: 48, pacing: 78, languageDensity: 55, eraFeel: 25, excitementDensity: 76
+    }
+  },
+  {
+    id: 'shuangwen-xitong',
+    name: '系统流金手指风',
+    category: '爽文',
+    description: '任务面板+奖励结算+数值成长，爽点高频可量化，节奏直奔目标',
+    parameters: {
+      formality: 35, emotionIntensity: 88, descriptionDensity: 58, dialogueRatio: 72,
+      rhetoricFrequency: 40, pacing: 94, languageDensity: 62, eraFeel: 30, excitementDensity: 96
+    }
+  },
+  {
+    id: 'tongren-zongman',
+    name: '综漫同人快穿风',
+    category: '同人',
+    description: '跨世界穿行，保留原作设定底色，主角以新身份介入并改变关键节点',
+    parameters: {
+      formality: 45, emotionIntensity: 85, descriptionDensity: 68, dialogueRatio: 74,
+      rhetoricFrequency: 50, pacing: 86, languageDensity: 65, eraFeel: 40, excitementDensity: 86
+    }
+  },
 ]
 
 // AI生成服务类

@@ -4,6 +4,7 @@ import { useState, useEffect, useRef } from 'react'
 import { ChevronRight, Trash2, Plus, User, Shield, Sword, Heart, Users, Edit2, X, Save } from 'lucide-react'
 import { extractText } from '@/lib/text-utils'
 import type { GeneratedData } from '../ai-generate-wizard'
+import { autoResize } from '@/hooks/useAutoResize'
 
 type RelationshipItem = Partial<NonNullable<NonNullable<GeneratedData['relationships']>['relationships']>[number]> & {
   id?: string
@@ -33,11 +34,6 @@ function RelationshipGraph({ relationships, characters, onChange: onRelationsCha
   const [selectedChar, setSelectedChar] = useState<string | null>(null)
   const [editMode, setEditMode] = useState(false)
 
-  const autoResize = function(e: React.FormEvent<HTMLTextAreaElement>) {
-    const ta = e.currentTarget
-    ta.style.height = 'auto'
-    ta.style.height = ta.scrollHeight + 'px'
-  }
 
   // 收集所有角色名
   const characterNames = new Set<string>()
@@ -701,11 +697,6 @@ function CharacterRelationshipCard({ charName, charInfo, categorized, getRelCate
 }) {
   const [isExpanded, setIsExpanded] = useState(true)
 
-  const autoResize = function(e: React.FormEvent<HTMLTextAreaElement>) {
-    const ta = e.currentTarget
-    ta.style.height = 'auto'
-    ta.style.height = ta.scrollHeight + 'px'
-  }
 
   const totalRels = Object.values(categorized).flat().length
   const categoryOrder = ['至亲至爱', '盟友下属', '对手仇敌', '泛交关系']
@@ -915,11 +906,6 @@ export default function StepRelationships({
   const setShowRelDropdown = _showRelDropdown[1]
   const _relIdCounter = useRef(0)
 
-  const autoResize = function(e: React.FormEvent<HTMLTextAreaElement>) {
-    const ta = e.currentTarget
-    ta.style.height = 'auto'
-    ta.style.height = ta.scrollHeight + 'px'
-  }
 
   useEffect(function() {
     const timer = setTimeout(function() {
@@ -937,7 +923,7 @@ export default function StepRelationships({
       .then(function (resp) {
         setMaintainedRels(resp.data ? (Object.values(resp.data).flat() as RelationshipItem[]) : [])
       })
-      .catch(function () {})
+      .catch(function (err) { console.error('[StepRelationships] 加载已维护关系失败:', err) })
   }, [])
 
   // 从维护的关系中选择并添加到当前图谱
@@ -1138,7 +1124,7 @@ export default function StepRelationships({
               <h5 className="font-bold text-stone-800 text-sm">宿命圈层</h5>
               <span className="text-xs text-stone-400">终极伏笔·大结局关键</span>
             </div>
-            <p className="text-xs text-stone-600 mb-2">上古先祖、前世羁绊、幕后黑手、天道棋子</p>
+            <p className="text-xs text-stone-600 mb-2">上古先祖、旧怨宿仇、幕后黑手、天道棋子</p>
             <div className="space-y-1 text-xs text-stone-500">
               <p className="flex items-start gap-1"><span className="text-stone-400 mt-0.5">•</span> 前期隐匿、只留线索、掌控世界秘密</p>
               <p className="flex items-start gap-1"><span className="text-stone-400 mt-0.5">•</span> 与主角身世深度绑定</p>

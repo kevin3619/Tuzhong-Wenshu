@@ -22,7 +22,7 @@ function getSiliconflowApiKeyFromModels(): string {
       return m && m.provider && String(m.provider).includes('硅基') && m.apiKey && !String(m.apiKey).includes('*')
     })
     if (anySf && anySf.apiKey) return String(anySf.apiKey).trim()
-  } catch (_e) {}
+  } catch (_e) { console.error('[generate-cover] 读取模型配置提取 API Key 失败:', _e) }
   return ''
 }
 
@@ -74,9 +74,37 @@ function getImageDimensions(buffer: ArrayBuffer, contentType: string): { width: 
       }
     }
   } catch (e) {
-    console.warn('[generate-cover] 解析图片尺寸失败:', e)
+    console.error('[generate-cover] 解析PNG尺寸失败:', e)
   }
   return null
+}
+
+/**
+ * 🔥 2026-10-22：封面规格门禁（移植自 oh-story skills/story-cover）
+ * - 番茄封面标准比例 3:4（600×800，实际出图 768×1024 同比例）；
+ * - 书名 ≤20 字、笔名 ≤12 字，保证在中央 85% 安全区内可排版；
+ * - 画面内不生成文字，书名/笔名由前端排版叠加。
+ */
+function validateCoverSpec(input: { title: string; author: string; genre: string; width: number; height: number }) {
+  const warnings: string[] = []
+  const titleLen = (input.title || '').trim().length
+  const authorLen = (input.author || '').trim().length
+  if (titleLen > 20) warnings.push('书名 ' + titleLen + ' 字，超过封面安全排版 20 字上限，建议精简')
+  if (authorLen > 12) warnings.push('笔名 ' + authorLen + ' 字，超过 12 字上限，建议精简')
+  if (!input.genre) warnings.push('未提供题材，封面风格锚点可能不准')
+  const ratio = input.height > 0 ? input.width / input.height : 0
+  if (Math.abs(ratio - 0.75) > 0.02) {
+    warnings.push('封面比例 ' + input.width + '×' + input.height + ' 非 3:4，番茄建议 600×800')
+  }
+  return {
+    ok: warnings.length === 0,
+    titleLen,
+    authorLen,
+    ratio: Math.round(ratio * 100) / 100,
+    safeArea: 'central-85%',
+    noTextInImage: true,
+    warnings,
+  }
 }
 
 // 封面生成API - 使用SDXL图片生成，失败时降级为SVG占位封面
@@ -114,6 +142,40 @@ export async function POST(request: NextRequest) {
     // 封面尺寸，默认番茄小说尺寸
     const coverWidth = Number(width) || 600
     const coverHeight = Number(height) || 800
+    const coverCheck = validateCoverSpec({
+      title: safeTitle,
+      author: safeAuthor,
+      genre: safeGenre,
+      width: coverWidth,
+      height: coverHeight,
+    })
+
+    // 🔥 2026-10-22 题材视觉锚点库（移植自 oh-story skills/story-cover/references/cover-styles.md）
+    //   该仓库的封面流程已被番茄签约作品验证：题材定风格层 → 平台定比例（番茄 600×800 = 3:4）→
+    //   画面层分前景人物/中景场景/远景氛围；书名与笔名必须落在中央 85% 安全区。
+    //   这里只借用它的「题材视觉词汇」，配色仍由本作设定动态推导（保持本项目原有优势）。
+    const _COVER_STYLE_ANCHORS: Array<{ re: RegExp; text: string }> = [
+      {
+        re: /历史|古代|明|宋|唐|三国|大明|朝堂|权谋|战争|将军|谋士|军事|宫斗|古装/,
+        text: '题材风格标签：historical Chinese war epic, grand battlefield panorama；\n人物：将军铠甲/谋士长袍，执兵器或持文牍，姿态有决断；\n背景三层：前景人物或器物（官印/军报/刀枪），中景城墙/军营/朝堂座次，远景烽火与烟尘天际；\n色彩：铁灰 + 暗红 + 土黄，金甲光泽与烽火橙点缀；\n光效：dramatic battlefield firelight, smoke-filled sky, sunset over war；\n书名字体：heavy stone-carved seal script in deep red；笔名字体：small dignified white Song typeface text；\n画风：digital painting style，不要照片感。',
+      },
+      {
+        re: /玄幻|仙侠|修真|洪荒|神话|上古|封神|巫|灵气|境界/,
+        text: '题材风格标签：Chinese xianxia fantasy epic, celestial mountains and floating islands；\n人物：长袍剑修/持灵器，周身灵光；\n背景三层：前景人物或法器，中景山门云海，远景仙宫与星河；\n色彩：靛蓝 + 金白 + 墨黑，灵光青紫点缀；\n光效：ethereal spirit glow, flowing clouds, moonlight halo。',
+      },
+      {
+        re: /宫斗|宅斗|古言|言情|后宫|闺阁/,
+        text: '题材风格标签：Chinese palace intrigue romance, ornate interior with silk drapes；\n人物：华服女子/朝服男子，仪态克制；\n背景三层：前景宫灯/绣帕，中景回廊朱门，远景宫墙暮色；\n色彩：胭脂红 + 黛青 + 象牙金；\n光效：candlelit interior, soft rose and gold rim light。',
+      },
+      {
+        re: /都市|现代|职场|商战|校园|重生|异能/,
+        text: '题材风格标签：modern urban drama, neon cityscape；\n人物：现代着装主角，剪影或半身；\n背景三层：前景道具，中景玻璃幕墙街景，远景城市夜色；\n色彩：冷蓝 + 暖橙 + 墨黑；\n光效：cinematic neon rim light, shallow depth of field。',
+      },
+    ]
+    const _pickAnchor = (text: string): string => {
+      for (const a of _COVER_STYLE_ANCHORS) if (a.re.test(text)) return a.text
+      return ''
+    }
 
     // 🔥 修复：从前序设定中提取核心视觉要素，让 LLM 基于本作前序设定动态推导配色与风格
     // 不再使用硬编码题材→配色映射（如洪荒=金橙红黑·仙侠=青白紫金等）
@@ -178,7 +240,6 @@ export async function POST(request: NextRequest) {
     let actualCoverModel = 'Kwai-Kolors/Kolors'
 
     if (useKwaiPipeline) {
-      console.log('[generate-cover] 启用 Kwai-Kolors 封面流水线, sfApiKey来源=' + (modelsSfKey ? 'models.json' : (envSfKey ? '环境变量' : '未配置')))
       try {
         // -------- Step1：Qwen/Qwen2.5-7B-Instruct 生成正向+反向绘画提示词 --------
         // 🔥 修复：移除硬编码题材→配色映射，改为要求 LLM 基于本作前序设定动态推导配色
@@ -207,6 +268,13 @@ export async function POST(request: NextRequest) {
           }
         ]
         const promptCfg = { provider: '硅基流动', apiKey: sfApiKey, baseUrl: sfBaseUrl, model: 'Qwen/Qwen2.5-7B-Instruct' }
+        // 🔥 2026-10-22 题材视觉锚点（移植自 oh-story skills/story-cover/references/cover-styles.md，
+        //   该仓库的封面流程已被番茄签约作品验证）。只作为「视觉词汇锚点」注入，
+        //   具体配色仍由本作前序设定动态推导（不做题材→配色的硬编码映射）。
+        const _styleAnchor = _pickAnchor(String(safeGenre || '') + ' ' + String(safePrompt || '') + ' ' + String(_prevWb.era || ''))
+        if (_styleAnchor) {
+          coverPromptGenMessages[1].content += '\n\n【题材视觉锚点（参照以下词汇与层次，配色仍须结合本作设定推导）】\n' + _styleAnchor
+        }
         // 🔥 Step1 超时 90 秒（文本生成任务）
         const promptRaw = await callLLM(promptCfg, coverPromptGenMessages, { maxTokens: 1000, temperature: 0.63, timeoutMs: 90000 })
         let promptJsonStr = promptRaw
@@ -222,9 +290,8 @@ export async function POST(request: NextRequest) {
           const promptObj = JSON.parse(promptJsonStr)
           if (promptObj.positivePrompt && typeof promptObj.positivePrompt === 'string') positivePrompt = promptObj.positivePrompt.slice(0, 600)
           if (promptObj.negativePrompt && typeof promptObj.negativePrompt === 'string') negativePrompt = promptObj.negativePrompt.slice(0, 300)
-          console.log('[generate-cover] Step1: 绘画提示词生成成功，正向=' + positivePrompt.length + '字 / 反向=' + negativePrompt.length + '字')
         } catch (_jsonErr) {
-          console.warn('[generate-cover] Step1: 提示词JSON解析失败，使用用户原始描述兜底')
+          console.error('[generate-cover] 解析prompt JSON失败，使用默认提示词:', _jsonErr)
         }
 
         // 加入封面强化后缀（竖版构图、768×1024番茄标准、专业级封面要求）
@@ -287,10 +354,10 @@ export async function POST(request: NextRequest) {
           const b64 = kolorsData?.data?.[0]?.b64_json || kolorsData?.images?.[0]?.b64_json
           const kolorsImgUrl = kolorsData?.data?.[0]?.url || kolorsData?.images?.[0]?.url
           if (b64 && typeof b64 === 'string' && b64.length > 1000) {
-            console.log('[generate-cover] Step2: Kwai-Kolors成功(base64)，长度=' + b64.length)
             return NextResponse.json({
               coverUrl: `data:image/png;base64,${b64}`,
               title: safeTitle,
+              coverCheck,
               positivePrompt: finalPositive,
               negativePrompt: negativePrompt,
               pipeline: 'Kwai-Kolors',
@@ -301,17 +368,16 @@ export async function POST(request: NextRequest) {
           }
           // 如果返回的是 URL，下载图片并转换为 base64
           if (kolorsImgUrl && typeof kolorsImgUrl === 'string' && /^https?:\/\//.test(kolorsImgUrl)) {
-            console.log('[generate-cover] Step2: Kwai-Kolors返回URL，下载转换base64:', kolorsImgUrl.slice(0, 80))
             try {
               const imgResp = await fetch(kolorsImgUrl, { signal: AbortSignal.timeout(30000) })
               if (imgResp.ok) {
                 const imgBuf = await imgResp.arrayBuffer()
                 const imgB64 = Buffer.from(imgBuf).toString('base64')
                 if (imgB64 && imgB64.length > 1000) {
-                  console.log('[generate-cover] Step2: URL下载成功，base64长度=' + imgB64.length)
                   return NextResponse.json({
                     coverUrl: `data:image/png;base64,${imgB64}`,
                     title: safeTitle,
+                    coverCheck,
                     positivePrompt: finalPositive,
                     negativePrompt: negativePrompt,
                     pipeline: 'Kwai-Kolors',
@@ -322,29 +388,24 @@ export async function POST(request: NextRequest) {
                 }
               }
             } catch (dlErr: unknown) {
-              console.warn('[generate-cover] Step2: URL下载失败:', dlErr instanceof Error ? dlErr.message : dlErr)
+              console.error('[generate-cover] 封面图片下载失败:', dlErr)
             }
           }
-          console.warn('[generate-cover] Step2: Kwai-Kolors返回空图片数据，响应:', JSON.stringify(kolorsData).slice(0, 300))
           kwaiPipelineError = 'Kwai-Kolors 返回空图片数据'
         } else {
           const kErr = await kolorsRes.text()
-          console.warn('[generate-cover] Step2: Kwai-Kolors HTTP ' + kolorsRes.status + ': ' + kErr.substring(0, 300))
           kwaiPipelineError = 'Kwai-Kolors HTTP ' + kolorsRes.status + ': ' + kErr.substring(0, 200)
         }
       } catch (pipeErr: unknown) {
         const pipeErrMsg = pipeErr instanceof Error ? pipeErr.message : String(pipeErr)
-        console.warn('[generate-cover] Kwai-Kolors流水线失败：' + pipeErrMsg)
         kwaiPipelineError = pipeErrMsg
       }
     } else {
       // 🔥 如果 API key 缺失或格式错误，记录明确错误信息
       if (!sfApiKey) {
         kwaiPipelineError = '硅基流动 API 密钥未配置（环境变量 SILICONFLOW_API_KEY 缺失或不是 sk- 开头格式，且硬编码密钥不可用）'
-        console.warn('[generate-cover] ' + kwaiPipelineError)
       } else if (!SILICONFLOW_MODEL_WHITELIST.has('Kwai-Kolors/Kolors')) {
         kwaiPipelineError = 'Kwai-Kolors/Kolors 模型不在硅基流动白名单中'
-        console.warn('[generate-cover] ' + kwaiPipelineError)
       }
     }
 
@@ -352,7 +413,6 @@ export async function POST(request: NextRequest) {
     // 🔥🔥🔥 问题4修复：讯飞星火API（SILICONFLOW_BASE_URL指向xf-yun.com）不支持/images/generations端点
     // 只有当base URL包含siliconflow.cn时才尝试SiliconFlow API，否则跳过避免浪费180秒超时
     if (siliconFlowApiKey && /siliconflow\.cn/i.test(siliconFlowUrl)) {
-      console.log('[generate-cover] 尝试使用SiliconFlow API生成图片')
       try {
         const sfController = new AbortController()
         const sfTimeoutId = setTimeout(() => sfController.abort(), 180000)
@@ -378,27 +438,21 @@ export async function POST(request: NextRequest) {
         if (sfRes.ok) {
           const data = await sfRes.json()
           if (data?.data?.[0]?.b64_json) {
-            console.log('[generate-cover] SiliconFlow API成功，获取到base64图片')
             const base64Url = `data:image/png;base64,${data.data[0].b64_json}`
             return NextResponse.json({
               coverUrl: base64Url,
               title: safeTitle,
+              coverCheck,
               _meta: { usedModel: actualCoverModel, usedProvider: '硅基流动' },
             })
           }
-          console.warn('[generate-cover] SiliconFlow API返回空图片数据')
-        } else {
-          console.warn('[generate-cover] SiliconFlow API返回非200状态:', sfRes.status)
         }
       } catch (sfErr: unknown) {
-        console.warn('[generate-cover] SiliconFlow API请求失败:', sfErr instanceof Error ? sfErr.message : sfErr)
+        console.error('[generate-cover] 硅基流动封面生成失败:', sfErr)
       }
-    } else {
-      console.log('[generate-cover] 跳过SiliconFlow API（讯飞星火不支持图片生成端点），直接使用trae API')
     }
 
     // ============ 备选方案1：尝试使用trae图片生成API ============
-    console.log('[generate-cover] 尝试使用trae图片生成API')
     const maxRetries = 5
     let finalImageUrl: string | null = null
     let finalImageData: string | null = null
@@ -409,12 +463,9 @@ export async function POST(request: NextRequest) {
       const timeoutId = setTimeout(() => controller.abort(), 60000)
 
       try {
-        console.log(`[generate-cover] 第${attempt + 1}次尝试获取图片...`)
         const imageRes = await fetch(traeUrl, { signal: controller.signal })
         clearTimeout(timeoutId)
 
-        console.log('[generate-cover] API响应状态:', imageRes.status)
-        console.log('[generate-cover] Content-Type:', imageRes.headers.get('content-type'))
 
         if (imageRes.ok) {
           const contentType = imageRes.headers.get('content-type') || ''
@@ -422,12 +473,10 @@ export async function POST(request: NextRequest) {
           if (contentType.startsWith('image/')) {
             const imageBuffer = await imageRes.arrayBuffer()
             const imageSizeKB = imageBuffer.byteLength / 1024
-            console.log(`[generate-cover] 获取到图片，大小: ${imageSizeKB.toFixed(1)}KB`)
 
             // 质量检测1：太小的图片（<2KB）很可能是占位图，跳过
             // 🔥🔥🔥 问题4修复：放宽阈值（从5KB→2KB），避免有效的小图片被跳过
             if (imageSizeKB < 2) {
-              console.log(`[generate-cover] 图片太小(${imageSizeKB.toFixed(1)}KB)，疑似占位图`)
               if (attempt < maxRetries - 1) {
                 await new Promise(resolve => setTimeout(resolve, 5000))
                 continue
@@ -438,24 +487,20 @@ export async function POST(request: NextRequest) {
             // 质量检测2：检查图片尺寸
             const dims = getImageDimensions(imageBuffer, contentType)
             if (dims) {
-              console.log(`[generate-cover] 图片尺寸: ${dims.width}x${dims.height}`)
 
               // 🔥🔥🔥 问题4修复：放宽宽高比检测（从0.5-1.2→0.3-1.5），接受更多竖版图片
               // portrait_4_3比例约为0.75，但trae API可能返回略有偏差的图片
               const ratio = dims.width / dims.height
               if (ratio < 0.3 || ratio > 1.5) {
-                console.log(`[generate-cover] 图片宽高比超出范围(${dims.width}x${dims.height}, ratio=${ratio.toFixed(2)})`)
                 if (attempt < maxRetries - 1) {
                   await new Promise(resolve => setTimeout(resolve, 6000))
                   continue
                 }
                 // 🔥🔥🔥 问题4修复：如果是最后一次重试，即使宽高比不符也接受图片（有图总比SVG好）
-                console.log(`[generate-cover] 最后一次重试，接受宽高比不符的图片`)
               }
             }
 
             // 图片质量合格
-            console.log('[generate-cover] 图片质量合格，转换为 base64 data URL')
             const imageBase64 = Buffer.from(imageBuffer).toString('base64')
             const imageMime = contentType.split(';')[0].trim() || 'image/png'
             const dataUrl = `data:${imageMime};base64,${imageBase64}`
@@ -465,7 +510,19 @@ export async function POST(request: NextRequest) {
 
           // 尝试解析JSON，提取图片URL
           const responseText = await imageRes.text()
-          console.log('[generate-cover] 响应文本前500字符:', responseText.slice(0, 500))
+
+          // 🔥 2026-10-16 占位图拦截：trae API 未就绪时会返回文本占位提示
+          //   （如「The image is generating... Please refresh preview.」）或 HTML 错误页。
+          //   旧逻辑只认 JSON 字段 / http 前缀，未识别占位文本，导致占位/低质结果被当正式封面继续合成。
+          //   此处显式识别占位特征 → 跳过本轮、继续重试/回退（只接受真正的图片 URL / JSON / data URL）。
+          if (!/^\s*(https?:\/\/|\{|\[|data:image\/)/.test(responseText) ||
+              /generating|refresh preview|please wait|still processing|image is being|生成中|请刷新/i.test(responseText)) {
+            if (attempt < maxRetries - 1) {
+              await new Promise(resolve => setTimeout(resolve, 4000))
+              continue
+            }
+            break
+          }
 
           try {
             const data = JSON.parse(responseText)
@@ -473,21 +530,17 @@ export async function POST(request: NextRequest) {
               || data?.data?.url || data?.result?.url || data?.image
               || data?.data?.image_url || data?.result?.image_url
             if (imageUrl && typeof imageUrl === 'string' && imageUrl.length > 10) {
-              console.log('[generate-cover] 从JSON中提取到图片URL:', imageUrl.slice(0, 100))
               finalImageUrl = imageUrl
               break
             }
             const base64Data = data?.base64 || data?.image_base64 || data?.data?.base64
               || data?.result?.base64 || data?.imageData
             if (base64Data && typeof base64Data === 'string' && base64Data.length > 100) {
-              console.log('[generate-cover] 从JSON中提取到base64图片数据')
               const base64Url = `data:image/png;base64,${base64Data}`
               finalImageData = base64Url
               break
             }
-            console.warn('[generate-cover] JSON中未找到图片URL或base64数据')
           } catch (jsonErr) {
-            console.warn('[generate-cover] JSON解析失败:', jsonErr)
             const trimmed = responseText.trim()
             if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) {
               finalImageUrl = trimmed
@@ -495,19 +548,16 @@ export async function POST(request: NextRequest) {
             }
           }
         } else {
-          console.warn(`[generate-cover] API返回非200状态: ${imageRes.status}`)
           break
         }
       } catch (fetchErr: unknown) {
         clearTimeout(timeoutId)
-        console.warn(`[generate-cover] 第${attempt + 1}次请求失败:`, fetchErr instanceof Error ? fetchErr.message : fetchErr)
         if (attempt < maxRetries - 1) {
           await new Promise(resolve => setTimeout(resolve, 3000))
         }
       }
       
       if (Date.now() - startTime > 60000) {
-        console.log('[generate-cover] 总超时(60秒)，停止重试')
         break
       }
     }
@@ -520,6 +570,7 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({
         coverUrl: finalImageData,
         title: safeTitle,
+        coverCheck,
         _meta: { usedModel: actualCoverModel, usedProvider: 'trae' },
       })
     }
@@ -527,13 +578,13 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({
         coverUrl: finalImageUrl,
         title: safeTitle,
+        coverCheck,
         _meta: { usedModel: actualCoverModel, usedProvider: 'trae' },
       })
     }
 
     // ============ 备选方案2：尝试使用DeepAI API（仅当配置了 DEEPAI_API_KEY 时） ============
     if (deepAiApiKey) {
-      console.log('[generate-cover] 尝试使用DeepAI API')
       try {
         const deepAiController = new AbortController()
         const deepAiTimeoutId = setTimeout(() => deepAiController.abort(), 60000)
@@ -553,23 +604,20 @@ export async function POST(request: NextRequest) {
         if (deepAiRes.ok) {
           const data = await deepAiRes.json()
           if (data?.output_url) {
-            console.log('[generate-cover] DeepAI API成功，获取到图片URL:', data.output_url.slice(0, 100))
             return NextResponse.json({
               coverUrl: data.output_url,
               title: safeTitle,
+              coverCheck,
               _meta: { usedModel: 'DeepAI/text2img', usedProvider: 'DeepAI' },
             })
           }
         }
       } catch (deepAiErr: unknown) {
-        console.warn('[generate-cover] DeepAI API请求失败:', deepAiErr instanceof Error ? deepAiErr.message : deepAiErr)
+        console.error('[generate-cover] DeepAI 封面生成失败:', deepAiErr)
       }
-    } else {
-      console.log('[generate-cover] 未配置 DEEPAI_API_KEY 环境变量，跳过 DeepAI 备选方案')
     }
 
     // ============ 降级方案：生成SVG占位封面 ============
-    console.log('[generate-cover] 所有图片API失败，生成SVG占位封面')
     // 🔥 关键修复：将 Kwai-Kolors 流水线错误信息传递到前端，便于诊断
     const fallbackReason = kwaiPipelineError || '所有图片API均不可用'
     console.log('[generate-cover] 降级原因:', fallbackReason)
@@ -582,6 +630,7 @@ export async function POST(request: NextRequest) {
       coverUrl: svgDataUrl,
       svgContent: svgCover,
       title: safeTitle,
+      coverCheck,
       isFallback: true,
       // 🔥 将详细的错误原因返回到前端，便于用户和开发者诊断
       fallbackReason: fallbackReason,

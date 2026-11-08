@@ -11,7 +11,8 @@ const SETUP_KEY_LIST = [
 ] as const
 
 // 内存缓存微信支付平台证书（避免每次都解析）
-const platformCertCache: { cert: string, expireAt: number } | null = null
+type PlatformCertEntry = { cert: string; expireAt: number; serialNo: string }
+const _platformCertMap = new Map<string, PlatformCertEntry>()
 
 // 套餐天数映射（lifetime 特殊处理，不在 MAP 中）
 const PLAN_DAY_MAP: Record<string, number> = {
@@ -32,7 +33,7 @@ export async function getOrderExpireMinutes(): Promise<number> {
       const val = parseInt(row.configValue, 10)
       if (!isNaN(val) && val >= 1 && val <= 1440) return val
     }
-  } catch { /* ignore */ }
+  } catch (e) { console.error('[wechat-pay] 读取订单清理间隔配置失败，使用默认值:', e) }
   return DEFAULT_ORDER_EXPIRE_MINUTES
 }
 
@@ -264,12 +265,18 @@ export async function buildWechatPayOrder(bkUserId: string, planType: string, pa
   const planLabel = computePlanLabel(planType)
   const clientIp = getClientIp(requestHeaders)
 
+  // 🔥 修复（P1）：订单有效期必须在下单前算好并作为 time_expire 传给微信，
+  //   否则会出现「本地已判过期并置失效、微信侧仍可付款成功 → 回调不再发卡」的死单。
+  const expireMinutesForOrder = await getOrderExpireMinutes()
+  const expireTimeForOrder = new Date(Date.now() + expireMinutesForOrder * 60 * 1000).toISOString()
+
   const reqPayload = JSON.stringify({
     appid: payAppId,
     mchid: merchantSetup.mchid,
     description: '途中文枢VIP-' + planLabel + '会员',
     out_trade_no: outTradeNo,
     notify_url: notifyEndPoint,
+    time_expire: expireTimeForOrder,
     amount: {
       total: Math.round(payPrice * 100),
       currency: 'CNY'
@@ -332,7 +339,7 @@ export async function buildWechatPayOrder(bkUserId: string, planType: string, pa
     if (sweptCount > 0) {
       console.log('[微信支付下单] 自动清理过期订单 ' + sweptCount + ' 笔')
     }
-  } catch { /* ignore */ }
+  } catch (e) { console.error('[wechat-pay] 下单前自动清理过期订单失败:', e) }
 
   const newPayOrder = await prisma.payment.create({
     data: {
@@ -358,6 +365,56 @@ export async function buildWechatPayOrder(bkUserId: string, planType: string, pa
   }
 }
 
+/** 取「微信支付平台证书」公钥用于验签：缓存 → 后台上传 → GET /v3/certificates 下载（APIv3 解密） */
+async function resolveWechatPlatformPublicKey(
+  merchantSetup: { mchid: string; apiv3Key: string; serialNo: string; certPem: string; privateKeyPem: string },
+  notifySerial: string
+): Promise<string | null> {
+  const wanted = String(notifySerial || '').trim().toUpperCase()
+  for (const e of _platformCertMap.values()) {
+    if (e.expireAt > Date.now() && (!wanted || !e.serialNo || e.serialNo.toUpperCase() === wanted)) return e.cert
+  }
+  try {
+    const manual = await prisma.systemConfig.findFirst({ where: { configKey: { in: ['wechat_pay_platform_cert', 'wechat_pay_public_key'] } } })
+    if (manual && manual.configValue) {
+      const v = manual.configValue
+      return v.indexOf('BEGIN CERTIFICATE') !== -1 ? extractPublicKey(v) : v
+    }
+  } catch (e) { console.error('[wechat-pay] 读取手工上传的平台证书失败:', e) }
+  try {
+    const ts = Math.floor(Date.now() / 1000)
+    const nonce = crypto.randomBytes(16).toString('hex')
+    const sign = createV3PaySign('GET', '/v3/certificates', ts, nonce, '', merchantSetup.privateKeyPem)
+    const resp = await fetch('https://api.mch.weixin.qq.com/v3/certificates', {
+      method: 'GET',
+      headers: {
+        'Accept': 'application/json',
+        'Authorization': buildAuthHeader(merchantSetup.mchid, merchantSetup.serialNo, ts, nonce, sign),
+        'User-Agent': 'TuzhongWenshu/1.0',
+      },
+    })
+    if (!resp.ok) { console.error('[wechat-pay] 下载平台证书失败 HTTP ' + resp.status); return null }
+    const payload = await resp.json()
+    const list = Array.isArray((payload as { data?: unknown[] })?.data) ? (payload as { data: unknown[] }).data : []
+    for (const item of list as Array<Record<string, any>>) {
+      const enc = item && item.encrypt_certificate
+      if (!enc || !enc.nonce_str || !enc.ciphertext) continue
+      try {
+        const certPem = aesGcmDecrypt(merchantSetup.apiv3Key, enc.nonce_str, enc.ciphertext, enc.associated_data || '')
+        const serialNo = String(item.serial_no || '')
+        const expMs = Date.parse(String(item.expires_at || '')) || (Date.now() + 12 * 3600 * 1000)
+        _platformCertMap.set(serialNo || ('k' + _platformCertMap.size), { cert: certPem, serialNo, expireAt: expMs - 60 * 1000 })
+      } catch (de) { console.error('[wechat-pay] 平台证书解密失败（核对 APIv3 密钥）:', de instanceof Error ? de.message : String(de)) }
+    }
+    for (const e of _platformCertMap.values()) if (!wanted || e.serialNo.toUpperCase() === wanted) return e.cert
+    const anyOne = _platformCertMap.values().next().value
+    return anyOne ? anyOne.cert : null
+  } catch (e) {
+    console.error('[wechat-pay] 获取微信支付平台证书异常:', e instanceof Error ? e.message : String(e))
+    return null
+  }
+}
+
 // 验签微信支付回调通知（V3 RSA-SHA256验签）
 // v4 C3 修复：增加时间戳窗口校验，防止重放攻击
 export async function checkCallbackSign(timeStampHeader: string, nonceHeader: string, signHeader: string, serialHeader: string, bodyText: string): Promise<boolean> {
@@ -378,7 +435,13 @@ export async function checkCallbackSign(timeStampHeader: string, nonceHeader: st
 
   try {
     const message = timeStampHeader + '\n' + nonceHeader + '\n' + bodyText + '\n'
-    const publicKey = extractPublicKey(merchantSetup.certPem)
+    // 🔥 修复（P1 验签必然失败）：回调由「微信支付平台证书」私钥签名，旧实现拿商户自己的
+    //   apiclient_cert 公钥去验，且 wechatpay-serial 头从未使用 → 真实回调 100% 验签不过。
+    const publicKey = await resolveWechatPlatformPublicKey(merchantSetup, serialHeader)
+    if (!publicKey) {
+      console.error('[微信支付回调验签] 拿不到微信支付平台证书（serial=' + String(serialHeader || '-') + '），拒绝放行')
+      return false
+    }
 
     const verifier = crypto.createVerify('RSA-SHA256')
     verifier.update(message)
@@ -414,8 +477,10 @@ async function processPaymentSuccess(payOrderId: string, payOrderUserId: string,
   try {
     await prisma.$transaction(async (tx) => {
       // 乐观锁：仅当 status=0 时才更新（防止并发重复处理）
+      // 🔥 修复：待支付(0) 与被本地过期扫描置为失效(2)/取消(3) 的订单，只要微信真的扣款
+      //   成功就必须开通会员（旧实现只认 status=0 → 收了钱不开通）。已开通(1) 仍幂等跳过。
       const updated = await tx.payment.updateMany({
-        where: { id: payOrderId, status: 0 },
+        where: { id: payOrderId, status: { in: [0, 2, 3] } },
         data: {
           status: 1,
           auditTime: nowTime.toISOString()
@@ -431,6 +496,8 @@ async function processPaymentSuccess(payOrderId: string, payOrderUserId: string,
         where: { id: payOrderUserId },
         data: {
           subscriptionTier: tier,
+          // 🔥 修复：subscriptionStartedAt 此前从不写入，会员起始时间无从核对
+          subscriptionStartedAt: nowTime.toISOString(),
           subscriptionExpiresAt: expireDate.toISOString(),
           updatedAt: nowTime.toISOString()
         }
@@ -602,7 +669,7 @@ export async function queryPayOrderStatus(outTradeNo: string): Promise<OrderStat
   // 轮询时顺便清理过期订单（自动取消机制 - 每次轮询触发一次批量清理）
   try {
     await sweepExpiredOrders()
-  } catch { /* ignore */ }
+  } catch (e) { console.error('[wechat-pay] 轮询时自动清理过期订单失败:', e) }
 
   const payOrder = await prisma.payment.findFirst({
     where: {

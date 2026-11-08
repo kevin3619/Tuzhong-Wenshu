@@ -69,7 +69,7 @@ export async function PATCH(request: NextRequest, { params }: RouteParams) {
       }
     }
     if (status !== undefined) updateData.status = Number(status) === 0 ? 0 : 1
-    const VALID_TIERS = ['free', 'monthly', 'quarterly', 'yearly', 'lifetime', 'pro']
+    const VALID_TIERS = ['free', 'monthly', 'quarterly', 'yearly', 'lifetime', 'pro', 'annual']
     if (subscriptionTier !== undefined) {
       const t = String(subscriptionTier).trim()
       updateData.subscriptionTier = VALID_TIERS.includes(t) ? t : 'free'

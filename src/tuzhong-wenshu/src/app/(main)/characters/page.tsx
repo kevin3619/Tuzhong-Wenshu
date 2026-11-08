@@ -120,6 +120,8 @@ export default function CharacterPage() {
   const [loadingCharacters, setLoadingCharacters] = useState(false)
   const [viewMode, setViewMode] = useState<'graph' | 'list'>('graph')
   const [selectedCharacter, setSelectedCharacter] = useState<Character | null>(null)
+  // 刷新列表版本号（增删角色/关系后 bump，触发带 safe-merge 的统一加载）
+  const [charListVersion, setCharListVersion] = useState<number>(0)
   const [showCharacterModal, setShowCharacterModal] = useState(false)
   const [showRelationModal, setShowRelationModal] = useState(false)
   const [searchQuery, setSearchQuery] = useState('')
@@ -170,11 +172,14 @@ export default function CharacterPage() {
             appearance: safeStr(char.appearance, ''),
             personality: safeStr(char.personality, ''),
             background: safeStr(char.background, ''),
-            relationships: (safeArr(char.relationships) as Record<string, unknown>[]).map((rel) => ({
-              targetId: safeStr(rel.targetId, ''),
-              type: safeStr(rel.type, ''),
-              description: safeStr(rel.description, ''),
-            })),
+            relationships: (safeArr(char.relationships) as Record<string, unknown>[])
+              // 🔥 Bug修复：AI 产出 relationships 数组可能含 null 项，直接 .map 会 TypeError 全页崩
+              .filter(function (rel) { return !!rel })
+              .map((rel) => ({
+                targetId: safeStr(rel.targetId, ''),
+                type: safeStr(rel.type, ''),
+                description: safeStr(rel.description, ''),
+              })),
             aliases: safeStrArr(char.aliases),
             skills: safeStrArr(char.skills),
             color: safeStr(char.color, '#3B82F6'),
@@ -191,7 +196,9 @@ export default function CharacterPage() {
       }
     }
     fetchCharacters()
-  }, [selectedNovelId])
+    // 🔥 Bug修复：新增刷新列表版本号——增删角色/关系后统一走带 safe-merge 的加载路径，
+    //   不再各自散写 setCharacters 裸数据丢掉 color/x/y 等位置状态
+  }, [selectedNovelId, charListVersion])
 
   // 绘制关系图谱
   useEffect(() => {
@@ -212,7 +219,7 @@ export default function CharacterPage() {
     characters.forEach((char) => {
       (safeArr(char.relationships) as Relationship[]).forEach((rel) => {
         const target = characters.find((c) => c.id === rel.targetId)
-        if (target && char.x && char.y && target.x && target.y) {
+        if (target && typeof char.x === 'number' && typeof char.y === 'number' && typeof target.x === 'number' && typeof target.y === 'number') {
           ctx.beginPath()
           ctx.moveTo(char.x, char.y)
           ctx.lineTo(target.x, target.y)
@@ -232,7 +239,8 @@ export default function CharacterPage() {
 
     // 绘制节点
     characters.forEach((char) => {
-      if (char.x && char.y) {
+      // 🔥 Bug修复：拖到 (0,0) 的节点此前会被 falsy 判定拒绝绘制
+      if (typeof char.x === 'number' && typeof char.y === 'number') {
         // 绘制圆形背景
         ctx.beginPath()
         ctx.arc(char.x, char.y, 30, 0, Math.PI * 2)
@@ -269,7 +277,7 @@ export default function CharacterPage() {
 
     // 检查是否点击了角色
     const clickedChar = characters.find((char) => {
-      if (!char.x || !char.y) return false
+      if (typeof char.x !== 'number' || typeof char.y !== 'number') return false
       const distance = Math.sqrt((x - char.x) ** 2 + (y - char.y) ** 2)
       return distance <= 30
     })
@@ -290,7 +298,7 @@ export default function CharacterPage() {
     const y = e.clientY - rect.top
 
     const clickedChar = characters.find((char) => {
-      if (!char.x || !char.y) return false
+      if (typeof char.x !== 'number' || typeof char.y !== 'number') return false
       const distance = Math.sqrt((x - char.x) ** 2 + (y - char.y) ** 2)
       return distance <= 30
     })
@@ -794,11 +802,8 @@ export default function CharacterPage() {
                 })
                 if (response.ok) {
                   setShowCharacterModal(false)
-                  const charsResponse = await fetch(`/tuzhong-wenshu/api/characters?novelId=${selectedNovelId}`)
-                  if (charsResponse.ok) {
-                    const data = await charsResponse.json()
-                    setCharacters(data.data || data.characters || [])
-                  }
+                  // 🔥 Bug修复：统一走 safe-merge 加载路径 + 失败给出提示（此前静默丢失）
+                  setCharListVersion(function (v) { return v + 1 })
                 } else {
                   alert('添加角色失败，请重试')
                 }
@@ -950,11 +955,8 @@ export default function CharacterPage() {
                 if (response.ok) {
                   setSelectedCharacter(updatedCharacter)
                   setShowRelationModal(false)
-                  const charsResponse = await fetch(`/tuzhong-wenshu/api/characters?novelId=${selectedNovelId}`)
-                  if (charsResponse.ok) {
-                    const data = await charsResponse.json()
-                    setCharacters(data.data || data.characters || [])
-                  }
+                  // 🔥 Bug修复：统一走 safe-merge 加载路径（此前散写裸数据丢 color/x/y）
+                  setCharListVersion(function (v) { return v + 1 })
                 } else {
                   alert('添加关系失败，请重试')
                 }

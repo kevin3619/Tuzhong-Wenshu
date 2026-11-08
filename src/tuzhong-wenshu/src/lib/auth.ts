@@ -40,8 +40,14 @@ export async function createToken(userId: string, isAdmin: boolean): Promise<str
 
 export async function verifyToken(token: string): Promise<{ userId: string; isAdmin: boolean } | null> {
   try {
+    // 🔥 Bug修复：此前黑名单机制零调用——登出/改密后 JWT 在 7 天内仍然有效
+    if (token && LOGOUT_BLACKLIST.has(token)) return null
     const { payload } = await jwtVerify(token, JWT_SECRET)
-    return { userId: payload.userId as string, isAdmin: payload.isAdmin as boolean }
+    const userId = payload.userId as string
+    // 🔥 修复（P1）：middleware 走 jose 直验、不查黑名单，且 logout 只拉黑「当前这一个」token，
+    //   于是泄漏在 URL 里的 token（微信扫码回调）可继续用满 7 天。改为按用户维度记录失效时间。
+    if (userId && await isTokenRevokedFor(userId, payload.iat)) return null
+    return { userId, isAdmin: payload.isAdmin as boolean }
   } catch {
     return null
   }
@@ -60,4 +66,44 @@ export function blacklistToken(token: string): void {
 
 export async function isTokenBlacklisted(token: string): Promise<boolean> {
   return LOGOUT_BLACKLIST.has(token)
+}
+
+// ── 用户级令牌失效（写 SystemConfig，进程重启仍有效）──
+const PWD_EPOCH_PREFIX = 'pwd_changed_at_'
+const _epochCache = new Map<string, { at: number; ts: number }>()
+
+async function getEpochMs(userId: string): Promise<number> {
+  const hit = _epochCache.get(userId)
+  if (hit && Date.now() - hit.at < 30 * 1000) return hit.ts
+  let ts = 0
+  try {
+    const { prisma } = await import('./prisma')
+    const row = await prisma.systemConfig.findUnique({ where: { configKey: PWD_EPOCH_PREFIX + userId } })
+    if (row?.configValue) { const p = Date.parse(row.configValue); if (!isNaN(p)) ts = p }
+  } catch (e) {
+    console.error('[auth] 读取令牌失效时间失败（按未失效处理）:', e)
+  }
+  _epochCache.set(userId, { at: Date.now(), ts })
+  return ts
+}
+
+async function isTokenRevokedFor(userId: string, iat?: number): Promise<boolean> {
+  if (!iat) return false
+  const epoch = await getEpochMs(userId)
+  return epoch > 0 && iat * 1000 < epoch - 2000
+}
+
+/** 撤销某用户此前签发的全部令牌（改密/重置/登出/改角色时调用） */
+export async function invalidateUserTokens(userId: string): Promise<void> {
+  const iso = new Date().toISOString()
+  try {
+    const { prisma } = await import('./prisma')
+    await prisma.systemConfig.upsert({
+      where: { configKey: PWD_EPOCH_PREFIX + userId },
+      update: { configValue: iso, updatedAt: iso },
+      create: { configKey: PWD_EPOCH_PREFIX + userId, configValue: iso, createdAt: iso, updatedAt: iso },
+    })
+  } finally {
+    _epochCache.set(userId, { at: Date.now(), ts: Date.parse(iso) })
+  }
 }

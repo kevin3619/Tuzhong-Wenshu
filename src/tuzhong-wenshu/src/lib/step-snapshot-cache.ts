@@ -13,16 +13,38 @@ interface StepSnapshotStore {
 }
 
 // 内存快照池（每个步骤独立存储多版本快照）
-const projStepSavePool = new Map<StepSnapshotKey, StepSnapshotStore>()
+const projStepSavePool = new Map<string, StepSnapshotStore>()
 
 // 🔥 Bug修复：localStorage 持久化key前缀，防止热重载(Fast Refresh)重置内存Map导致数据丢失
 const LS_SNAPSHOT_PREFIX = 'tuzhong-snapshot-'
+
+// 🔥 Bug修复（P2 #1）：按"当前激活作品"隔离快照，避免切换作品时串快照（跨作品污染）
+// 默认从应用统一的激活作品键读取；若该键缺失，退回 'temp'（与向导未保存草稿态一致）
+const LS_ACTIVE_NOVEL_KEY = 'tuzhong-active-novel-id'
+let _snapshotNovelId: string | null = null
+export function setSnapshotNovelId(id: string | null): void {
+  _snapshotNovelId = id || null
+}
+function snapshotNovelNS(): string {
+  if (_snapshotNovelId) return _snapshotNovelId
+  try {
+    if (typeof window !== 'undefined' && window.localStorage) {
+      const v = window.localStorage.getItem(LS_ACTIVE_NOVEL_KEY)
+      if (v) return v
+    }
+  } catch (_e) { /* ignore */ }
+  return 'temp'
+}
+// 组合出带作品隔离维度的 localStorage 键：tuzhong-snapshot-<novelId>::<stepKey>
+function lsKey(stepKey: StepSnapshotKey): string {
+  return LS_SNAPSHOT_PREFIX + snapshotNovelNS() + '::' + stepKey
+}
 
 // 🔥 Bug修复：从 localStorage 恢复快照（热重载后自动调用）
 function restoreFromLocalStorage(stepKey: StepSnapshotKey): StepSnapshotStore | null {
   try {
     if (typeof window === 'undefined' || !window.localStorage) return null
-    const raw = window.localStorage.getItem(LS_SNAPSHOT_PREFIX + stepKey)
+    const raw = window.localStorage.getItem(lsKey(stepKey))
     if (!raw) return null
     const parsed = JSON.parse(raw)
     if (parsed && Array.isArray(parsed.snapshots) && parsed.snapshots.length > 0) {
@@ -47,7 +69,7 @@ function persistToLocalStorage(stepKey: StepSnapshotKey, store: StepSnapshotStor
       snapshots: store.snapshots.slice(-3), // 保留最近3个版本
       currentIdx: Math.min(store.currentIdx, 2) // 调整索引
     }
-    window.localStorage.setItem(LS_SNAPSHOT_PREFIX + stepKey, JSON.stringify(toPersist))
+    window.localStorage.setItem(lsKey(stepKey), JSON.stringify(toPersist))
   } catch (e) {
     // localStorage 配额不足时静默失败（不影响主流程）
     console.warn('[step-snapshot-cache] persistToLocalStorage failed for ' + stepKey + ':', e)
@@ -100,15 +122,16 @@ function isDomOrReactKey(key: string): boolean {
 
 // 初始化某步骤的快照存储
 function initStageCacheStore(stepKey: StepSnapshotKey): StepSnapshotStore {
-  const existing = projStepSavePool.get(stepKey)
+  const mapKey = snapshotNovelNS() + '::' + stepKey
+  const existing = projStepSavePool.get(mapKey)
   if (existing) {
     return existing
   }
   // 🔥 Bug修复：内存Map中没有时，尝试从localStorage恢复（热重载后自动恢复）
   const restored = restoreFromLocalStorage(stepKey)
   if (restored) {
-    projStepSavePool.set(stepKey, restored)
-    console.log('[step-snapshot-cache] 从localStorage恢复快照:', stepKey, '版本数:', restored.snapshots.length)
+    projStepSavePool.set(mapKey, restored)
+    console.log('[step-snapshot-cache] 从localStorage恢复快照:', mapKey, '版本数:', restored.snapshots.length)
     return restored
   }
   const newStore: StepSnapshotStore = {
@@ -116,7 +139,7 @@ function initStageCacheStore(stepKey: StepSnapshotKey): StepSnapshotStore {
     snapshots: [],
     currentIdx: -1,
   }
-  projStepSavePool.set(stepKey, newStore)
+  projStepSavePool.set(mapKey, newStore)
   return newStore
 }
 
@@ -311,6 +334,12 @@ export function saveStepSnapshot(stepKey: StepSnapshotKey, projStepSaveMsg: unkn
   const serialized = safeSerialize(projStepSaveMsg)
   store.snapshots.push(serialized)
   store.currentIdx = store.snapshots.length - 1
+  // 🔥 Bug修复：内存快照此前永不裁剪——向导长会话中快照无限增长；
+  // localStorage 侧只留3份，内存侧对齐裁到最近50份并校正索引
+  if (store.snapshots.length > 50) {
+    store.snapshots = store.snapshots.slice(-50)
+    store.currentIdx = store.snapshots.length - 1
+  }
   // 🔥 Bug修复：同步持久化到localStorage，防止热重载丢失
   persistToLocalStorage(stepKey, store)
 }
@@ -347,12 +376,36 @@ export function canRollbackStep(stepKey: StepSnapshotKey): boolean {
 
 // 清空某步骤所有快照
 export function clearStepSnapshots(stepKey: StepSnapshotKey): void {
-  projStepSavePool.delete(stepKey)
+  projStepSavePool.delete(snapshotNovelNS() + '::' + stepKey)
+  // 🔥 Bug修复：localStorage 键不同步删除的话，下一步 initStageCacheStore 又把旧快照恢复回来（"清空"失效）
+  try {
+    if (typeof window !== 'undefined' && window.localStorage) {
+      window.localStorage.removeItem(lsKey(stepKey))
+    }
+  } catch (_e) { /* 忽略 */ }
 }
 
-// 清空所有步骤快照
+// 清空所有步骤快照（仅清理当前激活作品命名空间 + 旧版无命名空间残留键）
 export function clearAllSnapshots(): void {
-  projStepSavePool.clear()
+  const ns = snapshotNovelNS()
+  const nsPrefix = LS_SNAPSHOT_PREFIX + ns + '::'
+  try {
+    if (typeof window !== 'undefined' && window.localStorage) {
+      const toRemove: string[] = []
+      for (let i = 0; i < window.localStorage.length; i++) {
+        const k = window.localStorage.key(i)
+        if (!k) continue
+        if (k.indexOf(nsPrefix) === 0) toRemove.push(k) // 当前作品命名空间
+        else if (k.indexOf(LS_SNAPSHOT_PREFIX) === 0 && k.indexOf('::') === -1) toRemove.push(k) // 旧版无命名空间残留
+      }
+      for (const k of toRemove) window.localStorage.removeItem(k)
+    }
+  } catch (_e) { /* 忽略 */ }
+  // 同时清空内存 Map 中当前作品命名空间的条目
+  const memPrefix = ns + '::'
+  for (const mk of Array.from(projStepSavePool.keys())) {
+    if (mk.indexOf(memPrefix) === 0) projStepSavePool.delete(mk)
+  }
 }
 
 // 自研业务数据克隆方法：剥离页面DOM绑定、React内部实例属性

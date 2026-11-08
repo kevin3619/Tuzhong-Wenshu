@@ -446,7 +446,7 @@ export default function SkillsPage() {
           setSkills([...mergedSkills, ...customSkills])
           setGlobalEnabled(parsed.globalEnabled ?? true)
         })
-      } catch {}
+      } catch (e) { console.error('[skills] 解析本地技能配置失败:', e) }
     } else {
       // 没有保存的话，使用预设技能（全部开启）
       queueMicrotask(function () {
@@ -687,9 +687,12 @@ export default function SkillsPage() {
               </div>
               <div>
                 <label className="block text-sm font-medium text-gray-700 mb-1">技能提示词</label>
+                {/* 🔥 修复（P2）：内置技能的提示词在保存时被直接丢弃，但界面允许编辑并提示成功
+                    （刷新就回滚）。现明确置灰只读，不再假装生效。 */}
                 <textarea
                   value={editPrompt}
                   onChange={(e) => setEditPrompt(e.target.value)}
+                  readOnly={!editingSkill?.isCustom}
                   rows={8}
                   className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-purple-500 focus:border-purple-500 resize-none"
                 />

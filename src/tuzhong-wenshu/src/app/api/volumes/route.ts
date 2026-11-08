@@ -2,6 +2,8 @@ import { NextResponse, NextRequest } from 'next/server'
 import fs from 'fs'
 import path from 'path'
 import { isAdminOnlyNovel, getRequestActor, loadNovelMetaOrNull } from '@/lib/permissions'
+import { checkNovelAccessFor } from '@/lib/novel-access'
+import { atomicWriteJson, runExclusive } from '@/lib/file-lock'
 
 const dataDir = path.join(process.cwd(), '.tuzhong-data')
 
@@ -27,19 +29,12 @@ function readVolumes() {
 
 // 写入分卷数据
 function writeVolumes(data: unknown) {
-  fs.writeFileSync(volumesFile, JSON.stringify(data, null, 2), 'utf-8')
+  atomicWriteJson(volumesFile, data)
 }
 
-async function checkNovelAccess(request: Request | NextRequest, novelId: string): Promise<{ ok: boolean; status?: number; error?: string }> {
-  const actor = await getRequestActor(request)
-  if (actor.isAdmin) return { ok: true }
-  if (isAdminOnlyNovel(String(novelId))) return { ok: false, status: 403, error: '无权访问此作品分卷' }
-  const meta = loadNovelMetaOrNull(String(novelId))
-  if (!meta) return { ok: false, status: 404, error: '作品不存在' }
-  if (!actor.userId) return { ok: false, status: 401, error: '请先登录' }
-  if (meta.userId && String(meta.userId) !== String(actor.userId)) return { ok: false, status: 403, error: '无权访问此作品分卷' }
-  return { ok: true }
-}
+
+const checkNovelAccess = (request: Request | NextRequest, novelId: string) =>
+  checkNovelAccessFor(request, novelId, '分卷')
 
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url)
@@ -91,26 +86,28 @@ export async function POST(request: Request) {
     return NextResponse.json({ success: false, error: access.error || '无权访问' }, { status: access.status || 403 })
   }
 
-  const allVolumes = readVolumes()
-  if (!allVolumes[novelId]) {
-    allVolumes[novelId] = []
-  }
+  return await runExclusive(volumesFile, async () => {
+    const allVolumes = readVolumes()
+    if (!allVolumes[novelId]) {
+      allVolumes[novelId] = []
+    }
 
-  const newVolume = {
-    id: Date.now().toString(),
-    novelId,
-    name: name || '',
-    summary: summary || '',
-    coreObjective: coreObjective || '',
-    order: order ?? allVolumes[novelId].length + 1,
-    chapters: chapters || [],
-    createdAt: new Date().toISOString(),
-  }
+    const newVolume = {
+      id: Date.now().toString(),
+      novelId,
+      name: name || '',
+      summary: summary || '',
+      coreObjective: coreObjective || '',
+      order: order ?? allVolumes[novelId].length + 1,
+      chapters: chapters || [],
+      createdAt: new Date().toISOString(),
+    }
 
-  allVolumes[novelId].push(newVolume)
-  writeVolumes(allVolumes)
+    allVolumes[novelId].push(newVolume)
+    writeVolumes(allVolumes)
 
-  return NextResponse.json({ success: true, data: newVolume }, { status: 201 })
+    return NextResponse.json({ success: true, data: newVolume }, { status: 201 })
+  })
 }
 
 export async function PUT(request: Request) {
@@ -126,28 +123,30 @@ export async function PUT(request: Request) {
     return NextResponse.json({ success: false, error: access.error || '无权访问' }, { status: access.status || 403 })
   }
 
-  const allVolumes = readVolumes()
-  if (!allVolumes[novelId]) {
-    return NextResponse.json({ success: false, error: '作品不存在' }, { status: 404 })
-  }
+  return await runExclusive(volumesFile, async () => {
+    const allVolumes = readVolumes()
+    if (!allVolumes[novelId]) {
+      return NextResponse.json({ success: false, error: '作品不存在' }, { status: 404 })
+    }
 
-  const index = allVolumes[novelId].findIndex((v: any) => v.id === volumeId)
-  if (index === -1) {
-    return NextResponse.json({ success: false, error: '分卷不存在' }, { status: 404 })
-  }
+    const index = allVolumes[novelId].findIndex((v: any) => v.id === volumeId)
+    if (index === -1) {
+      return NextResponse.json({ success: false, error: '分卷不存在' }, { status: 404 })
+    }
 
-  const updated = { ...allVolumes[novelId][index] }
-  if (name !== undefined) updated.name = name
-  if (summary !== undefined) updated.summary = summary
-  if (coreObjective !== undefined) updated.coreObjective = coreObjective
-  if (order !== undefined) updated.order = order
-  if (chapters !== undefined) updated.chapters = chapters
-  updated.updatedAt = new Date().toISOString()
+    const updated = { ...allVolumes[novelId][index] }
+    if (name !== undefined) updated.name = name
+    if (summary !== undefined) updated.summary = summary
+    if (coreObjective !== undefined) updated.coreObjective = coreObjective
+    if (order !== undefined) updated.order = order
+    if (chapters !== undefined) updated.chapters = chapters
+    updated.updatedAt = new Date().toISOString()
 
-  allVolumes[novelId][index] = updated
-  writeVolumes(allVolumes)
+    allVolumes[novelId][index] = updated
+    writeVolumes(allVolumes)
 
-  return NextResponse.json({ success: true, data: updated })
+    return NextResponse.json({ success: true, data: updated })
+  })
 }
 
 export async function DELETE(request: Request) {
@@ -162,15 +161,17 @@ export async function DELETE(request: Request) {
     return NextResponse.json({ success: false, error: access.error || '无权访问' }, { status: access.status || 403 })
   }
 
-  const allVolumes = readVolumes()
-  if (!allVolumes[novelId]) {
-    return NextResponse.json({ success: false, error: '作品不存在' }, { status: 404 })
-  }
-  const idx = allVolumes[novelId].findIndex((v: any) => v.id === volumeId)
-  if (idx === -1) {
-    return NextResponse.json({ success: false, error: '分卷不存在' }, { status: 404 })
-  }
-  allVolumes[novelId].splice(idx, 1)
-  writeVolumes(allVolumes)
-  return NextResponse.json({ success: true })
+  return await runExclusive(volumesFile, async () => {
+    const allVolumes = readVolumes()
+    if (!allVolumes[novelId]) {
+      return NextResponse.json({ success: false, error: '作品不存在' }, { status: 404 })
+    }
+    const idx = allVolumes[novelId].findIndex((v: any) => v.id === volumeId)
+    if (idx === -1) {
+      return NextResponse.json({ success: false, error: '分卷不存在' }, { status: 404 })
+    }
+    allVolumes[novelId].splice(idx, 1)
+    writeVolumes(allVolumes)
+    return NextResponse.json({ success: true })
+  })
 }

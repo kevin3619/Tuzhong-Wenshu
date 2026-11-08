@@ -11,7 +11,9 @@ export async function GET(request: NextRequest) {
     const status = request.nextUrl.searchParams.get('status')
     const where: { status?: number } = {}
     if (status !== null && status !== '' && status !== 'all') {
-      where.status = parseInt(status, 10)
+      // 🔥 Bug修复：parseInt NaN 直接进 Prisma 查询会异常
+      const _n = parseInt(status, 10)
+      if (!Number.isNaN(_n)) where.status = _n
     }
 
     const list = await prisma.feedback.findMany({

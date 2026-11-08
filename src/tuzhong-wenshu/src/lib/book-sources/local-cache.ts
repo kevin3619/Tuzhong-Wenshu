@@ -78,7 +78,7 @@ class LocalCache {
         }
       } catch (e) {
         // 解析失败，删除缓存
-        try { fs.unlinkSync(cacheFile) } catch (_) {}
+        try { fs.unlinkSync(cacheFile) } catch (e) { console.error('[local-cache] 删除损坏缓存文件失败:', e) }
       }
     }
     
@@ -130,7 +130,7 @@ class LocalCache {
         fs.unlinkSync(cacheFile)
       }
     } catch (e) {
-      // 忽略删除失败
+      console.error('[local-cache] 删除缓存文件失败:', e)
     }
   }
 
@@ -160,7 +160,7 @@ class LocalCache {
                 fs.unlinkSync(filePath)
               }
             } catch (e) {
-              try { fs.unlinkSync(filePath) } catch (_) {}
+              try { fs.unlinkSync(filePath) } catch (e) { console.error('[local-cache] 删除过期缓存文件失败:', e) }
             }
           }
         }

@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { useParams, useRouter } from 'next/navigation'
 import Link from 'next/link'
 import {
@@ -60,6 +60,15 @@ import {
   Ruler,
 } from 'lucide-react'
 import AIGenerateWizard from '@/components/ai-generate-wizard'
+import {
+  applyPreferencesToLocalStorage,
+  fetchServerPreferences,
+  getLocalPrefsUpdatedAt,
+  getLocalZhuqueApiKey,
+  pushServerPreferences,
+  resolveStyleId,
+  resolveStyleName,
+} from '@/lib/user-preferences-client'
 
 interface Novel {
   id: string
@@ -153,10 +162,30 @@ export default function NovelEditorPage() {
   const [expandedVolumes, setExpandedVolumes] = useState<Record<number, boolean>>({})
   const [coverUrl, setCoverUrl] = useState<string>('')
   const [coverFallbackIndex, setCoverFallbackIndex] = useState<number>(0)
+  const [coverZoomOpen, setCoverZoomOpen] = useState<boolean>(false)
+
+  // 封面灯箱：ESC 关闭 + 锁定背景滚动
+  useEffect(() => {
+    if (!coverZoomOpen) return
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setCoverZoomOpen(false) }
+    window.addEventListener('keydown', onKey)
+    const prevOverflow = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+    return () => {
+      window.removeEventListener('keydown', onKey)
+      document.body.style.overflow = prevOverflow
+    }
+  }, [coverZoomOpen])
 
   // 正文编辑模式 + 临时内容
   const [isEditMode, setIsEditMode] = useState(false)
   const [editDraft, setEditDraft] = useState('')
+  // 🔥 修复（P0 正文被覆盖/丢稿）：草稿基线 + 切章序号。旧实现把「上一章」的异步正文
+  //   写进「当前选中章节」，用户一保存就把新章节原稿覆盖；且切章/刷新无脏值守卫。
+  const draftBaselineRef = useRef('')
+  const editDraftRef = useRef('')
+  const chapterSwitchSeqRef = useRef(0)
+  useEffect(function () { editDraftRef.current = editDraft }, [editDraft])
   const [isSaving, setIsSaving] = useState(false)
 
   // 章节内容显示偏好
@@ -186,7 +215,7 @@ export default function NovelEditorPage() {
       const saved = localStorage.getItem('tuzhong-preferences')
       if (saved) {
         const prefs = JSON.parse(saved)
-        if (prefs.writingStyle) queueMicrotask(function () { setWritingStyle(prefs.writingStyle) })
+        if (prefs.writingStyle) queueMicrotask(function () { setWritingStyle(resolveStyleName(String(prefs.writingStyle))) })
         if (prefs.continuationLength) {
           const lenMap: Record<string, 'short' | 'medium' | 'long'> = { short: 'short', medium: 'medium', long: 'long' }
           if (lenMap[prefs.continuationLength]) queueMicrotask(function () { setContinueLength(lenMap[prefs.continuationLength]) })
@@ -203,6 +232,21 @@ export default function NovelEditorPage() {
     } catch (e) {
       console.warn('[write] 加载偏好失败:', e)
     }
+
+    // 🔥 2026-10-20：账号级偏好同步——换浏览器/设备登录后仍能拿到已保存的风格与平台标准
+    fetchServerPreferences().then(function (res) {
+      if (!res || !res.data) return
+      if (res.updatedAt < getLocalPrefsUpdatedAt()) return
+      applyPreferencesToLocalStorage(res.data, res.updatedAt)
+      applyDetectPlatformsFromLocal()
+      const d = res.data as Record<string, any>
+      if (d.writingStyle) queueMicrotask(function () { setWritingStyle(resolveStyleName(String(d.writingStyle))) })
+      if (d.continuationLength) {
+        const lenMap: Record<string, 'short' | 'medium' | 'long'> = { short: 'short', medium: 'medium', long: 'long' }
+        const v = lenMap[String(d.continuationLength)]
+        if (v) queueMicrotask(function () { setContinueLength(v) })
+      }
+    }).catch(function () { /* 离线时继续用本机缓存 */ })
   }, [])
 
   // 阅读偏好持久化
@@ -219,7 +263,7 @@ export default function NovelEditorPage() {
       prefs.firstLineIndent = firstLineIndent
       prefs.autoWrap = autoWrap
       localStorage.setItem('tuzhong-preferences', JSON.stringify(prefs))
-    } catch (e) { /* ignore */ }
+    } catch (e) { console.error('[write] 保存阅读偏好失败:', e) }
   }, [readerTheme, fontFamily, fontSize, lineHeight, paragraphSpacing, contentWidth, firstLineIndent, autoWrap])
 
   const [showToolPanel, setShowToolPanel] = useState(false)
@@ -230,6 +274,173 @@ export default function NovelEditorPage() {
   const [continueLength, setContinueLength] = useState<'short' | 'medium' | 'long'>('medium')
   const [isGenerating, setIsGenerating] = useState(false)
   const [toolResult, setToolResult] = useState<string>('')
+  // ============================================================
+  // 🔥 修复（P1 假功能）：右侧「风格续写 / 深度改写」此前是 setTimeout + 写死的示例文本
+  //   （甚至自称「消除AI痕迹约15%，自然度提升至92%」），用户会误以为 AI 真的分析了自己的书。
+  //   现改为真实调用后端接口；模型不可用时直接报错，绝不编造结果。
+  // ============================================================
+  const [toolBusy, setToolBusy] = useState(false)
+  const [toolError, setToolError] = useState('')
+  const [continueOptions, setContinueOptions] = useState<string[]>([])
+  const [rewriteResult, setRewriteResult] = useState('')
+  const [toolNotice, setToolNotice] = useState('')
+  const [settingQuery, setSettingQuery] = useState('')
+
+  async function aiPost(url: string, payload: Record<string, unknown>): Promise<Record<string, any>> {
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+    try {
+      const t = typeof window !== 'undefined' ? (localStorage.getItem('token') || '') : ''
+      if (t) headers.Authorization = 'Bearer ' + t
+    } catch { /* 隐私模式退回 cookie 鉴权 */ }
+    const res = await fetch(url, { method: 'POST', headers, body: JSON.stringify(payload) })
+    const json = await res.json().catch(function () { return null })
+    if (!res.ok) {
+      if (res.status === 401) throw new Error('登录已过期，请重新登录')
+      throw new Error((json && (json.error || json.message)) || ('服务返回 HTTP ' + res.status))
+    }
+    return (json && json.data) ? json.data : (json || {})
+  }
+
+  function toolSourceText(): string {
+    if (isEditMode && editDraft) return editDraft
+    return selectedChapter?.content || ''
+  }
+
+  async function handleRealContinue() {
+    const src = toolSourceText()
+    if (src.trim().length < 30) { setToolError('本章正文太短（不足 30 字），无法续写'); return }
+    setToolBusy(true); setToolError(''); setToolNotice(''); setContinueOptions([]); setToolResult('')
+    try {
+      const data = await aiPost('/tuzhong-wenshu/api/ai/continue', {
+        context: src.slice(-1800), style: writingStyle, length: continueLength,
+      })
+      const opts = Array.isArray(data.options) ? data.options.filter(function (o: unknown) { return typeof o === 'string' && (o as string).trim() }) : []
+      if (!opts.length) throw new Error('模型未返回续写内容（请检查 AI 模型配置）')
+      setContinueOptions(opts)
+      setToolNotice('已生成 ' + opts.length + ' 个续写方向，可追加到本章末尾')
+    } catch (e) { setToolError('续写失败：' + ((e as Error)?.message || String(e))) } finally { setToolBusy(false) }
+  }
+
+  async function handleRealRewrite() {
+    const src = toolSourceText()
+    if (src.trim().length < 30) { setToolError('本章正文太短（不足 30 字），无法改写'); return }
+    setToolBusy(true); setToolError(''); setToolNotice(''); setToolResult(''); setRewriteResult('')
+    try {
+      const data = await aiPost('/tuzhong-wenshu/api/ai/rewrite', { text: src, style: 'fanqie', intensity: 'medium' })
+      const out = String(data.rewrittenText || '').trim()
+      if (!out) throw new Error('模型未返回改写结果')
+      setRewriteResult(out)
+      setToolNotice(String(data.llmWarning || '') || '改写完成，可一键替换草稿')
+    } catch (e) { setToolError('改写失败：' + ((e as Error)?.message || String(e))) } finally { setToolBusy(false) }
+  }
+
+  function applyContinueToDraft(text: string) {
+    const base = toolSourceText()
+    setEditDraft(base ? base + '\n\n' + text : text)
+    editDraftRef.current = base ? base + '\n\n' + text : text
+    setIsEditMode(true)
+    setToolNotice('已追加到正文末尾并进入编辑模式，点「保存」才会写库')
+  }
+
+  const settingsBundleRef = useRef<{ novelId: string; characters: any[]; world: unknown } | null>(null)
+
+  async function loadSettingsBundle() {
+    if (settingsBundleRef.current && settingsBundleRef.current.novelId === novelId) return settingsBundleRef.current
+    const grab = async function (url: string) {
+      try {
+        const r = await fetch(url)
+        if (!r.ok) return null
+        const j = await r.json()
+        return j && j.data !== undefined ? j.data : j
+      } catch { return null }
+    }
+    const qs = 'novelId=' + encodeURIComponent(novelId || '')
+    const [ch, world] = await Promise.all([grab('/tuzhong-wenshu/api/characters?' + qs), grab('/tuzhong-wenshu/api/settings?' + qs)])
+    const characters = Array.isArray(ch) ? ch : (ch && Array.isArray((ch as any).characters) ? (ch as any).characters : [])
+    const bundle = { novelId: novelId || '', characters, world }
+    settingsBundleRef.current = bundle
+    return bundle
+  }
+
+  function collectSettingLeaves(node: unknown, kw: string, cap: number, path = ''): string[] {
+    const out: string[] = []
+    const walk = function (v: unknown, p: string) {
+      if (out.length >= cap) return
+      if (typeof v === 'string') {
+        const s = v.trim()
+        if (s && (!kw || s.includes(kw) || p.includes(kw))) out.push((p ? p + '：' : '') + s.slice(0, 80))
+        return
+      }
+      if (Array.isArray(v)) { v.forEach(function (x, i) { walk(x, p + '[' + i + ']') }); return }
+      if (v && typeof v === 'object') Object.keys(v as Record<string, unknown>).forEach(function (k) { walk((v as Record<string, unknown>)[k], p ? p + '.' + k : k) })
+    }
+    walk(node, path)
+    return out
+  }
+
+  async function handleSettingQuery(kw: string) {
+    setToolBusy(true); setToolError(''); setToolResult('')
+    try {
+      const bundle = await loadSettingsBundle()
+      const key = String(kw || '').trim()
+      const body = toolSourceText()
+      const lines: string[] = []
+      const chars: any[] = bundle.characters
+      if (chars.length) {
+        const matched = chars.filter(function (c) {
+          const name = String(c && (c.name || c.姓名) || '')
+          if (!name) return false
+          return key ? (name.includes(key) || JSON.stringify(c).includes(key)) : body.includes(name)
+        }).slice(0, 10)
+        lines.push(key ? ('【人物设定 · 命中 ' + matched.length + ' / 共 ' + chars.length + ' 人】') : ('【本章疑似出场人物 · ' + matched.length + ' / 共 ' + chars.length + ' 人】'))
+        matched.forEach(function (c) {
+          lines.push('• ' + [String(c.name || ''), String(c.title || c.role || ''), String(c.identity || ''), String(c.personality || '').slice(0, 30), String(c.relationshipWithProtagonist || '').slice(0, 30)].filter(Boolean).join('｜'))
+        })
+      }
+      const leaves = collectSettingLeaves(bundle.world, key, 12)
+      if (leaves.length) { lines.push(key ? '【世界观/设定命中】' : '【世界观设定摘要】'); leaves.forEach(function (l) { lines.push('• ' + l) }) }
+      setToolResult(lines.length ? lines.join('\n') : (key ? ('设定库里没有匹配「' + key + '」的条目。') : '本作暂无可查询的设定数据。'))
+    } catch (e) { setToolError('查询失败：' + ((e as Error)?.message || String(e))) } finally { setToolBusy(false) }
+  }
+
+  /**
+   * 🔥 原「对标分析」返回写死的「对比《盘龙》相似度68%」——平台内没有这些书的正文，
+   *   任何百分比都是编造的。改为只报当前正文真实算得出的指标。
+   */
+  function handleSelfCheck() {
+    const src = toolSourceText()
+    if (src.trim().length < 50) { setToolError('本章正文太短，无法统计'); return }
+    setToolError(''); setToolResult('')
+    const clean = src.replace(/\s+/g, '')
+    const paras = src.split('\n').map(function (s) { return s.trim() }).filter(Boolean)
+    const sents = src.split(/[。！？…]+/).map(function (s) { return s.trim() }).filter(function (s) { return s.length > 1 })
+    const dialog = (src.match(/[「“"][^」”"]{2,}[」”"]/g) || []).join('')
+    const dialogRatio = clean.length ? Math.round((dialog.replace(/\s+/g, '').length / clean.length) * 100) : 0
+    const lens = paras.map(function (p) { return p.replace(/\s+/g, '').length })
+    const mean = lens.reduce(function (a, b) { return a + b }, 0) / (lens.length || 1)
+    const cv = mean ? Math.round(Math.sqrt(lens.reduce(function (a, b) { return a + (b - mean) * (b - mean) }, 0) / (lens.length || 1)) / mean * 100) : 0
+    const banned = ['值得注意的是', '总而言之', '综上所述', '由此可见', '瞳孔骤缩', '倒吸一口凉气', '嘴角勾起一抹', '眼中闪过一丝']
+      .map(function (w) { return { w: w, n: (src.match(new RegExp(w, 'g')) || []).length } }).filter(function (x) { return x.n > 0 })
+    const lines = [
+      '【本章真实指标】',
+      '· 正文净字数：' + clean.length,
+      '· 段落数：' + paras.length + '，平均段长：' + Math.round(mean) + ' 字',
+      '· 平均句长：' + Math.round(clean.length / Math.max(1, sents.length)) + ' 字',
+      '· 对话占比：' + dialogRatio + '%（平台参考 25%–35%）',
+      '· 段长波动系数：' + cv + '%' + (cv < 25 ? '（偏均匀，节奏容易单调）' : '（有起伏）'),
+      banned.length ? ('· AI 高频词命中：' + banned.map(function (x) { return x.w + '×' + x.n }).join('、')) : '· AI 高频词命中：0',
+      '',
+      '说明：不再提供与《盘龙》等作品「相似度」——平台内没有这些书的正文数据可比对。',
+    ]
+    setToolResult(lines.join('\n'))
+  }
+
+  function replaceDraftWithRewrite(text: string) {
+    setEditDraft(text)
+    editDraftRef.current = text
+    setIsEditMode(true)
+    setToolNotice('已用改写结果替换草稿（未保存），点「保存」写库')
+  }
   const [selectedPlatform, setSelectedPlatform] = useState('tomato')
 
   // 进入编辑模式 / 切换章节时重置编辑草稿
@@ -238,6 +449,8 @@ export default function NovelEditorPage() {
       const currentRaw = isRealTxtNovel() ? simpleCleanTxtContent(selectedChapter.content) : dePipelineContent(selectedChapter.content, selectedChapter.title)
       queueMicrotask(function () {
         setEditDraft(currentRaw)
+        editDraftRef.current = currentRaw
+        draftBaselineRef.current = currentRaw
         setIsEditMode(false)
       })
     }
@@ -262,6 +475,8 @@ export default function NovelEditorPage() {
       if (!res.ok) throw new Error('保存失败')
       const json = await res.json()
       const updatedChapter = json.data as Chapter
+      // 🔥 保存成功后刷新脏值基线，避免切章时误报「有未保存修改」
+      draftBaselineRef.current = editDraft
       setChapters(prev => prev.map(c => c.id === updatedChapter.id ? { ...c, ...updatedChapter } : c))
       setSelectedChapter(prev => prev ? { ...prev, ...updatedChapter } : prev)
       setIsEditMode(false)
@@ -280,6 +495,245 @@ export default function NovelEditorPage() {
       : ''
     setEditDraft(currentRaw)
     setIsEditMode(false)
+  }
+
+  // 🔥 2026-10-18：「AI生成」按钮——按分卷/章节摘要整章重写（与生成向导同一条 ai-generate 精写链路）
+  // 🔥 2026-10-18-2：目标字数自由输入 + 目标章节自由选择/批量（2 或 2-4 或 1,3,5）
+  const [regenWordsInput, setRegenWordsInput] = useState('2500')
+  const [regenChapterInput, setRegenChapterInput] = useState('1')
+  const [regenElapsed, setRegenElapsed] = useState(0)
+  const regenAbortRef = useRef<AbortController | null>(null)
+
+  // 生成中计时（让等待状态可感知，不再"空转"）
+  useEffect(() => {
+    if (!isGenerating) return
+    setRegenElapsed(0)
+    const timer = setInterval(() => setRegenElapsed((s) => s + 1), 1000)
+    return () => clearInterval(timer)
+  }, [isGenerating])
+
+  // 解析章节规格：'3' / '3-5' / '1,3,5-6'
+  function parseChapterList(spec: string): number[] {
+    // 🔥 2026-11-01 支持「卷N」语法：一卷 60 章一键批量
+    const volMatch = spec.trim().match(/^卷\s*(\d+)$/)
+    if (volMatch) {
+      const vo = Number(volMatch[1])
+      const volList = chapters
+        .filter(c => Number((c as any).volume) === vo)
+        .map(c => Number((c as any).chapterNumber))
+        .filter(n => n > 0)
+        .sort((x: number, y: number) => x - y)
+      if (volList.length) return volList.slice(0, 60)
+    }
+    const out: number[] = []
+    for (const part of spec.split(/[,，\s]+/)) {
+      if (!part) continue
+      const m = part.match(/(\d+)\s*[-—~]\s*(\d+)/)
+      if (m) {
+        let a = Number(m[1]); let b = Number(m[2])
+        if (a > b) { const t = a; a = b; b = t }
+        for (let i = a; i <= b && i <= a + 59; i++) out.push(i)
+      } else {
+        const v = parseInt(part, 10)
+        if (!isNaN(v)) out.push(v)
+      }
+    }
+    // 🔥 2026-11-01 批量放宽：支持一卷 60 章批量（原 slice(0,10) 静默砍章是 60 章批量失败的首因）
+    return Array.from(new Set(out)).slice(0, 60)
+  }
+
+  // 读取用户在「个人设置→平台AI检测配置」保存的平台标准，随生成请求上传（服务端注入引擎提示词+AI率闸门）
+  function readPlatformStandards(): Array<{ name: string; aiStandard: string; criteria: string[] }> {
+    try {
+      let src: any[] = []
+      const raw1 = localStorage.getItem('tuzhong-platform-configs')
+      if (raw1) src = JSON.parse(raw1) || []
+      if (!Array.isArray(src) || src.length === 0) {
+        const prefsRaw = localStorage.getItem('tuzhong-preferences')
+        if (prefsRaw) {
+          const prefs = JSON.parse(prefsRaw)
+          if (Array.isArray(prefs.platformConfigs)) src = prefs.platformConfigs
+        }
+      }
+      return (Array.isArray(src) ? src : [])
+        .filter((p: any) => p && p.enabled)
+        .map((p: any) => ({
+          name: (typeof p.name === 'string' && p.name) || '',
+          aiStandard: (typeof p.aiStandard === 'string' && p.aiStandard) || '',
+          criteria: Array.isArray(p.criteria) ? p.criteria.filter((c: any) => typeof c === 'string').slice(0, 4) : [],
+        }))
+    } catch (_e) { return [] }
+  }
+
+  // 🔥 单章生成辅助：返回 { zh, content }；错误直接抛出（批量循环里统一处理）
+  async function regenOneChapter(tn: number, targetWords: number, signal: AbortSignal, prevEndingIn: string): Promise<{ zh: number; content: string }> {
+    const chapter = chapters.find(c => Number((c as any).chapterNumber) === tn) as any
+    if (!chapter) throw new Error('目录中没有第 ' + tn + ' 章')
+    const curSummary = chapter.summary || (volumes.find(v => v.order === chapter.volume)?.summary || '')
+    if (!curSummary) throw new Error('第 ' + tn + ' 章没有章节摘要，请先在设定中心补全章节大纲')
+    const chIdx = chapters.findIndex(c => c.id === chapter.id)
+    // 上一章结尾：外部传入（批量时沿用上一章产物；单章时由调用方传入）
+    const prevData: any = {
+      chapterNumber: tn,
+      chapterTitle: chapter.title || ('第' + tn + '章'),
+      corePlot: curSummary,
+      shuangPoints: chapter.shuangPoints || '',
+      prevEnding: prevEndingIn || '（新章开始）',
+      prevChaptersSummary: chapters.filter((c, i) => i < chIdx)
+        .map((c, i) => '第' + ((c as any).chapterNumber || i + 1) + '章《' + (c.title || '') + '》：' + (c.summary || '').slice(0, 40))
+        .join('\n'),
+      idea: { title: novel?.title || '', genre: novel?.genre || '' },
+      synopsis: novel?.description || '',
+      worldbuilding: {}, powerSystem: {}, characters: {}, outline: '', keyPlots: {},
+      // 🔥 2026-10-22 跨章保护（与引擎闸门同口径）：
+      //   引擎的「跨章撞句」防护依赖前文 n-gram 黑名单与上一章全文；
+      //   应用内批量此前没传这两项 → 引擎的跨章保护形同虚设（实测相邻章撞句 36~44 处、词汇分布掉到 67）。
+      //   这里把最近 3 章正文传过去，引擎据此自算公式句黑名单（batch 路径同源）。
+      prevFullText: chapters.filter((c, i) => i < chIdx && i >= chIdx - 3)
+        .map((c: any) => String((c as any).content || ''))
+        .filter(Boolean)
+        .join('\n'),
+      // 卷/章摘要随卷传入（引擎的跨章口径与平台标准不依赖这里，仅作上下文）
+      chapters: { volumes: volumes.map(v => ({ name: v.name, summary: v.summary, order: v.order })) },
+    }
+    const res = await fetch('/tuzhong-wenshu/api/ai-generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        step: 'content',
+        input: { title: chapter.title || ('第' + tn + '章'), summary: curSummary, engineNovelKey: novelId },
+        genre: novel?.genre || '',
+        novelId,
+        targetWordCount: targetWords,
+        style: writingStyle,
+        newCharacters: '',
+        previousData: prevData,
+        platformStandards: readPlatformStandards(),
+      }),
+      signal,
+    })
+    const json = await res.json().catch(() => ({}))
+    if (!res.ok) throw new Error(json.error || ('HTTP ' + res.status))
+    const data = json?.data
+    let content = typeof data === 'string' ? data : (data && (data.content || data.text)) || ''
+    if (!content && data && typeof data === 'object') {
+      let best = '', bestN = 0
+      ;(function walk(o: any) {
+        if (typeof o === 'string') { const n = (o.match(/[\u4e00-\u9fa5]/g) || []).length; if (n > bestN) { bestN = n; best = o } return }
+        if (o && typeof o === 'object') for (const k in o) { try { walk(o[k]) } catch (_e) {} }
+      })(data)
+      content = best
+    }
+    const zh = (content.match(/[\u4e00-\u9fa5]/g) || []).length
+    if (!content || zh < 500) throw new Error('第 ' + tn + ' 章生成内容过短（' + zh + ' 汉字），已放弃写回')
+    const saveRes = await fetch('/tuzhong-wenshu/api/chapters', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ novelId, chapterId: chapter.id, content, title: chapter.title || selectedChapter?.title, status: 'completed' }),
+    })
+    if (!saveRes.ok) throw new Error('第 ' + tn + ' 章生成成功但保存失败')
+    // 更新本地章节状态（正文同步刷新）
+    try {
+      const sj = await saveRes.json()
+      const updatedChapter = sj.data as Chapter
+      setChapters(prev => prev.map(c => c.id === updatedChapter.id ? { ...c, ...updatedChapter, ...(updatedChapter.content ? {} : { content }) } : c))
+      if (selectedChapter && selectedChapter.id === updatedChapter.id) {
+        queueMicrotask(() => {
+          setSelectedChapter(prev => prev ? { ...prev, ...updatedChapter, content: (updatedChapter as any).content || content } as Chapter : prev)
+          setEditDraft((updatedChapter as any).content || content)
+          setIsEditMode(false)
+        })
+      }
+    } catch (_e) { /* 状态刷新失败不影响写回 */ }
+    return { zh, content }
+  }
+
+  async function handleAIRegenerate() {
+    if (!novelId || isGenerating) return
+    const targets = parseChapterList(regenChapterInput)
+    if (!targets.length) { alert('请填写目标章节：单章填 2，批量填 2-4 或 1,3,5，或输入 卷1/卷2 直接跑一整卷（≤60章）'); return }
+    for (const tn of targets) {
+      const c = chapters.find(x => Number((x as any).chapterNumber) === tn)
+      if (!c) { alert('目录中没有第 ' + tn + ' 章'); return }
+      if (!(c as any).summary && !window.confirm('第 ' + tn + ' 章没有章节摘要，无法按摘要重写（会被跳过并报错）。继续？')) return
+    }
+    // 🔥 字数自由输入（800-8000），不再固定三档
+    const parsedWords = parseInt(regenWordsInput, 10)
+    const targetWords = Math.min(8000, Math.max(800, isNaN(parsedWords) ? 2500 : parsedWords))
+    const targetPreview = targets.length > 8 ? targets.slice(0, 8).join(',') + '…共' + targets.length + '章' : targets.join(',')
+    const hoursHint = Math.round(targets.length * 5 / 6) / 10
+    if (!window.confirm('将按分卷/章节摘要重新生成第 ' + targetPreview + '，并覆盖对应正文。字数目标 ' + targetWords + ' 汉字，预计约 ' + hoursHint + ' 小时（每章 3-10 分钟）。中途失败自动跳过并汇总，已成功章不会重复生成，请保持页面打开。继续？')) return
+    setIsGenerating(true)
+    setToolResult('')
+    const aborter = new AbortController()
+    regenAbortRef.current = aborter
+    try {
+      // 首章衔接：取目标首章前一章节选尾部；批量内自动串联上一章生成稿
+      let prevEnding = ''
+      const firstIdx = chapters.findIndex(c => Number((c as any).chapterNumber) === targets[0])
+      if (firstIdx > 0) {
+        try {
+          const pRes = await fetch(`/tuzhong-wenshu/api/chapters?novelId=${novelId}&chapterId=${chapters[firstIdx - 1].id}`)
+          if (pRes.ok) prevEnding = String((await pRes.json())?.data?.content || '').slice(-500)
+        } catch (_e) { /* 静默降级 */ }
+      }
+      const doneLog: string[] = []
+      const failLog: string[] = []
+      for (let t = 0; t < targets.length; t++) {
+        if (aborter.signal.aborted) break
+        const tn = targets[t]
+        setToolResult('（' + (t + 1) + '/' + targets.length + '）正在生成第 ' + tn + ' 章… 逐场景精写中最长约 10 分钟')
+        // 🔥 2026-11-01 单章容错：失败重试 1 次（冷却 15s 躲限流），仍失败则跳过记录——不再一章失败中断整批
+        let okOne = false
+        let lastErrMsg = ''
+        for (let attempt = 1; attempt <= 2; attempt++) {
+          try {
+            const { zh, content } = await regenOneChapter(tn, targetWords, aborter.signal, prevEnding || '（新章开始）')
+            prevEnding = content.slice(-500)
+            doneLog.push('第' + tn + '章 ' + zh + '字')
+            okOne = true
+            break
+          } catch (e) {
+            if (aborter.signal.aborted) break
+            const msg = ((e as Error).message || String(e)).slice(0, 80)
+            lastErrMsg = msg
+            if (attempt === 1) {
+              setToolResult('（' + (t + 1) + '/' + targets.length + '）第 ' + tn + ' 章首次失败（' + msg + '），15 秒后自动重试一次…')
+              await new Promise(r => setTimeout(r, 15000))
+            }
+          }
+        }
+        if (!okOne && !aborter.signal.aborted) {
+          failLog.push('第' + tn + '章：' + lastErrMsg)
+          // 🔥 衔接连链保护：失败章的下一章改用该章当前已存内容结尾（新旧稿均可），保证批内不断链、不漂移
+          try {
+            const cur = chapters.find(c => Number((c as any).chapterNumber) === tn)
+            const cRes = await fetch('/tuzhong-wenshu/api/chapters?novelId=' + novelId + '&chapterId=' + (cur as any).id)
+            const cText = String((await cRes.json())?.data?.content || '')
+            if (cText) prevEnding = cText.slice(-500)
+          } catch (_e) { /* 保持原 prevEnding */ }
+        }
+      }
+      if (aborter.signal.aborted) {
+        setToolResult('⏹ 已取消生成。已完成：' + (doneLog.join('、') || '无') + (failLog.length ? '；失败跳过：' + failLog.join('；') : '') + '。未完成的章节未被改动，可从失败章号继续（衔接自动接上）。')
+      } else if (failLog.length) {
+        setToolResult('⚠ 批量完成：成功 ' + doneLog.length + ' 章（' + doneLog.join('、') + '）；失败 ' + failLog.length + ' 章——' + failLog.join('；') + '。直接从失败章号重新发起即可续跑，已成功章不会重复生成。')
+      } else {
+        setToolResult('✅ 已按卷/章摘要重新生成 ' + doneLog.length + ' 章：' + doneLog.join('、') + '，均已自动保存。')
+      }
+    } catch (e) {
+      const err = e as Error
+      if (err.name === 'AbortError') {
+        setToolResult('⏹ 已取消本次生成（未改动本章内容）')
+      } else {
+        const msg = err.message || String(e)
+        setToolResult('❌ ' + msg)
+        alert('❌ AI生成失败: ' + msg)
+      }
+    } finally {
+      setIsGenerating(false)
+      regenAbortRef.current = null
+    }
   }
 
   function handlePrint() { window.print() }
@@ -351,19 +805,58 @@ export default function NovelEditorPage() {
       setSearchMatchIndex(res.length ? 0 : -1)
     })
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [searchQuery, selectedChapter?.id])
+  }, [searchQuery, selectedChapter?.id, selectedChapter?.content])
 
   // 检测平台配置（可配置的检测标准）
   const [detectPlatforms, setDetectPlatforms] = useState([
-    { key: 'tomato', name: '番茄小说', icon: '🍅', aiStandard: '< 5%', color: 'red', enabled: true },
-    { key: 'zhuque', name: '朱雀AI', icon: '🔴', aiStandard: '< 5%', color: 'rose', enabled: true },
-    { key: 'qimao', name: '七猫小说', icon: '🐱', aiStandard: '< 8%', color: 'orange', enabled: false },
-    { key: 'qidian', name: '起点中文', icon: '📖', aiStandard: '< 10%', color: 'blue', enabled: false },
-    { key: 'jinjiang', name: '晋江文学', icon: '🌸', aiStandard: '< 8%', color: 'pink', enabled: false },
-    { key: 'feilu', name: '飞卢小说', icon: '⚡', aiStandard: '< 10%', color: 'yellow', enabled: false },
-    { key: 'zongheng', name: '纵横中文', icon: '🌊', aiStandard: '< 12%', color: 'cyan', enabled: false },
-    { key: 'yuedong', name: '阅动文化', icon: '📚', aiStandard: '< 10%', color: 'green', enabled: false },
+    { key: 'tomato', name: '番茄小说', icon: '🍅', aiStandard: '< 30%', color: 'red', enabled: true },
+    { key: 'zhuque', name: '朱雀AI', icon: '🔴', aiStandard: '< 40%', color: 'rose', enabled: true },
+    { key: 'qimao', name: '七猫小说', icon: '🐱', aiStandard: '< 35%', color: 'orange', enabled: false },
+    { key: 'qidian', name: '起点中文', icon: '📖', aiStandard: '< 35%', color: 'blue', enabled: false },
+    { key: 'jinjiang', name: '晋江文学', icon: '🌸', aiStandard: '< 20%', color: 'pink', enabled: false },
+    { key: 'feilu', name: '飞卢小说', icon: '⚡', aiStandard: '< 40%', color: 'yellow', enabled: false },
+    { key: 'zongheng', name: '纵横中文', icon: '🌊', aiStandard: '< 35%', color: 'cyan', enabled: false },
+    { key: 'yuedong', name: '阅动文化', icon: '📚', aiStandard: '< 30%', color: 'green', enabled: false },
   ])
+
+  // 🔥 2026-10-19：检测标准与「个人设置→平台AI检测配置」同步——用户改过的标准（如 <1%）必须在这里生效
+  function applyDetectPlatformsFromLocal() {
+    try {
+      let src: any[] = []
+      const raw1 = localStorage.getItem('tuzhong-platform-configs')
+      if (raw1) src = JSON.parse(raw1) || []
+      if (!Array.isArray(src) || src.length === 0) {
+        const prefsRaw = localStorage.getItem('tuzhong-preferences')
+        if (prefsRaw) {
+          const prefs = JSON.parse(prefsRaw)
+          if (Array.isArray(prefs.platformConfigs)) src = prefs.platformConfigs
+        }
+      }
+      if (!Array.isArray(src) || src.length === 0) return
+      setDetectPlatforms(function (prev) {
+        return prev.map(function (def) {
+          const saved = src.find(function (s: any) { return s && s.key === def.key })
+          if (!saved) return def
+          return {
+            ...def,
+            name: (typeof saved.name === 'string' && saved.name) || def.name,
+            aiStandard: (typeof saved.aiStandard === 'string' && saved.aiStandard.trim()) || def.aiStandard,
+            enabled: typeof saved.enabled === 'boolean' ? saved.enabled : def.enabled,
+          }
+        })
+      })
+    } catch (_e) { /* localStorage 读取失败时保持默认 */ }
+  }
+
+  useEffect(function () {
+    applyDetectPlatformsFromLocal()
+    // 同一浏览器其他标签页改了偏好，这里同步刷新
+    const onStorage = function (e: StorageEvent) {
+      if (e.key === 'tuzhong-platform-configs' || e.key === 'tuzhong-preferences') applyDetectPlatformsFromLocal()
+    }
+    window.addEventListener('storage', onStorage)
+    return function () { window.removeEventListener('storage', onStorage) }
+  }, [])
 
   useEffect(() => {
     if (!novelId) return
@@ -412,7 +905,7 @@ export default function NovelEditorPage() {
               setSelectedChapter({ ...firstChapter, content: fetchedContent })
               setChapters(chs.map((c: any) => c.id === firstChapter.id ? { ...c, content: fetchedContent } : c))
             }
-          } catch { /* 静默降级 */ }
+          } catch (e) { console.error('[write] 拉取首章正文失败，静默降级:', e) }
           setExpandedVolumes({ 1: true })
         }
       }
@@ -445,10 +938,17 @@ export default function NovelEditorPage() {
   }
 
   function getChaptersForVolume(volumeNum: number, volumeName?: string): Chapter[] {
+    // 卷归属优先级：数字 volume > volumeId > volumeIndex > 卷名字符串
+    // volumeIndex 既有 0 基也有 1 基数据，这里按全量数据的最小值判断基准，避免卷与章节整体错位
+    const idxVals = chapters.map(c => (typeof c.volumeIndex === 'number' ? c.volumeIndex : NaN)).filter(n => !isNaN(n))
+    const idxBase = idxVals.length > 0 && Math.min(...idxVals) === 0 ? 0 : 1
     const matched = chapters.filter(c => {
-      if (typeof c.volumeIndex === 'number' && c.volumeIndex === volumeNum - 1) return true
-      if (typeof c.volume === 'number' && c.volume === volumeNum) return true
-      if (typeof c.volumeId === 'string' && volumes.find(v => v.order === volumeNum)?.id === c.volumeId) return true
+      if (typeof c.volume === 'number') return c.volume === volumeNum
+      if (typeof c.volumeId === 'string') {
+        const v = volumes.find(x => x.order === volumeNum)
+        if (v && v.id === c.volumeId) return true
+      }
+      if (typeof c.volumeIndex === 'number') return c.volumeIndex === volumeNum - 1 + idxBase
       if (volumeName && typeof c.volume === 'string' && c.volume === volumeName) return true
       return false
     })
@@ -464,19 +964,31 @@ export default function NovelEditorPage() {
     }))
   }
 
-  function navigateChapter(direction: 'prev' | 'next') {
+  async function navigateChapter(direction: 'prev' | 'next') {
     if (!selectedChapter || chapters.length === 0) return
     const currentIdx = chapters.findIndex(c => c.id === selectedChapter.id)
     if (currentIdx === -1) return
     const targetIdx = direction === 'prev' ? currentIdx - 1 : currentIdx + 1
     if (targetIdx >= 0 && targetIdx < chapters.length) {
-      selectChapterWithContent(chapters[targetIdx])
+      await selectChapterWithContent(chapters[targetIdx])
     }
   }
 
   // 🔥 按需拉取章节正文：章节列表已剥离 content，选中章节时单独请求正文
   const [contentLoading, setContentLoading] = useState(false)
+  /** 切章前的脏值守卫：true = 允许切换 */
+  async function guardUnsavedSwitch(): Promise<boolean> {
+    if (!isEditMode) return true
+    if (editDraftRef.current === draftBaselineRef.current) return true
+    const saveFirst = window.confirm('当前章节有未保存的修改。\n\n【确定】= 先保存再切换章节\n【取消】= 停留在本章（可点「取消编辑」放弃本次修改）')
+    if (!saveFirst) return false
+    await handleSaveDraft()
+    return true
+  }
+
   async function selectChapterWithContent(chapter: Chapter) {
+    if (!(await guardUnsavedSwitch())) return
+    const mySeq = ++chapterSwitchSeqRef.current
     setSelectedChapter(chapter)
     // 如果已有 content 或明确无正文（hasContent=0），无需再请求
     if (chapter.content !== undefined) return
@@ -487,14 +999,19 @@ export default function NovelEditorPage() {
       if (res.ok) {
         const json = await res.json()
         const fetchedContent = json?.data?.content || ''
-        setSelectedChapter(prev => prev ? { ...prev, content: fetchedContent } : prev)
+        // 🔥 已有更新的切章请求时，只回填列表缓存，绝不覆盖当前选中章节（否则串正文）
+        if (mySeq !== chapterSwitchSeqRef.current) {
+          setChapters(prev => prev.map(c => c.id === chapter.id ? { ...c, content: fetchedContent } : c))
+          return
+        }
+        setSelectedChapter(prev => (prev && prev.id === chapter.id) ? { ...prev, content: fetchedContent } : prev)
         // 同步更新 chapters 数组中的对应章节
         setChapters(prev => prev.map(c => c.id === chapter.id ? { ...c, content: fetchedContent } : c))
       }
-    } catch {
-      // 静默降级
+    } catch (e) {
+      console.error('[write] 拉取章节正文失败，静默降级:', e)
     } finally {
-      setContentLoading(false)
+      if (mySeq === chapterSwitchSeqRef.current) setContentLoading(false)
     }
   }
 
@@ -748,10 +1265,10 @@ export default function NovelEditorPage() {
     s = s.replace(/[^\n]{0,10}[\u4e00-\u9fa5]{2,15}的轻贱[。，,]\s*上[。，,\.\s]+(?=[\u4e00-\u9fa5])/g, '')
     s = s.replace(/上[。，,\.，,]\s*眼[，,、\s]+瞳孔/gu, '瞳孔')
     // 更激进的孤立「上。」「上」清除（防止匹配失败后留下"低声议眼…""尸山血海之本命图腾""像被狂奔的野牛撞哇地"这类截断）
-    s = s.replace(/(?<=[论起论话辱骂羞辱欺辱嘲讽讽讥笑贬斥轻蔑鄙夷鄙夷不屑轻贱鄙视微词刺挑拨排挤踩压踩贬损羞辱诋讥诽嘲挖苦寒碜糟践糟蹋作践践踏])([\s，,。.…]*?)上[。，,\.\s]+/g, '$1')
+    s = s.replace(/(?<=[。.！?？…\n])[ \t]*上[。，,\.]+(?=[\u4e00-\u9fa5])/g, '')
     s = s.replace(/之+上[。，,\.\s]+(?=[\u4e00-\u9fa5])/g, '，')
     s = s.replace(/(撞|推|顶|打|砸|压|劈|砍|斩|刺|扫|拍|抓|扣|按|压|撞|碾|踩|踏)上[。，,\.\s]+/g, '$1，')
-    s = s.replace(/(?<=[\u4e00-\u9fa5，,。.！？!?；;：:])\s*上[。，,\.\s]+(?=[\u4e00-\u9fa5\s])/g, '')
+    // 2026-11-01 修复：原通用孤立上正则误伤正常文本（「落在他脸上。」「压在舌根上，」「磕在他的牙上，」全被吞），已并入上方收紧版（仅句末标点/行首后的孤立上才清理）
     s = s.replace(/(?<=低[声音])\s*[上议]\s*(?=眼|瞳)/gu, '')
     s = s.replace(/(?<=血海之)\s*上\s*/g, '，')
     s = s.replace(/(?<=狂奔的野牛)\s*上\s*/g, '')
@@ -977,7 +1494,10 @@ export default function NovelEditorPage() {
             <span className="text-sm">返回书架</span>
           </Link>
           <div className="flex items-start gap-3">
-            <div className={`w-14 h-20 rounded bg-gradient-to-br ${coverGradients[0]} flex-shrink-0 flex items-center justify-center overflow-hidden`}>
+            <div
+              onClick={function () { if (coverUrl) setCoverZoomOpen(true) }}
+              title={coverUrl ? '点击查看大图' : undefined}
+              className={`w-14 h-20 rounded bg-gradient-to-br ${coverGradients[0]} flex-shrink-0 flex items-center justify-center overflow-hidden ${coverUrl ? 'cursor-zoom-in' : ''}`}>
               {coverUrl ? (
                 <img
                   src={coverUrl}
@@ -1196,7 +1716,7 @@ export default function NovelEditorPage() {
                           ? (isRealTxtNovel() ? simpleCleanTxtContent(selectedChapter.content) : dePipelineContent(selectedChapter.content, selectedChapter.title))
                           : ''
                         setEditDraft(raw)
-                      } catch (_e) { /* ignore */ }
+                      } catch (_e) { console.error('[write] 进入编辑模式前清洗正文失败:', _e) }
                       setIsEditMode(true)
                     }} className={`px-3 py-1.5 text-sm rounded-lg transition-colors flex items-center gap-1 ${
                       readerTheme === 'dark' || readerTheme === 'night'
@@ -1556,6 +2076,14 @@ export default function NovelEditorPage() {
           {/* 悬浮按钮组 */}
           <div className="fixed right-6 top-1/2 -translate-y-1/2 flex flex-col gap-3 z-20">
             <button
+              onClick={() => { setActiveTool('regen'); setShowToolPanel(true); const tn = (selectedChapter as any)?.chapterNumber || (chapters.findIndex(c => c.id === selectedChapter?.id) + 1); if (tn) setRegenChapterInput(String(tn)) }}
+              className="w-12 h-12 bg-gradient-to-br from-emerald-500 to-teal-600 text-white rounded-xl shadow-lg hover:shadow-xl hover:scale-105 transition-all flex flex-col items-center justify-center gap-0.5 group"
+              title="AI生成本章（按卷/章摘要重新设计）"
+            >
+              <RefreshCcw className="w-5 h-5" />
+              <span className="text-[9px] font-medium">AI生成</span>
+            </button>
+            <button
               onClick={() => { setActiveTool('style'); setShowToolPanel(true) }}
               className="w-12 h-12 bg-gradient-to-br from-purple-500 to-indigo-600 text-white rounded-xl shadow-lg hover:shadow-xl hover:scale-105 transition-all flex flex-col items-center justify-center gap-0.5 group"
               title="风格续写"
@@ -1595,6 +2123,7 @@ export default function NovelEditorPage() {
               {/* 面板头部 */}
               <div className="flex items-center justify-between px-4 py-3 border-b border-gray-100 bg-gradient-to-r from-purple-50 to-indigo-50">
                 <h3 className="font-bold text-gray-800">
+                  {activeTool === 'regen' && '🔁 AI生成本章'}
                   {activeTool === 'style' && '✨ 风格续写'}
                   {activeTool === 'tomato' && '🍅 番茄检测'}
                   {activeTool === 'setting' && '📚 设定查询'}
@@ -1610,6 +2139,73 @@ export default function NovelEditorPage() {
 
               {/* 面板内容 */}
               <div className="p-4 max-h-[60vh] overflow-y-auto">
+                {/* AI生成本章（按卷/章摘要整章重写） */}
+                {activeTool === 'regen' && (
+                  <div className="space-y-4">
+                    <p className="text-xs text-gray-500 leading-relaxed">
+                      按设定中心的<b>分卷摘要</b>与<b>章节摘要</b>整章重写正文（走逐章精写引擎，含QA闸门与平台AI检测标准）。支持批量：依序逐章生成并自动保存，章与章自动衔接。生成约每章 3-10 分钟。
+                    </p>
+                    <div>
+                      <label className="text-sm font-medium text-gray-700 mb-2 block">目标章节（可自由修改，支持批量）</label>
+                      <input
+                        type="text"
+                        value={regenChapterInput}
+                        onChange={(e) => setRegenChapterInput(e.target.value)}
+                        disabled={isGenerating}
+                        placeholder="如 2 或 2-4 或 1,3,5"
+                        className="w-full px-3 py-2 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500 disabled:bg-gray-100"
+                      />
+                      <p className="text-xs text-gray-400 mt-1">单章填章号；批量填区间（2-4）或列表（1,3,5），最多同时 10 章，按顺序逐章生成与保存</p>
+                    </div>
+                    <div>
+                      <label className="text-sm font-medium text-gray-700 mb-2 block">目标字数（可自由修改）</label>
+                      <div className="flex items-center gap-2">
+                        <input
+                          type="number"
+                          min={800}
+                          max={8000}
+                          step={100}
+                          value={regenWordsInput}
+                          onChange={(e) => setRegenWordsInput(e.target.value)}
+                          disabled={isGenerating}
+                          className="w-full px-3 py-2 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500 disabled:bg-gray-100"
+                        />
+                        <span className="text-xs text-gray-500 shrink-0">汉字</span>
+                      </div>
+                      <p className="text-xs text-gray-400 mt-1">建议范围 1000-6000，任意数值即时生效</p>
+                    </div>
+                    <button
+                      disabled={isGenerating}
+                      onClick={handleAIRegenerate}
+                      className="w-full py-3 bg-gradient-to-r from-emerald-500 to-teal-600 text-white rounded-xl font-bold hover:from-emerald-600 hover:to-teal-700 transition-all flex items-center justify-center gap-2 disabled:opacity-60"
+                    >
+                      {isGenerating ? (
+                        <>
+                          <RefreshCcw className="w-4 h-4 animate-spin" />
+                          生成中 {Math.floor(regenElapsed / 60)}分{regenElapsed % 60 < 10 ? '0' : ''}{regenElapsed % 60}秒…
+                        </>
+                      ) : (
+                        <><RefreshCcw className="w-4 h-4" /> 开始重新生成本章</>
+                      )}
+                    </button>
+                    {isGenerating && (
+                      <>
+                        <button
+                          onClick={() => { if (regenAbortRef.current) regenAbortRef.current.abort() }}
+                          className="w-full py-2 bg-gray-100 text-gray-600 rounded-lg text-xs font-medium hover:bg-gray-200 transition-colors"
+                        >
+                          取消生成（本章内容不会被改动）
+                        </button>
+                        <p className="text-[11px] text-gray-400 text-center">正在逐场景精写并质检，最长约 10 分钟；若与其它生成任务同时运行会变慢</p>
+                      </>
+                    )}
+                    {toolResult && (
+                      <div className={`text-xs rounded-lg p-3 whitespace-pre-wrap ${toolResult.startsWith('✅') ? 'bg-green-50 text-green-700' : toolResult.startsWith('❌') ? 'bg-red-50 text-red-600' : 'bg-gray-50 text-gray-600'}`}>
+                        {toolResult}
+                      </div>
+                    )}
+                  </div>
+                )}
                 {/* 风格续写 */}
                 {activeTool === 'style' && (
                   <div className="space-y-4">
@@ -1617,14 +2213,104 @@ export default function NovelEditorPage() {
                       <label className="text-sm font-medium text-gray-700 mb-2 block">写作风格</label>
                       <select
                         value={writingStyle}
-                        onChange={(e) => setWritingStyle(e.target.value)}
+                        onChange={(e) => {
+                          const styleName = e.target.value
+                          setWritingStyle(styleName)
+                          // 选择后同步回写作偏好（设置页与生成向导共用同一个风格）
+                          try {
+                            const raw = JSON.parse(localStorage.getItem('tuzhong-preferences') || '{}')
+                            const id = resolveStyleId(styleName)
+                            if (id) raw.writingStyle = id
+                            raw._updatedAt = Date.now()
+                            localStorage.setItem('tuzhong-preferences', JSON.stringify(raw))
+                            pushServerPreferences(raw)
+                          } catch (_e) { /* ignore */ }
+                        }}
                         className="w-full px-3 py-2 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-purple-500"
                       >
-                        <option>番茄爽文风</option>
-                        <option>老白文风格</option>
-                        <option>轻松搞笑风</option>
-                        <option>细腻文艺风</option>
-                        <option>热血战斗风</option>
+                        {/* 🔥 2026-10-26：风格库从 5 个硬编码扩为 PRESET_STYLES 全量 60+ 种（按平台分组），与设置页/向导同源 */}
+                        <optgroup label="通用与经典">
+                          <option>番茄爽文风</option>
+                          <option>老白文风格</option>
+                          <option>轻松搞笑风</option>
+                          <option>细腻文艺风</option>
+                          <option>热血战斗风</option>
+                          <option>古典仙侠问道风</option>
+                          <option>凡人流稳健修仙风</option>
+                          <option>传统玄幻升级风</option>
+                          <option>历史权谋朝堂风</option>
+                          <option>古风宫廷宅斗风</option>
+                          <option>当年明月历史风</option>
+                          <option>年代生活流风</option>
+                        </optgroup>
+                        <optgroup label="起点系">
+                          <option>天蚕土豆玄幻风</option>
+                          <option>辰东遮天荒古风</option>
+                          <option>耳根仙逆求魔风</option>
+                          <option>忘语凡人修仙风</option>
+                          <option>爱潜水的乌贼风</option>
+                          <option>萧鼎诛仙虐恋仙侠风</option>
+                          <option>官术/官居一品 官场历史风</option>
+                        </optgroup>
+                        <optgroup label="番茄/七猫系">
+                          <option>番茄番茄梗式搞笑爽文风</option>
+                          <option>番茄战神回归都市风</option>
+                          <option>番茄废柴签到系统流</option>
+                          <option>七猫大一柱都市神豪风</option>
+                          <option>系统流金手指风</option>
+                        </optgroup>
+                        <optgroup label="飞卢系">
+                          <option>飞卢综漫同人脑洞风</option>
+                          <option>飞卢曝光+向真文体</option>
+                          <option>飞卢女频快穿虐渣风</option>
+                          <option>综漫同人快穿风</option>
+                        </optgroup>
+                        <optgroup label="晋江/女频">
+                          <option>现代言情甜宠风</option>
+                          <option>桐华言情风</option>
+                          <option>墨宝非宝甜宠暖爱风</option>
+                          <option>山海卷轴古风言情风</option>
+                          <option>晋江耽美甜虐风</option>
+                          <option>晋江女强重生复仇风</option>
+                          <option>晋江女频玄幻仙侠风</option>
+                          <option>甜宠日常恋爱风</option>
+                        </optgroup>
+                        <optgroup label="悬疑推理">
+                          <option>东野圭吾悬疑风</option>
+                          <option>阿加莎推理黄金风</option>
+                          <option>雷米刑侦悬疑风</option>
+                          <option>刑侦悬疑推理风</option>
+                          <option>南派三叔盗墓悬疑风</option>
+                          <option>天下霸唱鬼吹灯冒险风</option>
+                          <option>民俗灵异怪谈风</option>
+                        </optgroup>
+                        <optgroup label="科幻">
+                          <option>刘慈欣硬科幻风</option>
+                          <option>海伯利安太空歌剧风</option>
+                          <option>王晋康生命科幻风</option>
+                          <option>末日废土进化流风</option>
+                        </optgroup>
+                        <optgroup label="都市/游戏">
+                          <option>都市神医下山风</option>
+                          <option>都市豪门总裁风</option>
+                          <option>都市重生逆袭风</option>
+                          <option>都市异能觉醒风</option>
+                          <option>全职高手电竞职业风</option>
+                          <option>网游-从零开始数据流风</option>
+                          <option>大富翁经营养成风</option>
+                        </optgroup>
+                        <optgroup label="其他题材">
+                          <option>金庸武侠风</option>
+                          <option>古龙悬疑武侠风</option>
+                          <option>梁羽生正气武侠风</option>
+                          <option>西幻领主种田风</option>
+                          <option>魔法学院成长风</option>
+                          <option>铁血军事战争风</option>
+                          <option>末世求生基建风</option>
+                          <option>无限流副本闯关风</option>
+                          <option>刘地师无限副本风</option>
+                          <option>黄衣之王克苏鲁神话风</option>
+                        </optgroup>
                       </select>
                     </div>
                     <div>
@@ -1651,13 +2337,37 @@ export default function NovelEditorPage() {
                     </div>
                     <button
                       disabled={isGenerating}
-                      onClick={function() {
+                      onClick={async function() {
                         setIsGenerating(true)
                         setToolResult('')
-                        setTimeout(function() {
-                          setToolResult('已基于当前章节末尾生成' + (continueLength === 'short' ? '200' : continueLength === 'medium' ? '500' : '1000') + '字续写内容，风格为' + writingStyle + '。\n\n（示例）他深吸一口气，体内灵力猛地爆发开来，周身的空气都在剧烈震颤。那双眸子里燃烧着不屈的火焰，仿佛要将这天都给捅破一个窟窿……')
+                        try {
+                          // 🔥 2026-10-26：假示例 → 真实续写（/api/ai/continue）
+                          const lenMap: Record<string, number> = { short: 200, medium: 500, long: 1000 }
+                          const targetLen = lenMap[continueLength] || 500
+                          const tail = String((selectedChapter as any)?.content || '').slice(-600)
+                          const res = await fetch('/tuzhong-wenshu/api/ai/continue', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + (localStorage.getItem('token') || '') },
+                            body: JSON.stringify({
+                              context: tail || '（当前章节为空，从新书开头续写）',
+                              style: { name: writingStyle, parameters: {} },
+                              length: continueLength,
+                              targetLength: targetLen,
+                              novelId: (selectedChapter as any)?.novelId || novelId,
+                              chapterTitle: (selectedChapter as any)?.title || ''
+                            })
+                          })
+                          const j = await res.json()
+                          if (j && j.success && j.data && j.data.content) {
+                            setToolResult(j.data.content)
+                          } else {
+                            setToolResult('续写失败：' + ((j && j.error) || '接口未返回内容') + '\n\n提示：可在「设置 → AI模型」检查免费模型可用性。')
+                          }
+                        } catch (e: any) {
+                          setToolResult('续写请求异常：' + (e?.message || e))
+                        } finally {
                           setIsGenerating(false)
-                        }, 1500)
+                        }
                       }}
                       className="w-full py-3 bg-gradient-to-r from-purple-500 to-indigo-600 text-white rounded-xl font-bold hover:from-purple-600 hover:to-indigo-700 transition-all flex items-center justify-center gap-2"
                     >
@@ -1672,10 +2382,7 @@ export default function NovelEditorPage() {
                       onClick={function() {
                         setIsGenerating(true)
                         setToolResult('')
-                        setTimeout(function() {
-                          setToolResult('已对当前章节进行深度改写，消除AI痕迹约15%，文本自然度提升至92%。\n\n主要优化：\n• 增加了更多感官细节和心理描写\n• 调整了部分句式结构，避免AI规整感\n• 加入了一些口语化表达，增强人味')
-                          setIsGenerating(false)
-                        }, 2000)
+                        handleRealRewrite()
                       }}
                       className="w-full py-3 bg-gradient-to-r from-pink-500 to-rose-500 text-white rounded-xl font-bold hover:from-pink-600 hover:to-rose-600 transition-all flex items-center justify-center gap-2 disabled:opacity-50"
                     >
@@ -1685,7 +2392,33 @@ export default function NovelEditorPage() {
                         <><Wand2 className="w-4 h-4" /> 深度改写</>
                       )}
                     </button>
-                    <p className="text-xs text-gray-400 text-center">消除AI痕迹，使内容更自然</p>
+                    <p className="text-xs text-gray-400 text-center">调用已配置的 AI 模型；失败会直接报错，不再返回示例文本</p>
+                    {toolNotice && (
+                      <div className="bg-amber-50 border border-amber-200 rounded-lg p-2 text-xs text-amber-700 whitespace-pre-wrap">{toolNotice}</div>
+                    )}
+                    {toolError && (
+                      <div className="bg-red-50 border border-red-200 rounded-lg p-2 text-xs text-red-700">{toolError}</div>
+                    )}
+                    {continueOptions.map(function (opt: string, i: number) {
+                      return (
+                        <div key={'copt' + i} className="bg-white border border-purple-200 rounded-lg p-3">
+                          <div className="flex items-center justify-between mb-1.5">
+                            <span className="text-xs font-bold text-purple-700">续写方向 {i + 1}</span>
+                            <button onClick={function () { applyContinueToDraft(opt) }} className="px-2 py-1 text-xs bg-purple-600 text-white rounded-md hover:bg-purple-700">追加到章末</button>
+                          </div>
+                          <p className="text-sm text-gray-700 whitespace-pre-wrap max-h-72 overflow-auto">{opt}</p>
+                        </div>
+                      )
+                    })}
+                    {rewriteResult && (
+                      <div className="bg-white border border-pink-200 rounded-lg p-3">
+                        <div className="flex items-center justify-between mb-1.5">
+                          <span className="text-xs font-bold text-pink-700">改写结果</span>
+                          <button onClick={function () { replaceDraftWithRewrite(rewriteResult) }} className="px-2 py-1 text-xs bg-pink-600 text-white rounded-md hover:bg-pink-700">替换草稿</button>
+                        </div>
+                        <p className="text-sm text-gray-700 whitespace-pre-wrap max-h-72 overflow-auto">{rewriteResult}</p>
+                      </div>
+                    )}
                     {toolResult && (
                       <div className="bg-green-50 border border-green-200 rounded-lg p-3 text-sm text-green-700 whitespace-pre-wrap">
                         {toolResult}
@@ -1726,33 +2459,101 @@ export default function NovelEditorPage() {
                       <p className="text-xs text-gray-600">
                         AI率标准：{detectPlatforms.find(p => p.key === selectedPlatform)?.aiStandard}
                       </p>
+                      <button
+                        disabled={isGenerating}
+                        onClick={function () {
+                          const srcText = (selectedChapter && selectedChapter.content) ? String(selectedChapter.content) : ''
+                          if (!srcText || srcText.replace(/\s/g, '').length < 50) {
+                            setToolResult('⚠️ 当前章节正文不足 50 字，无法送检。')
+                            return
+                          }
+                          setIsGenerating(true)
+                          // 🔥 2026-10-26：优先用用户自填的朱雀 Key（存在浏览器本地偏好，不传服务端）
+                          const _zKey = getLocalZhuqueApiKey()
+                          setToolResult(_zKey
+                            ? '正在调用朱雀官方模型检测，请稍候…'
+                            : '未填写朱雀 API Key，正在使用站内 AI 检测（可在「设置」填入 Key 启用官方判定）…')
+                          fetch('/tuzhong-wenshu/api/ai/zhuque-detect', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ text: srcText, apiKey: _zKey }),
+                          }).then(async function (res) {
+                            const json = await res.json().catch(function () { return null })
+                            if (!res.ok || !json || !json.data) {
+                              setToolResult('❌ 检测失败：' + ((json && json.error) || ('HTTP ' + res.status)) + (_zKey ? '' : '（未填朱雀 Key 时本应自动降级站内检测，请反馈）'))
+                              return
+                            }
+                            const z = json.data
+                            const segLines = (z.segments || []).slice(0, 8).map(function (s: any) {
+                              return '  · ' + s.labelName + '（置信 ' + Math.round(Number(s.confidence || 0) * 100) + '%）：' + s.length + '字 「' + String(s.head || '').replace(/\n/g, ' ') + '…」'
+                            }).join('\n')
+                            setToolResult(
+                              (z.pass ? '✅ ' : '❌ ') + (z.isOfficialZhuque ? '朱雀官方模型判定' : '站内 AI 检测（朱雀口径本地代理）') + (z.isOfficialZhuque ? '' : '　·　可在「设置」填入朱雀 API Key 升级为官方判定') + '（' + (z.model || '') + '）\n\n' +
+                              '• 人工占比：' + z.humanRatio + '%\n' +
+                              '• AI占比：' + z.aiRatio + '%\n' +
+                              '• 疑似AI占比：' + z.suspectedRatio + '%（目标 ≤' + z.targetSuspectedRatio + '%，' + (z.pass ? '达标' : '未达标') + '）\n' +
+                              '• 整体置信度：' + (z.softmaxConfidence !== null && z.softmaxConfidence !== undefined ? Math.round(Number(z.softmaxConfidence) * 1000) / 10 + '%' : '—') + '\n' +
+                              (z.dimensions && z.dimensions.length ? '\n四维判定：\n' + z.dimensions.map(function (d: any) { return '  · ' + d.name + '：' + d.score + '分（' + d.detail + '）' }).join('\n') + '\n' : '') +
+                              (segLines ? '\n分段判定：\n' + segLines + '\n' : '') +
+                              '\n说明：' + (z.note || '疑似AI占比超标的段落都是叙述/说明/罗列句，应改写为动作、对话与身体感。')
+                            )
+                          }).catch(function (e) {
+                            setToolResult('❌ 朱雀官方检测失败：' + String(e && e.message ? e.message : e))
+                          }).finally(function () { setIsGenerating(false) })
+                        }}
+                        className="mt-2 w-full py-2 bg-gradient-to-r from-red-600 to-rose-600 text-white rounded-lg text-sm font-bold hover:from-red-700 hover:to-rose-700 transition-all flex items-center justify-center gap-2"
+                      >
+                        <ShieldCheck className="w-4 h-4" /> 朱雀口径自检（自建标准·疑似AI≤5%）
+                      </button>
                     </div>
                     <button
                       disabled={isGenerating}
                       onClick={function() {
+                        const plat = detectPlatforms.find(p => p.key === selectedPlatform)
+                        const srcText = (selectedChapter && selectedChapter.content) ? String(selectedChapter.content) : ''
+                        if (!srcText || srcText.replace(/\s/g, '').length < 50) {
+                          setToolResult('⚠️ 当前章节正文不足 50 字，无法检测。请先生成/选择有正文的章节。')
+                          return
+                        }
                         setIsGenerating(true)
                         setToolResult('')
-                        const plat = detectPlatforms.find(p => p.key === selectedPlatform)
-                        const aiRate = selectedPlatform === 'tomato' || selectedPlatform === 'zhuque' 
-                          ? 3.2 
-                          : selectedPlatform === 'qimao' || selectedPlatform === 'jinjiang'
-                          ? 4.5
-                          : selectedPlatform === 'qidian' || selectedPlatform === 'feilu'
-                          ? 5.8
-                          : 6.5
-                        setTimeout(function() {
+                        fetch('/tuzhong-wenshu/api/ai/detect', {
+                          method: 'POST',
+                          headers: { 'Content-Type': 'application/json' },
+                          body: JSON.stringify({ text: srcText }),
+                        }).then(async function(res) {
+                          const json = await res.json().catch(function() { return null })
+                          if (!res.ok || !json || !json.data) {
+                            setToolResult('❌ 检测失败：' + ((json && json.error) || ('HTTP ' + res.status)))
+                            return
+                          }
+                          const det = json.data
+                          const std = plat && plat.aiStandard ? String(plat.aiStandard) : ''
+                          const m = std.match(/(\d+(?:\.\d+)?)/)
+                          const threshold = m ? Number(m[1]) : null
+                          const rateVal = Math.round(Number(det.aiRate) * 10) / 10
+                          // 严格口径：标准写「<1%」时须真小于 1%；写「≤1%」才允许等于 1%
+                          const strictLt = /[<＜]/.test(std) && !/[≤≦]/.test(std)
+                          const pass = threshold === null ? true : (strictLt ? rateVal < threshold : rateVal <= threshold)
+                          const dims = Array.isArray(det.scores)
+                            ? det.scores.slice(0, 8).map(function(s: any) { return '• ' + s.name + '：' + Math.round(s.score) + '分' }).join('\n')
+                            : ''
+                          const issues = Array.isArray(det.issues)
+                            ? det.issues.slice(0, 4).map(function(it: any) { return '⚠️ ' + (it && (it.description || it.type) || '') }).filter(Boolean).join('\n')
+                            : ''
                           setToolResult(
-                            '✅ ' + (plat?.name || '平台') + '检测通过！\n\n' +
-                            '• AI率：' + aiRate + '%（' + (plat?.aiStandard || '<10%') + '达标）\n' +
-                            '• 内容安全：96分（低风险）\n' +
-                            '• 原创度：94分（优秀）\n' +
-                            '• 节奏把控：93分（良好）\n' +
-                            '• 人设辨识度：92分（良好）\n' +
-                            '• 题材契合度：95分（优秀）\n\n' +
-                            '综合评级：S级，可直接投稿'
+                            (pass ? '✅ ' : '❌ ') + (plat ? plat.name : '平台') + '检测' + (pass ? '达标' : '未达标') + '\n\n' +
+                            '• 平台自研估测AI率：' + rateVal.toFixed(1) + '%（标准 ' + (std || '未设置') + '）\n' +
+                            (dims ? dims + '\n' : '') +
+                            (issues ? '\n主要问题：\n' + issues + '\n' : '') +
+                            '\n说明：这是站内自研算法的估测值，不是朱雀官方检测结果（朱雀官方判定须走官方通道：网页版或 EdgeOne Makers API）。' +
+                            '标准取自「个人设置→平台AI检测配置」。' + (pass ? '' : '建议重新生成或按上述问题修改后再测。')
                           )
+                        }).catch(function(e) {
+                          setToolResult('❌ 检测失败：' + (e && e.message ? e.message : String(e)))
+                        }).finally(function() {
                           setIsGenerating(false)
-                        }, 2000)
+                        })
                       }}
                       className="w-full py-3 bg-gradient-to-r from-red-500 to-orange-500 text-white rounded-xl font-bold hover:from-red-600 hover:to-orange-600 transition-all flex items-center justify-center gap-2"
                     >
@@ -1782,7 +2583,10 @@ export default function NovelEditorPage() {
                     </div>
                     <input
                       type="text"
-                      placeholder="输入关键词查询设定..."
+                      value={settingQuery}
+                      onChange={function (e) { setSettingQuery(e.target.value) }}
+                      onKeyDown={function (e) { if (e.key === 'Enter') handleSettingQuery(settingQuery) }}
+                      placeholder="输入人名/地名/势力等关键词，回车查询..."
                       className="w-full px-3 py-2 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
                     />
                     <div className="space-y-2">
@@ -1803,10 +2607,7 @@ export default function NovelEditorPage() {
                       onClick={function() {
                         setIsGenerating(true)
                         setToolResult('')
-                        setTimeout(function() {
-                          setToolResult('📖 主角设定查询结果：\n\n姓名：艾登·克莱尔\n身份：克莱尔家族末裔，天才魔法师\n年龄：16岁\n金手指：龙纹戒指（内含上古魔导师索恩残魂）\n主修：雷系魔法 + 土系魔法（双系天赋）\n辅助：斗气修炼（索恩修正法门）\n性格：坚毅、隐忍、重情义、有仇必报\n\n当前状态：圣罗兰魔法学院新生，已展露双系天赋')
-                          setIsGenerating(false)
-                        }, 1000)
+                        handleSettingQuery(settingQuery)
                       }}
                       className="w-full py-3 bg-gradient-to-r from-blue-500 to-cyan-500 text-white rounded-xl font-bold hover:from-blue-600 hover:to-cyan-600 transition-all flex items-center justify-center gap-2"
                     >
@@ -1849,10 +2650,7 @@ export default function NovelEditorPage() {
                       onClick={function() {
                         setIsGenerating(true)
                         setToolResult('')
-                        setTimeout(function() {
-                          setToolResult('📊 对标分析报告（对比《盘龙》）\n\n相似度：68%\n\n优势项：\n• 开篇节奏更快（+8%）\n• 打脸爽点更密集（+5%）\n\n待提升：\n• 世界观宏大感不足（-12%）\n• 配角立体度有待加强（-10%）\n• 升级体系清晰感一般（-7%）\n\n建议：第3卷前增加世界观铺垫，丰富配角背景故事')
-                          setIsGenerating(false)
-                        }, 2500)
+                        handleSelfCheck()
                       }}
                       className="w-full py-3 bg-gradient-to-r from-green-500 to-emerald-500 text-white rounded-xl font-bold hover:from-green-600 hover:to-emerald-600 transition-all flex items-center justify-center gap-2"
                     >
@@ -1875,6 +2673,42 @@ export default function NovelEditorPage() {
         </>
       )}
 
+        </div>
+      )}
+
+      {/* 封面大图灯箱 */}
+      {coverZoomOpen && coverUrl && (
+        <div
+          onClick={function () { setCoverZoomOpen(false) }}
+          role="dialog"
+          aria-modal="true"
+          className="fixed inset-0 z-[9999] bg-black/80 backdrop-blur-sm flex items-center justify-center p-4"
+        >
+          <button
+            onClick={function (e) { e.stopPropagation(); setCoverZoomOpen(false) }}
+            title="关闭 (ESC)"
+            aria-label="关闭"
+            className="absolute top-4 right-4 p-2 rounded-full bg-white/10 hover:bg-white/20 text-white transition-colors z-10"
+          >
+            <X className="w-6 h-6" />
+          </button>
+          <img
+            src={coverUrl}
+            alt="封面大图"
+            onClick={function (e) { e.stopPropagation() }}
+            onError={function () {
+              const raw = (novel?.cover || coverUrl || '') as string
+              const links = String(raw).split('|||').map(function (s) { return s.trim() }).filter(Boolean)
+              const next = coverFallbackIndex + 1
+              if (next < links.length) {
+                setCoverFallbackIndex(next)
+                setCoverUrl(links[next])
+              } else {
+                setCoverZoomOpen(false)
+              }
+            }}
+            className="max-h-[90vh] max-w-[90vw] object-contain rounded-lg shadow-2xl select-none"
+          />
         </div>
       )}
     </div>

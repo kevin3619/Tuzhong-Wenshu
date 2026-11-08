@@ -13,7 +13,6 @@ import {
   HelpCircle,
   Crown,
   Shield,
-  Palette,
 } from 'lucide-react'
 import { BrandLogoSmall } from '@/components/BrandLogo'
 
@@ -27,7 +26,7 @@ interface NavItem {
 const baseNavItems: NavItem[] = [
   { label: '作品书架', href: '/', icon: BookOpen, guideId: 'bookshelf' },
   { label: '设定中心', href: '/settings/world', icon: Globe },
-  { label: '风格工坊', href: '/style', icon: Palette },
+  // 🔥 2026-10-18：应需求移除「风格工坊」入口（页面 /style 保留，仅从菜单撤下）
   { label: 'SKILL', href: '/skills', icon: Sparkles, guideId: 'skill' },
   { label: '使用指南', href: '/guide', icon: HelpCircle },
   { label: 'VIP会员', href: '/vip', icon: Crown },
@@ -54,7 +53,7 @@ export default function Sidebar() {
         const admin = user.isAdmin === true
         // 使用 microtask 避免 useEffect 中同步 setState 触发 React Compiler 警告
         queueMicrotask(() => setIsAdmin(admin))
-      } catch {}
+      } catch (e) { console.error('[sidebar] 解析本地用户信息失败:', e) }
     }
     // 加载品牌Logo
     fetch('/tuzhong-wenshu/api/config/public')
@@ -111,7 +110,7 @@ export default function Sidebar() {
       </Link>
 
       {/* 导航菜单 */}
-      <nav className="flex-1 overflow-y-auto py-2 px-2 space-y-1 min-h-0">
+      <nav className="flex-1 overflow-y-auto py-4 px-3 space-y-2 min-h-0">
         {navItems.map((item) => {
           const Icon = item.icon
           const active = isActive(item.href)
@@ -121,15 +120,15 @@ export default function Sidebar() {
               href={item.href}
               title={collapsed ? item.label : undefined}
               data-guide={item.guideId}
-              className={`flex items-center h-10 px-3 rounded-lg transition-colors ${
+              className={`flex items-center h-11 px-3 rounded-xl transition-all duration-150 ${
                 active
-                  ? 'bg-[#c8364d] text-white'
+                  ? 'bg-[#c8364d] text-white shadow-md shadow-[#c8364d]/30'
                   : 'text-stone-300 hover:bg-white/10 hover:text-white'
               } ${collapsed ? 'justify-center' : ''}`}
             >
               <Icon className="w-5 h-5 shrink-0" />
               {!collapsed && (
-                <span className="ml-3 text-lg whitespace-nowrap">
+                <span className="ml-3 text-[17px] whitespace-nowrap tracking-wide">
                   {item.label}
                 </span>
               )}

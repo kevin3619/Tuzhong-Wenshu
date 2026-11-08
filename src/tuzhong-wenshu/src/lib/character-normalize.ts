@@ -134,11 +134,14 @@ const OWN_CAMP_RE = /主角阵营|我方|己方|本方|核心阵营|麾下|帐�
 const LOYAL_RE = /忠臣|忠诚|抗清|抗金|抗元|抗敌|义士|殉国|死守|坚守|支柱|柱石|中流砥柱|拥立|辅佐|效忠|名臣|民族英雄|楷模|典范|义从|麾下|帐下|救驾|护主|反正归明|归明|尽忠|老臣|股肱|心腹重臣|忠贞/
 const TRAITOR_RE = /降清|降敌|降明|引清|叛明|叛清|叛变|叛将|通敌|内奸|奸细|出卖|带路|告密|仕清|贰臣|降臣|反覆|反复无常|见风使舵|投机|野心家|只忠于自己/
 const RIVAL_RE = /(争位|争国|夺嫡|夺位|皇位|正统之争|争夺正统|称帝|监国|另立|对峙|政敌|党争|竞争|争统|(隆武|绍武|弘光|鲁王|唐王|福王|桂王)(帝|王|政权|朝廷)(?!旧臣|遗民))/
-const VILLAIN_RE = /反派|敌对|敌营|敌酋|清军|清廷|满清|后金|入侵|摄政|大敌|死敌|宿敌|BOSS|幕后主脑|屠城|奸臣|奸佞|权奸|佞臣|乱政|陷害忠良|暴虐|嗜杀/
+// 🔥 #219 修订：去掉 清军|清廷|满清|后金 裸名词——抗清英雄的传记里"清军"永远是敌军主语
+//   （阎应元"清军下江南推行剃发，率六万义民守江阴"被误判反派），敌我轴只认
+//   camp 字段与 降清/仕清/叛明 类动词（enemySide 判定已有），保留行为/品性词。
+const VILLAIN_RE = /反派|敌对|敌营|敌酋|入侵|大敌|死敌|宿敌|BOSS|幕后主脑|屠城|奸臣|奸佞|权奸|佞臣|乱政|陷害忠良|暴虐|嗜杀/
 const STAFF_RE = /太监|宦官|内官|内廷|司礼监|奴婢|侍女|丫鬟|宫女|亲随|亲卫|心腹|护卫|侍卫|斥候|长随|内务|军需|粮草|后勤|联络|情报|密探|文书|账房|管家|采办|医官|军医|匠作|督造|押运|传旨|秉笔|随堂|书办|差遣|锦衣卫|缇骑|厂卫|诏狱|细作|眼线|骨干|秘密行动/
 const CIVIL_RE = /文官|大学士|学士|尚书|侍郎|巡抚|总督|首辅|阁老|御史|郎中|员外|知府|知县|主簿|翰林|丞相|宰相|司业|督师|参政|参议|布政|按察|道台|兵备|给事中|詹事|洗马|中书|侍读|侍讲|学政|提学|佥都御史|都御史|少卿|寺丞|县丞|教谕|训导|典史|长史|司马|别驾|参军|总管|主事/
 const MIL_RE = /武将|将领|将军|总兵|提督|参将|副将|都督|统帅|指挥使|先锋|骑兵|水师|校尉|千户|百户|千总|把总|守备|游击|元帅|帅|名将|猛将|主力|军事|征战|战功|战果|大捷|击败|守城|督战|行伍|军伍|部队|攻城|野战|游击战|城防|救驾|立功|斩将|夺旗|开疆|拓土|统兵|领兵|掌兵|握兵|铁骑/
-const ELD_RE = /太后|皇后|皇妃|贵妃|皇太|妃|公主|郡主|王妃|国母|母妃|母亲|祖母|长辈|叔父|伯父|族长|长老会?|祖|父|母/
+const ELD_RE = /太后|皇后|皇妃|贵妃|皇太|妃|公主|郡主|王妃|国母|母妃|母亲|祖母|长辈|叔父|伯父|族长|长老会?|祖父|外祖|父王|皇考/
 const MENTOR_RE = /师父|师尊|导师|启蒙|座师|老师|师傅|太傅|少傅|先生|讲席|教习|师傅|艺业师父/
 const ALLY_RE = /盟友|联合|策应|结盟|响应|归附|反正|支援|声援|配合|友军/
 const MONARCH_HEAD_RE = /(帝|皇帝|天子|国王|女王|亲王|郡王|王爷|监国|国主|主公|君主)$/
@@ -187,7 +190,7 @@ export function normalizeCharacter(char: any, opts: { isProtagonist?: boolean; i
   if (roleTail && isTitleLike(roleTail)) derived = roleTail
   if (!derived) derived = cleanOfficeTitle(titleFromDesign(designText, String(char.name).trim()))
   if (!derived || !isTitleLike(derived)) {
-    var headTitle = cleanOfficeTitle(String(idHead || '').split('·').pop().trim())
+    var headTitle = cleanOfficeTitle((String(idHead || '').split('·').pop() || '').trim())
     if (headTitle && headTitle.length >= 2 && headTitle.length <= 8 && isTitleLike(headTitle)) derived = headTitle
   }
   // 🔥 2026-09-05：LLM 直出的头衔若"有出处"（其限定部分确实出现在阵营/身份/背景里），
@@ -227,8 +230,14 @@ export function normalizeCharacter(char: any, opts: { isProtagonist?: boolean; i
   }
 
   var cat = '配角'
+  // 🔥 #219 roleConfirmed 权威定位直通：用户确认/修复脚本核实过的定位不再被启发式改写。
+  //   旧启发式实证误判：阎应元（identity 首段以"清军"开头→反派）、郑成功（"海权之父"含父→长辈）、
+  //   朱聿键（"明太祖九世孙"含祖→长辈），且 L245 rawRole 回退会让错误定位自我强化。
+  //   用户在卡片下拉改定位时由前端把 roleConfirmed 置 true 并写入新值，即恢复权威语义。
+  var _roleConfirmed = !!(char as any).roleConfirmed && !!rawRole && /^(忠臣|忠臣文官|忠臣武将|反派|主角|女主|女配|男配|配角|盟友|亲随|亲信|竞争对手|宿敌|长辈|中立|女主\d{1,2})$/.test(rawRole)
   if (isProtag) cat = '主角'
-  else if (isFL) cat = '女主'
+  else if (isFL && !_roleConfirmed) cat = '女主'
+  else if (_roleConfirmed) cat = rawRole
   else if (hardVillain || traitor) cat = '反派'
   // 🔥 敌对阵营门禁：camp 明确是"清军阵营/敌对/反派"时，正文里的"麾下/统领/辅佐"是他对自己
   //   部属的统属关系而非效忠主角，不得把吴三桂这类人洗成忠臣
@@ -264,7 +273,7 @@ export function normalizeCharactersTitlesAndRoles(characters: any, designText?: 
     ;(characters.antagonists || []).forEach(function (c: any) { normalizeCharacter(c, { designText: ud }) })
     ;(characters.supporting || []).forEach(function (c: any) { normalizeCharacter(c, { designText: ud }) })
     normalizeCharacter(characters.antagonist, { designText: ud })
-  } catch (_e) { /* 规范化失败不影响主流程 */ }
+  } catch (_e) { console.error('[character-normalize] 角色规范化失败（不影响主流程）:', _e) }
   return characters
 }
 
@@ -276,6 +285,11 @@ export function normalizeCharactersTitlesAndRoles(characters: any, designText?: 
 export function dedupeCharactersByName(characters: any): number {
   if (!characters || typeof characters !== 'object') return 0
   var seen: Record<string, boolean> = {}
+  // 🔥 #218e：femaleLeads 名单豁免集——额外女主采用「femaleLeads + supporting 双挂载」渲染模型
+  //   （UI 32 卡网格只渲染 supporting，femaleLeads[1+] 不双挂载就对用户不可见）。
+  //   旧实现 uniq() 全局共享 seen：femaleLeads 先 uniq 时把额外女主名种进 seen，随后
+  //   uniq(supporting) 会把双挂载卡当「跨数组重复」剔掉（实测戴贵人 supporting[0] 被剥）。
+  var exempt: Record<string, boolean> = {}
   var removed = 0
   var uniq = function (arr: any[]): any[] {
     if (!Array.isArray(arr)) return arr
@@ -283,16 +297,24 @@ export function dedupeCharactersByName(characters: any): number {
     arr.forEach(function (c: any) {
       if (!c || !c.name) { if (c) out.push(c); return }
       var key = String(c.name).trim()
-      if (seen[key]) { removed++; return }
+      if (seen[key] && !exempt[key]) { removed++; return }
       seen[key] = true
       out.push(c)
     })
     return out
   }
   try {
+    // 🔥 #218d 修复：seen 初始只含主角；femaleLeads 先做自身内部去重（旧版先把 femaleLeads
+    //   名字种进 seen 再对自身 uniq → femaleLeads 必被整体清空，实测复现）；女主主卡名在其后
+    //   种入（此时 femaleLeads 已完成去重，不会挤掉 femaleLeads[0]）。
     if (characters.protagonist && characters.protagonist.name) seen[String(characters.protagonist.name).trim()] = true
-    ;(characters.femaleLeads || []).forEach(function (c: any) { if (c && c.name) seen[String(c.name).trim()] = seen[String(c.name).trim()] || true })
     characters.femaleLeads = uniq(characters.femaleLeads)
+    // femaleLeads 完成去重后登记豁免：其名单内的名字允许在 supporting 中双挂载存在
+    ;(characters.femaleLeads || []).forEach(function (c: any) {
+      var n = String((c && c.name) || '').trim()
+      if (n) exempt[n] = true
+    })
+    if (characters.femaleLead && characters.femaleLead.name) seen[String(characters.femaleLead.name).trim()] = true
     characters.antagonists = uniq(characters.antagonists)
     characters.supporting = uniq(characters.supporting)
     if (characters.femaleLead && characters.femaleLead.name) {
@@ -305,6 +327,6 @@ export function dedupeCharactersByName(characters: any): number {
       var dupInAnts = (characters.antagonists || []).some(function (c: any) { return c && String(c.name).trim() === akKey })
       if (dupInAnts) characters.antagonist = characters.antagonists[0] || characters.antagonist
     }
-  } catch (_e) { /* 去重失败不影响主流程 */ }
+  } catch (_e) { console.error('[character-normalize] 反派去重失败（不影响主流程）:', _e) }
   return removed
 }

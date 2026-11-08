@@ -321,7 +321,7 @@ class PlaywrightManager {
             dispatchEvent: function() { return false },
           }),
         })
-      } catch (e) {}
+      } catch (e) { console.error('[stealth] navigator 插件伪装失败:', e) }
       
       // 16. 伪装navigator.doNotTrack
       Object.defineProperty(navigator, 'doNotTrack', {
@@ -345,7 +345,7 @@ class PlaywrightManager {
         Object.defineProperty(screen, 'availHeight', { get: () => window.innerHeight })
         Object.defineProperty(screen, 'colorDepth', { get: () => 24 })
         Object.defineProperty(screen, 'pixelDepth', { get: () => 24 })
-      } catch (e) {}
+      } catch (e) { console.error('[stealth] screen 属性伪装失败:', e) }
       
       // 19. 伪装history.length
       try {
@@ -355,7 +355,7 @@ class PlaywrightManager {
             get: () => Math.max(2, Math.floor(Math.random() * 10) + 2),
           })
         }
-      } catch (e) {}
+      } catch (e) { console.error('[stealth] history.length 伪装失败:', e) }
       
       // 20. 增强Canvas指纹伪装（getImageData也添加噪点）
       const originalGetImageData = CanvasRenderingContext2D.prototype.getImageData
@@ -401,7 +401,7 @@ class PlaywrightManager {
         Object.defineProperty(navigator, 'pdfViewerEnabled', {
           get: () => true,
         })
-      } catch (e) {}
+      } catch (e) { console.error('[stealth] pdfViewerEnabled 伪装失败:', e) }
       
       // 24. 伪装navigator.hardwareConcurrency的随机性
       const coreCount = 4 + Math.floor(Math.random() * 5)  // 4-8核
@@ -423,7 +423,7 @@ class PlaywrightManager {
         Object.defineProperty(Notification, 'permission', {
           get: () => 'default',
         })
-      } catch (e) {}
+      } catch (e) { console.error('[stealth] Notification.permission 伪装失败:', e) }
     })
 
     return context
@@ -474,7 +474,7 @@ class PlaywrightManager {
         try {
           await page.waitForSelector(waitForSelector, { timeout: 1200 })
         } catch (e) {
-          // 忽略等待超时
+          console.error('[PlaywrightManager] 等待选择器超时（忽略继续）:', e)
         }
       }
 
@@ -859,7 +859,7 @@ class PlaywrightManager {
         const lemmaTitle = lemmaTitleEl ? (lemmaTitleEl.textContent || '').trim() : ''
         result['_pageTitle'] = pageTitle
         result['_lemmaTitle'] = lemmaTitle
-      } catch (e) {}
+      } catch (e) { console.error('[baike] 提取页面标题/词条标题失败:', e) }
       
       return result
     })
@@ -1026,7 +1026,7 @@ class PlaywrightManager {
         })
         await this.randomDelay(200, 500)
       } catch (e) {
-        // 忽略百度首页访问失败
+        console.error('[PlaywrightManager] 访问百度首页失败（忽略继续）:', e)
       }
       
       // 访问页面
@@ -1038,12 +1038,12 @@ class PlaywrightManager {
 
       // 等待内容加载
       try {
-        await page.waitForSelector('.main-content, .lemmaWgt-lemmaTitle, .lemma-summary, .basic-info, [class*="basic-info"]', {
-          timeout: Math.min(timeout * 0.2, 3000),
-        })
-      } catch (e) {
-        // 继续
-      }
+          await page.waitForSelector('.main-content, .lemmaWgt-lemmaTitle, .lemma-summary, .basic-info, [class*="basic-info"]', {
+            timeout: Math.min(timeout * 0.2, 3000),
+          })
+        } catch (e) {
+          console.error('[PlaywrightManager] 等待百科主内容选择器超时（继续）:', e)
+        }
 
       // 等待一段时间，让页面完全渲染
       await this.randomDelay(300, 800)
@@ -1081,7 +1081,7 @@ class PlaywrightManager {
         try {
           await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 5000 })
         } catch (e) {
-          // 可能已经加载完成
+          console.error('[PlaywrightManager] 等待小说版义项导航超时（可能已加载完成）:', e)
         }
         // 等待信息框元素出现
         try {
@@ -1089,7 +1089,7 @@ class PlaywrightManager {
             timeout: 2000,
           })
         } catch (e) {
-          // 继续
+          console.error('[PlaywrightManager] 等待信息框选择器超时（继续）:', e)
         }
         await this.randomDelay(30, 80)
         if (scroll) {
@@ -1126,20 +1126,20 @@ class PlaywrightManager {
           while ((m = cnPattern.exec(allText)) !== null) {
             const str = m[1]
             let result = 0
-            let temp = 0
+            let currentDigit = 0
             let hasDigit = false
             for (let i = 0; i < str.length; i++) {
               const char = str[i]
               if (cnDigits[char] !== undefined) {
-                temp = cnDigits[char]
+                currentDigit = cnDigits[char]
                 hasDigit = true
               } else if (cnUnits[char] !== undefined) {
                 const unit = cnUnits[char]
-                if (unit === 10000 || unit === 100000000) { result = (result + temp) * unit; temp = 0 }
-                else { if (temp === 0 && unit === 10) temp = 1; result += temp * unit; temp = 0 }
+                if (unit === 10000 || unit === 100000000) { result = (result + currentDigit) * unit; currentDigit = 0 }
+                else { if (currentDigit === 0 && unit === 10) currentDigit = 1; result += currentDigit * unit; currentDigit = 0 }
               }
             }
-            result += temp
+            result += currentDigit
             if (hasDigit && result > max && result < 10000) max = result
           }
           return max > 0 ? max : null
@@ -1169,64 +1169,63 @@ class PlaywrightManager {
             for (let ti = 0; ti < sectionTitles.length; ti++) {
               if (text.indexOf(sectionTitles[ti]) !== -1) { matched = true; break }
             }
-            if (matched) {
-              // 找到标题后，收集下面所有后续的段落，直到遇到下一个标题
-              let next = h.nextElementSibling
-              while (next) {
-                const nextTag = next.tagName.toLowerCase()
-                const nextClass = (next.className || '')
-                const nextText = next.textContent || ''
+            if (!matched) continue
+            // 找到标题后，收集下面所有后续的段落，直到遇到下一个标题
+            let next = h.nextElementSibling
+            while (next) {
+              const nextTag = next.tagName.toLowerCase()
+              const nextClass = (next.className || '')
+              const nextText = next.textContent || ''
                 
-                // 遇到下一个标题就停止
-                if (/h[1-6]/.test(nextTag) || nextClass.indexOf('para-title') !== -1 || nextClass.indexOf('title_') !== -1 || nextClass.indexOf('paraTitle') !== -1) {
-                  break
-                }
-                
-                // 跳过视频、图片、参考资料等
-                if (nextClass.indexOf('video') !== -1 || nextTag === 'video' || nextTag === 'img' || nextTag === 'figure') {
-                  next = next.nextElementSibling
-                  continue
-                }
-                
-                // 跳过目录、参考资料等
-                if (nextText.indexOf('目录') !== -1 && nextText.length < 100 && nextText.indexOf('1') !== -1 && nextText.indexOf('2') !== -1) {
-                  next = next.nextElementSibling
-                  continue
-                }
-                
-                // 跳过秒懂百科、视频时长等无关内容
-                const skipPatterns = [/^\d{2}:\d{2}$/, /秒懂百科/, /视频时长/, /播放/, /点赞/, /收藏/]
-                let shouldSkip = false
-                for (let si = 0; si < skipPatterns.length; si++) {
-                  if (skipPatterns[si].test(nextText.trim())) { shouldSkip = true; break }
-                }
-                if (shouldSkip) {
-                  next = next.nextElementSibling
-                  continue
-                }
-                
-                let paraText = ((next as HTMLElement).innerText || next.textContent || '').trim()
-                // 只取有意义的段落（长度适中，包含中文）
-                if (paraText.length > 20 && paraText.length < 1000 && /[\u4e00-\u9fa5]/.test(paraText)) {
-                  // 去掉引用标记
-                  paraText = paraText.replace(/\[\d+\]/g, '')
-                  // 过滤掉只包含简短标签的行
-                  const lines = paraText.split('\n').filter(function(line: string) {
-                    const trimmed = line.trim()
-                    if (trimmed.length === 0) return false
-                    // 过滤掉纯数字、纯符号、太短的行
-                    if (/^[\d\s\-\.,:：、]+$/.test(trimmed)) return false
-                    if (trimmed.length < 5) return false
-                    return true
-                  })
-                  if (lines.length > 0) {
-                    contentText += lines.join('\n') + '\n'
-                  }
-                }
-                next = next.nextElementSibling
+              // 遇到下一个标题就停止
+              if (/h[1-6]/.test(nextTag) || nextClass.indexOf('para-title') !== -1 || nextClass.indexOf('title_') !== -1 || nextClass.indexOf('paraTitle') !== -1) {
+                break
               }
-              if (contentText.trim().length > 100) break
+                
+              // 跳过视频、图片、参考资料等
+              if (nextClass.indexOf('video') !== -1 || nextTag === 'video' || nextTag === 'img' || nextTag === 'figure') {
+                next = next.nextElementSibling
+                continue
+              }
+                
+              // 跳过目录、参考资料等
+              if (nextText.indexOf('目录') !== -1 && nextText.length < 100 && nextText.indexOf('1') !== -1 && nextText.indexOf('2') !== -1) {
+                next = next.nextElementSibling
+                continue
+              }
+                
+              // 跳过秒懂百科、视频时长等无关内容
+              const skipPatterns = [/^\d{2}:\d{2}$/, /秒懂百科/, /视频时长/, /播放/, /点赞/, /收藏/]
+              let shouldSkip = false
+              for (let si = 0; si < skipPatterns.length; si++) {
+                if (skipPatterns[si].test(nextText.trim())) { shouldSkip = true; break }
+              }
+              if (shouldSkip) {
+                next = next.nextElementSibling
+                continue
+              }
+                
+              let paraText = ((next as HTMLElement).innerText || next.textContent || '').trim()
+              // 只取有意义的段落（长度适中，包含中文）
+              if (paraText.length > 20 && paraText.length < 1000 && /[\u4e00-\u9fa5]/.test(paraText)) {
+                // 去掉引用标记
+                paraText = paraText.replace(/\[\d+\]/g, '')
+                // 过滤掉只包含简短标签的行
+                const lines = paraText.split('\n').filter(function(line: string) {
+                  const trimmed = line.trim()
+                  if (trimmed.length === 0) return false
+                  // 过滤掉纯数字、纯符号、太短的行
+                  if (/^[\d\s\-\.,:：、]+$/.test(trimmed)) return false
+                  if (trimmed.length < 5) return false
+                  return true
+                })
+                if (lines.length > 0) {
+                  contentText += lines.join('\n') + '\n'
+                }
+              }
+              next = next.nextElementSibling
             }
+            if (contentText.trim().length > 100) break
           }
           
           if (contentText.trim().length > 100) {
@@ -1273,7 +1272,7 @@ class PlaywrightManager {
                   }
                 }
               }
-            } catch (e) {}
+            } catch (e) { console.error('[baike] 提取作者信息失败:', e) }
             
             // ===== 辅助函数 =====
             function addChar(name, desc, position) {
@@ -1741,38 +1740,37 @@ class PlaywrightManager {
                 }
               }
               
-              if (isPowerSection) {
-                var nextHeading = null;
-                var currentLevel = heading.tagName.toLowerCase() === 'h2' ? 2 : 3;
-                for (var m = k + 1; m < headings.length; m++) {
-                  var nextLevel = headings[m].tagName.toLowerCase() === 'h2' ? 2 : 3;
-                  if (nextLevel <= currentLevel) {
-                    nextHeading = headings[m];
-                    break;
+              if (!isPowerSection) continue;
+              var nextHeading = null;
+              var currentLevel = heading.tagName.toLowerCase() === 'h2' ? 2 : 3;
+              for (var m = k + 1; m < headings.length; m++) {
+                var nextLevel = headings[m].tagName.toLowerCase() === 'h2' ? 2 : 3;
+                if (nextLevel <= currentLevel) {
+                  nextHeading = headings[m];
+                  break;
+                }
+              }
+                
+              var allParas = document.querySelectorAll('.para, p, [class*="para_"], [class*="content_"], div[class*="text"]');
+              var content = '';
+              var headingTop = heading.getBoundingClientRect().bottom;
+              var nextTop = nextHeading ? nextHeading.getBoundingClientRect().top : 999999;
+                
+              for (var p = 0; p < allParas.length; p++) {
+                var para = allParas[p];
+                var paraTop = para.getBoundingClientRect().top;
+                if (paraTop > headingTop && paraTop < nextTop) {
+                  var text = (para.innerText || para.textContent || '').replace(/\\[\\d+\\]/g, '').trim();
+                  if (text && text.length > 15 && text.length < 300) {
+                    if (/^(参考资料|词条图册|相关搜索|推荐阅读|词条标签|TA说|为您推荐)/.test(text.substring(0, 10))) continue;
+                    if (/^(首页|登录|注册|关于我们|联系方式)/.test(text.substring(0, 10))) continue;
+                    content += text + '\\n';
                   }
                 }
+              }
                 
-                var allParas = document.querySelectorAll('.para, p, [class*="para_"], [class*="content_"], div[class*="text"]');
-                var content = '';
-                var headingTop = heading.getBoundingClientRect().bottom;
-                var nextTop = nextHeading ? nextHeading.getBoundingClientRect().top : 999999;
-                
-                for (var p = 0; p < allParas.length; p++) {
-                  var para = allParas[p];
-                  var paraTop = para.getBoundingClientRect().top;
-                  if (paraTop > headingTop && paraTop < nextTop) {
-                    var text = (para.innerText || para.textContent || '').replace(/\\[\\d+\\]/g, '').trim();
-                    if (text && text.length > 15 && text.length < 300) {
-                      if (/^(参考资料|词条图册|相关搜索|推荐阅读|词条标签|TA说|为您推荐)/.test(text.substring(0, 10))) continue;
-                      if (/^(首页|登录|注册|关于我们|联系方式)/.test(text.substring(0, 10))) continue;
-                      content += text + '\\n';
-                    }
-                  }
-                }
-                
-                if (content.length > 30) {
-                  result += (result ? '\\n\\n【' + headingText + '】\\n' : '【' + headingText + '】\\n') + content.trim();
-                }
+              if (content.length > 30) {
+                result += (result ? '\\n\\n【' + headingText + '】\\n' : '【' + headingText + '】\\n') + content.trim();
               }
             }
             
@@ -1979,8 +1977,8 @@ class PlaywrightManager {
       console.log('[PlaywrightManager] fetchBaiduBaikeNovel失败:', e instanceof Error ? e.message : String(e))
       return null
     } finally {
-      if (page) { try { await page.close() } catch (e) {} }
-      if (context) { try { await context.close() } catch (e) {} }
+      if (page) { try { await page.close() } catch (e) { console.error('[PlaywrightManager] 关闭 page 失败:', e) } }
+      if (context) { try { await context.close() } catch (e) { console.error('[PlaywrightManager] 关闭 context 失败:', e) } }
     }
   }
   
@@ -2074,7 +2072,7 @@ class PlaywrightManager {
             console.log('[PlaywrightManager] 搜索结果加载成功，选择器:', sel)
             break
           } catch (e) {
-            // 继续试下一个
+            console.error('[PlaywrightManager] 搜索结果选择器未命中，继续试下一个:', e)
           }
         }
         if (!found) {
@@ -2268,7 +2266,7 @@ class PlaywrightManager {
       try {
         await page.waitForLoadState('domcontentloaded', { timeout: timeout / 5 })
       } catch (e) {
-        // 忽略
+        console.error('[PlaywrightManager] 等待页面 domcontentloaded 超时（忽略）:', e)
       }
 
       // 等待信息框等关键元素加载
@@ -2277,7 +2275,7 @@ class PlaywrightManager {
           timeout: timeout / 6,
         })
       } catch (e) {
-        // 继续
+        console.error('[PlaywrightManager] 等待信息框选择器超时（继续）:', e)
       }
       
       // 等待百度百科的特征元素
@@ -2306,13 +2304,13 @@ class PlaywrightManager {
           try {
             await page.waitForLoadState('domcontentloaded', { timeout: timeout / 5 })
           } catch (e) {
-            // 忽略
+            console.error('[PlaywrightManager] 切换义项后等待页面加载超时（忽略）:', e)
           }
           // 等待信息框元素
           try {
             await page.waitForSelector('.basic-info, [class*="basic-info"]', { timeout: 3000 })
           } catch (e) {
-            // 继续
+            console.error('[PlaywrightManager] 等待信息框元素超时（继续）:', e)
           }
           await this.randomDelay(100, 250)
         } else {
@@ -2364,26 +2362,26 @@ class PlaywrightManager {
           while ((m = cnPattern.exec(allText)) !== null) {
             const str = m[1]
             let result = 0
-            let temp = 0
+            let currentDigit = 0
             let hasDigit = false
             for (let i = 0; i < str.length; i++) {
               const char = str[i]
               if (cnDigits[char] !== undefined) {
-                temp = cnDigits[char]
+                currentDigit = cnDigits[char]
                 hasDigit = true
               } else if (cnUnits[char] !== undefined) {
                 const unit = cnUnits[char]
                 if (unit === 10000 || unit === 100000000) {
-                  result = (result + temp) * unit
-                  temp = 0
+                  result = (result + currentDigit) * unit
+                  currentDigit = 0
                 } else {
-                  if (temp === 0 && unit === 10) temp = 1
-                  result += temp * unit
-                  temp = 0
+                  if (currentDigit === 0 && unit === 10) currentDigit = 1
+                  result += currentDigit * unit
+                  currentDigit = 0
                 }
               }
             }
-            result += temp
+            result += currentDigit
             if (hasDigit && result > max && result < 10000) max = result
           }
           
@@ -2415,64 +2413,63 @@ class PlaywrightManager {
             for (let ti = 0; ti < sectionTitles.length; ti++) {
               if (text.indexOf(sectionTitles[ti]) !== -1) { matched = true; break }
             }
-            if (matched) {
-              // 找到标题后，收集下面所有后续的段落，直到遇到下一个标题
-              let next = h.nextElementSibling
-              while (next) {
-                const nextTag = next.tagName.toLowerCase()
-                const nextClass = (next.className || '')
-                const nextText = next.textContent || ''
+            if (!matched) continue
+            // 找到标题后，收集下面所有后续的段落，直到遇到下一个标题
+            let next = h.nextElementSibling
+            while (next) {
+              const nextTag = next.tagName.toLowerCase()
+              const nextClass = (next.className || '')
+              const nextText = next.textContent || ''
                 
-                // 遇到下一个标题就停止
-                if (/h[1-6]/.test(nextTag) || nextClass.indexOf('para-title') !== -1 || nextClass.indexOf('title_') !== -1 || nextClass.indexOf('paraTitle') !== -1) {
-                  break
-                }
-                
-                // 跳过视频、图片、参考资料等
-                if (nextClass.indexOf('video') !== -1 || nextTag === 'video' || nextTag === 'img' || nextTag === 'figure') {
-                  next = next.nextElementSibling
-                  continue
-                }
-                
-                // 跳过目录、参考资料等
-                if (nextText.indexOf('目录') !== -1 && nextText.length < 100 && nextText.indexOf('1') !== -1 && nextText.indexOf('2') !== -1) {
-                  next = next.nextElementSibling
-                  continue
-                }
-                
-                // 跳过秒懂百科、视频时长等无关内容
-                const skipPatterns = [/^\d{2}:\d{2}$/, /秒懂百科/, /视频时长/, /播放/, /点赞/, /收藏/]
-                let shouldSkip = false
-                for (let si = 0; si < skipPatterns.length; si++) {
-                  if (skipPatterns[si].test(nextText.trim())) { shouldSkip = true; break }
-                }
-                if (shouldSkip) {
-                  next = next.nextElementSibling
-                  continue
-                }
-                
-                let paraText = ((next as HTMLElement).innerText || next.textContent || '').trim()
-                // 只取有意义的段落（长度适中，包含中文）
-                if (paraText.length > 20 && paraText.length < 1000 && /[\u4e00-\u9fa5]/.test(paraText)) {
-                  // 去掉引用标记
-                  paraText = paraText.replace(/\[\d+\]/g, '')
-                  // 过滤掉只包含简短标签的行
-                  const lines = paraText.split('\n').filter(function(line: string) {
-                    const trimmed = line.trim()
-                    if (trimmed.length === 0) return false
-                    // 过滤掉纯数字、纯符号、太短的行
-                    if (/^[\d\s\-\.,:：、]+$/.test(trimmed)) return false
-                    if (trimmed.length < 5) return false
-                    return true
-                  })
-                  if (lines.length > 0) {
-                    contentText += lines.join('\n') + '\n'
-                  }
-                }
-                next = next.nextElementSibling
+              // 遇到下一个标题就停止
+              if (/h[1-6]/.test(nextTag) || nextClass.indexOf('para-title') !== -1 || nextClass.indexOf('title_') !== -1 || nextClass.indexOf('paraTitle') !== -1) {
+                break
               }
-              if (contentText.trim().length > 100) break
+                
+              // 跳过视频、图片、参考资料等
+              if (nextClass.indexOf('video') !== -1 || nextTag === 'video' || nextTag === 'img' || nextTag === 'figure') {
+                next = next.nextElementSibling
+                continue
+              }
+                
+              // 跳过目录、参考资料等
+              if (nextText.indexOf('目录') !== -1 && nextText.length < 100 && nextText.indexOf('1') !== -1 && nextText.indexOf('2') !== -1) {
+                next = next.nextElementSibling
+                continue
+              }
+                
+              // 跳过秒懂百科、视频时长等无关内容
+              const skipPatterns = [/^\d{2}:\d{2}$/, /秒懂百科/, /视频时长/, /播放/, /点赞/, /收藏/]
+              let shouldSkip = false
+              for (let si = 0; si < skipPatterns.length; si++) {
+                if (skipPatterns[si].test(nextText.trim())) { shouldSkip = true; break }
+              }
+              if (shouldSkip) {
+                next = next.nextElementSibling
+                continue
+              }
+                
+              let paraText = ((next as HTMLElement).innerText || next.textContent || '').trim()
+              // 只取有意义的段落（长度适中，包含中文）
+              if (paraText.length > 20 && paraText.length < 1000 && /[\u4e00-\u9fa5]/.test(paraText)) {
+                // 去掉引用标记
+                paraText = paraText.replace(/\[\d+\]/g, '')
+                // 过滤掉只包含简短标签的行
+                const lines = paraText.split('\n').filter(function(line: string) {
+                  const trimmed = line.trim()
+                  if (trimmed.length === 0) return false
+                  // 过滤掉纯数字、纯符号、太短的行
+                  if (/^[\d\s\-\.,:：、]+$/.test(trimmed)) return false
+                  if (trimmed.length < 5) return false
+                  return true
+                })
+                if (lines.length > 0) {
+                  contentText += lines.join('\n') + '\n'
+                }
+              }
+              next = next.nextElementSibling
             }
+            if (contentText.trim().length > 100) break
           }
           
           if (contentText.trim().length > 100) {
@@ -2520,7 +2517,7 @@ class PlaywrightManager {
                   }
                 }
               }
-            } catch (e) {}
+            } catch (e) { console.error('[baike] 提取作者信息失败:', e) }
             
             // ===== 辅助函数 =====
             function addChar(name, desc, position) {
@@ -2949,38 +2946,37 @@ class PlaywrightManager {
                 }
               }
               
-              if (isPowerSection) {
-                var nextHeading = null;
-                var currentLevel = heading.tagName.toLowerCase() === 'h2' ? 2 : 3;
-                for (var m = k + 1; m < headings.length; m++) {
-                  var nextLevel = headings[m].tagName.toLowerCase() === 'h2' ? 2 : 3;
-                  if (nextLevel <= currentLevel) {
-                    nextHeading = headings[m];
-                    break;
+              if (!isPowerSection) continue;
+              var nextHeading = null;
+              var currentLevel = heading.tagName.toLowerCase() === 'h2' ? 2 : 3;
+              for (var m = k + 1; m < headings.length; m++) {
+                var nextLevel = headings[m].tagName.toLowerCase() === 'h2' ? 2 : 3;
+                if (nextLevel <= currentLevel) {
+                  nextHeading = headings[m];
+                  break;
+                }
+              }
+                
+              var allParas = document.querySelectorAll('.para, p, [class*="para_"], [class*="content_"], div[class*="text"]');
+              var content = '';
+              var headingTop = heading.getBoundingClientRect().bottom;
+              var nextTop = nextHeading ? nextHeading.getBoundingClientRect().top : 999999;
+                
+              for (var p = 0; p < allParas.length; p++) {
+                var para = allParas[p];
+                var paraTop = para.getBoundingClientRect().top;
+                if (paraTop > headingTop && paraTop < nextTop) {
+                  var text = (para.innerText || para.textContent || '').replace(/\\[\\d+\\]/g, '').trim();
+                  if (text && text.length > 15 && text.length < 300) {
+                    if (/^(参考资料|词条图册|相关搜索|推荐阅读|词条标签|TA说|为您推荐)/.test(text.substring(0, 10))) continue;
+                    if (/^(首页|登录|注册|关于我们|联系方式)/.test(text.substring(0, 10))) continue;
+                    content += text + '\\n';
                   }
                 }
+              }
                 
-                var allParas = document.querySelectorAll('.para, p, [class*="para_"], [class*="content_"], div[class*="text"]');
-                var content = '';
-                var headingTop = heading.getBoundingClientRect().bottom;
-                var nextTop = nextHeading ? nextHeading.getBoundingClientRect().top : 999999;
-                
-                for (var p = 0; p < allParas.length; p++) {
-                  var para = allParas[p];
-                  var paraTop = para.getBoundingClientRect().top;
-                  if (paraTop > headingTop && paraTop < nextTop) {
-                    var text = (para.innerText || para.textContent || '').replace(/\\[\\d+\\]/g, '').trim();
-                    if (text && text.length > 15 && text.length < 300) {
-                      if (/^(参考资料|词条图册|相关搜索|推荐阅读|词条标签|TA说|为您推荐)/.test(text.substring(0, 10))) continue;
-                      if (/^(首页|登录|注册|关于我们|联系方式)/.test(text.substring(0, 10))) continue;
-                      content += text + '\\n';
-                    }
-                  }
-                }
-                
-                if (content.length > 30) {
-                  result += (result ? '\\n\\n【' + headingText + '】\\n' : '【' + headingText + '】\\n') + content.trim();
-                }
+              if (content.length > 30) {
+                result += (result ? '\\n\\n【' + headingText + '】\\n' : '【' + headingText + '】\\n') + content.trim();
               }
             }
             

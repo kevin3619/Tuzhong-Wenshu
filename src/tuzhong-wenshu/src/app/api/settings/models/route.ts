@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server'
 import fs from 'fs'
 import path from 'path'
 import { verifyToken } from '@/lib/auth'
+import { atomicWriteJson } from '@/lib/file-lock'
 
 const dataDir = path.join(process.cwd(), '.tuzhong-data')
 const modelsFile = path.join(dataDir, 'models.json')
@@ -16,6 +17,8 @@ interface ModelConfig {
   model?: string
   userId?: string
   isAdminDefault?: boolean
+  // 🔥 2026-09-24：可选的按模型调用频率限制（opt-in，仅带此字段的模型后端才限流）
+  rateLimit?: { perMinute?: number; perHour?: number; perDay?: number }
   createdAt?: string
   updatedAt?: string
 }
@@ -76,7 +79,7 @@ function readModels(): ModelConfig[] {
 // 直接 writeFileSync 覆盖已存在文件不触发删除语义，可绕过 safe-delete 拦截。
 function writeModels(data: ModelConfig[]) {
   ensureDataFile()
-  fs.writeFileSync(modelsFile, JSON.stringify(data, null, 2), 'utf-8')
+  atomicWriteJson(modelsFile, data)
 }
 
 function generateId(): string {
@@ -102,26 +105,35 @@ export async function GET(request: Request) {
   const models = readModels()
 
   if (modelId) {
+    // 🔥 安全修复：单模型详情必须先登录，且只能看：管理员 / 本人模型 / 管理员共享模型
+    if (!user) {
+      return NextResponse.json({ error: '未登录' }, { status: 401 })
+    }
     const model = models.find((m) => m.id === modelId)
     if (!model) {
       return NextResponse.json({ error: '模型配置不存在' }, { status: 404 })
     }
-    if (user && !user.isAdmin && model.userId !== user.userId && !model.isAdminDefault) {
+    if (!user.isAdmin && model.userId !== user.userId && !model.isAdminDefault) {
       return NextResponse.json({ error: '无权限访问此模型' }, { status: 403 })
     }
-    return NextResponse.json({ data: model })
+    // 🔥 安全修复：apiKey 永不下发明文（前端本来只存 '***'，真实 Key 由服务端 resolveLLMConfig 回填）
+    return NextResponse.json({ data: { ...model, apiKey: model.apiKey ? '***' : '' } })
   }
 
   if (!user) {
+    // 🔥 安全修复：匿名一律不下发任何模型（此前匿名可拿到全量含 Key 配置）
     return NextResponse.json({ data: [] })
   }
 
   if (user.isAdmin) {
-    return NextResponse.json({ data: models, isAdmin: true })
+    // 管理员可见全部，但列表同样脱敏（编辑详情另行通过登录校验获取）
+    return NextResponse.json({ data: models.map((m) => ({ ...m, apiKey: m.apiKey ? '***' : '' })), isAdmin: true })
   }
 
-  // 管理员配置的共享模型：所有用户可见且可使用，apiKey 不脱敏（服务端内部分享机制）
-  const visibleModels = models.filter((m) => m.userId === user.userId || m.isAdminDefault === true)
+  // 管理员配置的共享模型：所有用户可见可用；apiKey 一律脱敏（服务端解析真实 Key）
+  const visibleModels = models
+    .filter((m) => m.userId === user.userId || m.isAdminDefault === true)
+    .map((m) => ({ ...m, apiKey: m.apiKey ? '***' : '' }))
   return NextResponse.json({ data: visibleModels, isAdmin: user.isAdmin })
 }
 
@@ -137,7 +149,7 @@ export async function POST(request: Request) {
     }
 
     const body = await request.json()
-    const { provider, name, status, apiKey, baseUrl, model } = body
+    const { provider, name, status, apiKey, baseUrl, model, rateLimit } = body
 
     if (!provider || !name) {
       return NextResponse.json(
@@ -171,9 +183,11 @@ export async function POST(request: Request) {
       }
       existing.name = name
       existing.status = modelStatus
-      existing.apiKey = apiKey
+      // 🔥 安全修复：前端回传 '***'（脱敏值）时保留原 Key，防止把真实 Key 覆盖成星号
+      existing.apiKey = (apiKey && !String(apiKey).includes('*')) ? apiKey : (existing.apiKey || apiKey)
       existing.baseUrl = baseUrl
       existing.model = model || ''
+      existing.rateLimit = rateLimit
       existing.updatedAt = new Date().toISOString()
       writeModels(models)
       return NextResponse.json({ data: existing, updated: true }, { status: 200 })
@@ -198,6 +212,7 @@ export async function POST(request: Request) {
       userId: user.userId,
       // 修复：管理员创建的模型标记为 isAdminDefault: true，普通用户可共享使用
       isAdminDefault: user.isAdmin ? true : false,
+      rateLimit: rateLimit,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     }
@@ -256,9 +271,18 @@ export async function PUT(request: Request) {
       return NextResponse.json({ error: '无权限修改管理员共享的模型' }, { status: 403 })
     }
 
+    // 🔥 修复（P2 提权）：updateData 原样展开，普通用户可把自己那条模型标成
+    //   isAdminDefault（全员共享、别人的请求会走他的 Key/BaseUrl）或改写归属 userId。
+    const safeUpdate: Record<string, unknown> = { ...updateData }
+    if (!user.isAdmin) {
+      delete safeUpdate.isAdminDefault
+      delete safeUpdate.userId
+      delete safeUpdate.id
+    }
+
     models[index] = {
       ...models[index],
-      ...updateData,
+      ...safeUpdate,
       updatedAt: new Date().toISOString(),
     }
 

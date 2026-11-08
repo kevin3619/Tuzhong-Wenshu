@@ -14,7 +14,7 @@ function tryExtractSerial(p12Buf: Buffer): string {
     const asciiText = p12Buf.toString('ascii')
     const snMatch = asciiText.match(/[0-9A-F]{16,}/)
     if (snMatch) return snMatch[0]
-  } catch { /* ignore */ }
+  } catch (e) { console.error('[wechat-cert] 提取证书序列号失败:', e) }
   return ''
 }
 

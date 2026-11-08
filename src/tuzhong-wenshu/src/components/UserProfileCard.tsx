@@ -78,7 +78,7 @@ export default function UserProfileCard({
           setNickname(u.nickname || '')
           setEmail(u.email || '')
           return
-        } catch {}
+        } catch (e) { console.error('[UserProfileCard] 解析本地用户信息失败:', e) }
       }
       // localStorage 缺失时调用后端 API 获取
       try {
@@ -95,7 +95,7 @@ export default function UserProfileCard({
           setEmail(u.email || '')
           localStorage.setItem('user', JSON.stringify(u))
         }
-      } catch {}
+      } catch (e) { console.error('[UserProfileCard] 回写本地用户信息失败:', e) }
     }
     loadUser()
   }, [])
@@ -112,10 +112,13 @@ export default function UserProfileCard({
     }
   }, [])
 
+  const messageTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const showMessage = (msg: string, type: 'success' | 'error') => {
     setMessage(msg)
     setMessageType(type)
-    setTimeout(() => setMessage(''), 3000)
+    // 🔥 Bug修复：连续两次提示时，前一条的 3 秒计时器会把新消息提前清空
+    if (messageTimerRef.current) clearTimeout(messageTimerRef.current)
+    messageTimerRef.current = setTimeout(() => setMessage(''), 3000)
   }
 
   // 保存个人信息
@@ -386,8 +389,8 @@ export default function UserProfileCard({
                 type="text"
                 value={oldPassword}
                 onChange={(e) => setOldPassword(e.target.value)}
-                onFocus={(e) => { try { const t = e.target as HTMLInputElement; t.type = 'password'; t.readOnly = false } catch(_e){} }}
-                onBlur={(e) => { try { (e.target as HTMLInputElement).readOnly = true } catch(_e){} }}
+                onFocus={(e) => { try { const t = e.target as HTMLInputElement; t.type = 'password'; t.readOnly = false } catch(_e){ console.error('[user-profile] 切换密码可见失败:', _e) } }}
+                onBlur={(e) => { try { (e.target as HTMLInputElement).readOnly = true } catch(_e){ console.error('[user-profile] 密码框置只读失败:', _e) } }}
                 placeholder="原密码（微信注册初始密码：123456）"
                 autoComplete="one-time-code"
                 name="_sec_field_k9p2_a1"
@@ -403,8 +406,8 @@ export default function UserProfileCard({
                 type="text"
                 value={newPassword}
                 onChange={(e) => setNewPassword(e.target.value)}
-                onFocus={(e) => { try { const t = e.target as HTMLInputElement; t.type = 'password'; t.readOnly = false } catch(_e){} }}
-                onBlur={(e) => { try { (e.target as HTMLInputElement).readOnly = true } catch(_e){} }}
+                onFocus={(e) => { try { const t = e.target as HTMLInputElement; t.type = 'password'; t.readOnly = false } catch(_e){ console.error('[user-profile] 切换密码可见失败:', _e) } }}
+                onBlur={(e) => { try { (e.target as HTMLInputElement).readOnly = true } catch(_e){ console.error('[user-profile] 密码框置只读失败:', _e) } }}
                 placeholder="6-16位新密码"
                 autoComplete="one-time-code"
                 name="_sec_field_m7n3_b2"
@@ -420,8 +423,8 @@ export default function UserProfileCard({
                 type="text"
                 value={confirmNewPassword}
                 onChange={(e) => setConfirmNewPassword(e.target.value)}
-                onFocus={(e) => { try { const t = e.target as HTMLInputElement; t.type = 'password'; t.readOnly = false } catch(_e){} }}
-                onBlur={(e) => { try { (e.target as HTMLInputElement).readOnly = true } catch(_e){} }}
+                onFocus={(e) => { try { const t = e.target as HTMLInputElement; t.type = 'password'; t.readOnly = false } catch(_e){ console.error('[user-profile] 切换密码可见失败:', _e) } }}
+                onBlur={(e) => { try { (e.target as HTMLInputElement).readOnly = true } catch(_e){ console.error('[user-profile] 密码框置只读失败:', _e) } }}
                 placeholder="再次输入新密码"
                 autoComplete="one-time-code"
                 name="_sec_field_t5q4_c3"
@@ -458,8 +461,8 @@ export default function UserProfileCard({
                 type="text"
                 value={newUsername}
                 onChange={(e) => setNewUsername(e.target.value)}
-                onFocus={(e) => { try { (e.target as HTMLInputElement).readOnly = false } catch(_e){} }}
-                onBlur={(e) => { try { (e.target as HTMLInputElement).readOnly = true } catch(_e){} }}
+                onFocus={(e) => { try { (e.target as HTMLInputElement).readOnly = false } catch(_e){ console.error('[user-profile] 密码框解除只读失败:', _e) } }}
+                onBlur={(e) => { try { (e.target as HTMLInputElement).readOnly = true } catch(_e){ console.error('[user-profile] 密码框置只读失败:', _e) } }}
                 placeholder="请输入新登录账号"
                 autoComplete="one-time-code"
                 name="_usr_field_j8h5_d4"
@@ -475,8 +478,8 @@ export default function UserProfileCard({
                 type="text"
                 value={usernamePassword}
                 onChange={(e) => setUsernamePassword(e.target.value)}
-                onFocus={(e) => { try { const t = e.target as HTMLInputElement; t.type = 'password'; t.readOnly = false } catch(_e){} }}
-                onBlur={(e) => { try { (e.target as HTMLInputElement).readOnly = true } catch(_e){} }}
+                onFocus={(e) => { try { const t = e.target as HTMLInputElement; t.type = 'password'; t.readOnly = false } catch(_e){ console.error('[user-profile] 切换密码可见失败:', _e) } }}
+                onBlur={(e) => { try { (e.target as HTMLInputElement).readOnly = true } catch(_e){ console.error('[user-profile] 密码框置只读失败:', _e) } }}
                 placeholder="请输入原密码"
                 autoComplete="one-time-code"
                 name="_sec_field_l2m7_e5"

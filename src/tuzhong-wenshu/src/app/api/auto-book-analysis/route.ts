@@ -9,6 +9,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { buildBookAnalysisMapping, BOOK_ANALYSIS_PROMPT } from '@/lib/ai/promptLibrary'
 import { callLLMWithFallback } from '@/lib/ai/llm'
 import { lenientParseJSON } from '@/lib/ai/json-lenient'
+import { deconstructChapterBlueprint } from '@/lib/ai/story-deconstruct'
 
 // 复用第一期拆书搜索的数据库
 interface BookData {
@@ -56,7 +57,9 @@ export async function POST(req: NextRequest) {
         if (_fs.existsSync(_fp)) {
           const _models = Array.isArray(JSON.parse(_fs.readFileSync(_fp, 'utf-8'))) ? JSON.parse(_fs.readFileSync(_fp, 'utf-8')) : []
           const _valid = function (m: any) { return m && m.apiKey && !String(m.apiKey).includes('*') && m.model }
-          const _default = (_models.find(function (m: any) { return m.status === 'default' && _valid(m) })) || _models.find(_valid)
+          // 🔥 P2 #8 安全修复：只取管理员共享默认模型（status==='default'），
+          //   不回退「任意首个有效 Key 模型」——models.json 含多用户模型，会越权占用他人 Key。
+          const _default = _models.find(function (m: any) { return m.status === 'default' && _valid(m) }) || null
           if (_default) {
             _effLlmConfig = {
               provider: _default.provider || '硅基流动',
@@ -64,10 +67,9 @@ export async function POST(req: NextRequest) {
               baseUrl: String(_default.baseUrl || 'https://api.siliconflow.cn/v1').replace(/[`'"]/g, '').trim(),
               model: _default.model,
             }
-            console.log('[auto-book-analysis] 未传模型，使用管理员默认模型:', _default.model)
           }
         }
-      } catch (_e) { /* 忽略 */ }
+      } catch (_e) { console.error('[auto-book-analysis] 读取默认模型配置失败:', _e) }
     }
     if (!_effLlmConfig) {
       const _envKey = String((process.env.SILICONFLOW_API_KEY as string) || '')
@@ -97,11 +99,10 @@ export async function POST(req: NextRequest) {
         const searchJson = await searchRes.json()
         if (searchJson.success && searchJson.data) {
           bookData = searchJson.data
-          console.log('[auto-book-analysis] 搜索成功:', bookData!.title, '作者:', bookData!.author)
         }
       }
     } catch (err) {
-      console.warn('[auto-book-analysis] 搜索失败，尝试直接LLM分析:', err)
+      console.error('[auto-book-analysis] 全网搜索图书信息失败:', err)
     }
 
     // Step 2: 构建LLM提示词
@@ -158,7 +159,6 @@ ${bookData.keywords?.join('、') || bookData.tags?.join('、') || ''}
     const fullPrompt = `${prompt}\n\n【参考信息】\n${bookInfoPrompt}\n\n请严格按照上述JSON格式输出拆解结果，所有字段必须填充，JSON必须完整有效。🔥 关键数据（字数、章节数、作者、主角名）必须与真实数据一致，绝对不能编造！`
 
     // Step 3: 调用LLM进行拆解
-    console.log('[auto-book-analysis] 调用LLM拆解中...')
     const llmResponse = await callLLMWithFallback(
       _effLlmConfig,
       [
@@ -181,7 +181,6 @@ ${bookData.keywords?.join('、') || bookData.tags?.join('、') || ''}
       }
       analysis = JSON.parse(jsonStr)
     } catch (parseErr) {
-      console.error('[auto-book-analysis] JSON解析失败:', parseErr)
       // 尝试修复常见JSON问题
       try {
         const cleaned = responseText
@@ -198,7 +197,6 @@ ${bookData.keywords?.join('、') || bookData.tags?.join('、') || ''}
         try { _lenient = lenientParseJSON(responseText) } catch (_le) { _lenient = null }
         if (_lenient && typeof _lenient === 'object' && Object.keys(_lenient).length > 0) {
           analysis = _lenient as Record<string, unknown>
-          console.log('[auto-book-analysis] lenientParseJSON 容错解析成功，字段数:', Object.keys(analysis).length)
         } else {
           return NextResponse.json({
             error: 'AI拆解结果格式异常，请重试或使用手动导入',
@@ -216,36 +214,30 @@ ${bookData.keywords?.join('、') || bookData.tags?.join('、') || ''}
     // LLM 拆解有时会漏填这些基础字段，必须从 bookData 中补全
     if (!analysis.author && bookData?.author) {
       analysis.author = bookData.author
-      console.log('[auto-book-analysis] 补全 author:', analysis.author)
     }
     if (!analysis.bookGenre || analysis.bookGenre === '玄幻') {
       // 如果 LLM 兜底为玄幻但 bookData 有更准确的类型，使用 bookData 的类型
       if (bookData?.genre && bookData.genre !== '玄幻') {
         analysis.bookGenre = bookData.genre
-        console.log('[auto-book-analysis] 修正 bookGenre:', analysis.bookGenre)
       }
     }
     if (!analysis.totalChapters && bookData?.totalChapters) {
       analysis.totalChapters = bookData.totalChapters
-      console.log('[auto-book-analysis] 补全 totalChapters:', analysis.totalChapters)
     } else if (!analysis.totalChapters && bookData?.chapterCount) {
       // chapterCount 字符串格式："746章"，提取数字
       const numMatch = String(bookData.chapterCount).match(/\d+/)
       if (numMatch) {
         analysis.totalChapters = parseInt(numMatch[0], 10)
-        console.log('[auto-book-analysis] 补全 totalChapters:', analysis.totalChapters)
       }
     }
     if (!analysis.totalWords && bookData?.wordCount) {
       analysis.totalWords = bookData.wordCount
-      console.log('[auto-book-analysis] 补全 totalWords:', analysis.totalWords)
     }
     // 主角名兜底
     if (!analysis.protagonistName && bookData?.characters) {
       const proto = bookData.characters.find((c: { role?: string; name?: string }) => c.role === '主角' || c.role === '男主')
       if (proto?.name) {
         analysis.protagonistName = proto.name
-        console.log('[auto-book-analysis] 补全 protagonistName:', analysis.protagonistName)
       }
     }
 
@@ -269,7 +261,6 @@ ${bookData.keywords?.join('、') || bookData.tags?.join('、') || ''}
           const lk = _lower(k)
           if (sigs.some(s => lk.includes(s.toLowerCase())) && analysis[k] && typeof analysis[k] === 'object') {
             analysis[canonical] = analysis[k]
-            console.log('[auto-book-analysis] #9 乱键归一:', k, '→', canonical)
             break
           }
         }
@@ -283,13 +274,27 @@ ${bookData.keywords?.join('、') || bookData.tags?.join('、') || ''}
 
     // Step 5: 执行结构化映射
     const mapping = buildBookAnalysisMapping(analysis)
-    console.log('[auto-book-analysis] 映射维度:', Object.keys(mapping).join(', '))
+
+    // Step 6: 章节级仿写骨架（黄金三章/单章循环/节奏/伏笔/爽点/禁止复制清单）
+    //   失败或解析失败一律降级为 null，绝不影响原有返回值
+    let chapterBlueprint: any = null
+    try {
+      chapterBlueprint = await deconstructChapterBlueprint({
+        bookName: String(analysis.bookName || searchName),
+        bookMeta: bookData || analysis,
+        llmConfig: _effLlmConfig,
+      })
+    } catch (_bpErr) {
+      console.warn('[auto-book-analysis] 章节骨架拆解失败（已忽略）:', _bpErr)
+      chapterBlueprint = null
+    }
 
     return NextResponse.json({
       success: true,
       data: {
         analysis,
         mapping,
+        ...(chapterBlueprint ? { chapterBlueprint } : {}),
         bookName: analysis.bookName,
         bookGenre: analysis.bookGenre,
         // 🔥 P2.1.1-P2.1.4 修复：确保关键字段在响应顶层也可访问

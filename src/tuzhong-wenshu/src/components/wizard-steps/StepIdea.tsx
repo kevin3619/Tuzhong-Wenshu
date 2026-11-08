@@ -2,6 +2,7 @@
 
 import { useEffect } from 'react'
 import type { GeneratedData } from '../ai-generate-wizard'
+import { autoResize } from '@/hooks/useAutoResize'
 
 interface StepIdeaProps {
   data: GeneratedData['idea']
@@ -30,10 +31,23 @@ export default function StepIdea({
     return function() { clearTimeout(timer) }
   }, [data])
 
-  const autoResize = function(e: React.FormEvent<HTMLTextAreaElement>) {
-    const ta = e.currentTarget
-    ta.style.height = 'auto'
-    ta.style.height = ta.scrollHeight + 'px'
+
+  // 🔥 2026-09-10 #219 「目标读者 [object Object]」：LLM/上游字段值可能是对象/数组，受控 value 直接渲染会显示 "[object Object]"。
+  //   统一转为可读文本，杜绝任何单值字段出现对象泄漏。
+  const toText = function(v: any): string {
+    if (v === null || v === undefined) return ''
+    if (typeof v === 'string') return v
+    if (typeof v === 'number' || typeof v === 'boolean') return String(v)
+    if (Array.isArray(v)) return v.map(toText).filter(Boolean).join('；')
+    if (typeof v === 'object') {
+      var parts: string[] = []
+      ;['text', 'value', 'content', 'profile', 'description', 'label', 'name', 'summary', 'detail'].forEach(function(k) {
+        if (v[k] != null && typeof v[k] !== 'object') parts.push(String(v[k]))
+      })
+      if (parts.length) return parts.join('；')
+      try { return JSON.stringify(v) } catch (e) { return '' }
+    }
+    return ''
   }
 
   if (!data || !data.title && !data.tagline) {
@@ -50,9 +64,9 @@ export default function StepIdea({
     )
   }
 
-  const tagline = data.tagline || data.hook || ''
-  const sellingPoints = Array.isArray(data.sellingPoints) ? data.sellingPoints : (data.coreSellingPoint ? [data.coreSellingPoint] : [])
-  const coreConflict = data.coreConflict || ''
+  const tagline = toText(data.tagline || data.hook)
+  const sellingPoints = Array.isArray(data.sellingPoints) ? data.sellingPoints.map(toText) : (data.coreSellingPoint ? [toText(data.coreSellingPoint)] : [])
+  const coreConflict = toText(data.coreConflict)
 
   return (
     <div className="space-y-6">
@@ -88,7 +102,7 @@ export default function StepIdea({
           <label className="text-sm font-medium text-stone-500">书名 <RegenButton step={stepName} field="title" label="书名" /></label>
           <input
             type="text"
-            value={data.title || ''}
+            value={toText(data.title)}
             onChange={(e) => onChange({ ...data, title: e.target.value })}
             className="w-full mt-1 px-3 py-2 bg-white border border-stone-200 rounded-lg focus:ring-2 focus:ring-stone-400 focus:border-transparent text-lg font-bold text-stone-900"
           />
@@ -162,7 +176,7 @@ export default function StepIdea({
           <label className="text-sm font-medium text-stone-500">目标读者 <RegenButton step={stepName} field="targetAudience" label="目标读者" /></label>
           <input
             type="text"
-            value={data.targetAudience || ''}
+            value={toText(data.targetAudience)}
             onChange={(e) => onChange({ ...data, targetAudience: e.target.value })}
             className="w-full mt-1 px-3 py-2 bg-white border border-stone-200 rounded-lg focus:ring-2 focus:ring-stone-400 focus:border-transparent text-stone-700"
           />
@@ -170,7 +184,7 @@ export default function StepIdea({
         <div>
           <label className="text-sm font-medium text-stone-500">主题思想 <RegenButton step={stepName} field="theme" label="主题思想" /></label>
           <textarea
-            value={data.theme || ''}
+            value={toText(data.theme)}
             onChange={(e) => onChange({ ...data, theme: e.target.value })}
             onInput={autoResize}
             rows={2}
@@ -182,17 +196,17 @@ export default function StepIdea({
             <label className="text-sm font-medium text-stone-500">文风定位 <RegenButton step={stepName} field="writingStyle" label="文风定位" /></label>
             <input
               type="text"
-              value={data.writingStyle || ''}
-              onChange={(e) => onChange({ ...data, writingStyle: e.target.value })}
-              className="w-full mt-1 px-3 py-2 bg-white border border-stone-200 rounded-lg focus:ring-2 focus:ring-stone-400 focus:border-transparent text-stone-700"
-            />
+              value={toText(data.writingStyle)}
+            onChange={(e) => onChange({ ...data, writingStyle: e.target.value })}
+            className="w-full mt-1 px-3 py-2 bg-white border border-stone-200 rounded-lg focus:ring-2 focus:ring-stone-400 focus:border-transparent text-stone-700"
+          />
           </div>
           <div>
             <label className="text-sm font-medium text-stone-500">爽点模式 <RegenButton step={stepName} field="shuangPattern" label="爽点模式" /></label>
             <input
               type="text"
-              value={data.shuangPattern || ''}
-              onChange={(e) => onChange({ ...data, shuangPattern: e.target.value })}
+              value={toText(data.shuangPattern)}
+            onChange={(e) => onChange({ ...data, shuangPattern: e.target.value })}
               className="w-full mt-1 px-3 py-2 bg-white border border-stone-200 rounded-lg focus:ring-2 focus:ring-stone-400 focus:border-transparent text-stone-700"
             />
           </div>
@@ -200,8 +214,8 @@ export default function StepIdea({
             <label className="text-sm font-medium text-stone-500">情绪基调 <RegenButton step={stepName} field="emotionTone" label="情绪基调" /></label>
             <input
               type="text"
-              value={data.emotionTone || ''}
-              onChange={(e) => onChange({ ...data, emotionTone: e.target.value })}
+              value={toText(data.emotionTone)}
+            onChange={(e) => onChange({ ...data, emotionTone: e.target.value })}
               className="w-full mt-1 px-3 py-2 bg-white border border-stone-200 rounded-lg focus:ring-2 focus:ring-stone-400 focus:border-transparent text-stone-700"
             />
           </div>
@@ -209,8 +223,8 @@ export default function StepIdea({
             <label className="text-sm font-medium text-stone-500">商业定位 <RegenButton step={stepName} field="commercialPositioning" label="商业定位" /></label>
             <input
               type="text"
-              value={data.commercialPositioning || ''}
-              onChange={(e) => onChange({ ...data, commercialPositioning: e.target.value })}
+              value={toText(data.commercialPositioning)}
+            onChange={(e) => onChange({ ...data, commercialPositioning: e.target.value })}
               className="w-full mt-1 px-3 py-2 bg-white border border-stone-200 rounded-lg focus:ring-2 focus:ring-stone-400 focus:border-transparent text-stone-700"
             />
           </div>
@@ -218,7 +232,7 @@ export default function StepIdea({
         <div>
           <label className="text-sm font-medium text-stone-500">核心金句 <RegenButton step={stepName} field="coreGoldenQuote" label="核心金句" /></label>
           <textarea
-            value={data.coreGoldenQuote || ''}
+            value={toText(data.coreGoldenQuote)}
             onChange={(e) => onChange({ ...data, coreGoldenQuote: e.target.value })}
             onInput={autoResize}
             rows={3}

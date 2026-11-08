@@ -11,6 +11,8 @@ const nextConfig: NextConfig = {
   },
   devIndicators: false,
   compress: true,
+  // 允许本机 headless 真渲验证（puppeteer 连 127.0.0.1）建立 HMR，避免跨源阻断导致客户端不水合
+  allowedDevOrigins: ['127.0.0.1', 'localhost'],
 };
 
 export default nextConfig;
